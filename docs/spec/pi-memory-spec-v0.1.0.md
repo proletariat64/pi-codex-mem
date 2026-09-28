@@ -2,6 +2,7 @@
 
 **Version:** 0.1.0  
 **Date:** 2026-09-28  
+**Draft revision:** 2 — v1 and v2 are both required for v0.1.0  
 **Status:** Proposed implementation contract, grounded in inspected upstream source  
 **Working package name:** `pi-memory` — a local project name, not a claim that this npm name is available  
 **Target:** A single-user TypeScript extension for pi with memory independent of Codex and Claude-mem
@@ -16,16 +17,17 @@ The user has explicitly selected:
 - Independent pi memory data, without sharing Codex's memory directory or database.
 - Source-informed implementation using Codex's memory approach.
 - A native pi extension as the integration surface.
+- Both Codex-style v1 and v2 memory pipelines in the implementation scope.
 
 This document specifies a new implementation. It does not claim that the implementation exists, that the user's installed pi matches the inspected version, or that matching the pipeline guarantees matching Codex's memory quality.
 
 ### 1.1 Scope
 
-The v0.1 release includes automatic capture of participating pi sessions, two-stage LLM processing, file-based progressive retrieval, explicit correction and forgetting, background scheduling, durable job state, bounded model usage, diagnostics, and an evaluation harness.
+The v0.1 release MUST implement both memory versions, selectable through configuration. v1 remains the default; v2 is a complete supported pipeline, not a future placeholder. Optional dual writing generates both versions while only the selected version supplies foreground context. The v0.1 release includes automatic capture of participating pi sessions, two-stage LLM processing, file-based progressive retrieval, explicit correction and forgetting, background scheduling, durable job state, bounded model usage, diagnostics, and an evaluation harness.
 
 There is no embedding model, vector database, reranker, HTTP memory server, Docker requirement, or independent resident daemon. SQLite stores coordination and provenance; Markdown stores model-readable memory. Online LLM calls use the configured pi provider runtime.
 
-The first supported deployment is one user on Linux with a local filesystem. Cross-machine synchronization, shared team memory, full-text semantic search, automatic executable-skill generation, Codex v2 parity, and Claude-mem data migration are outside v0.1.
+The first supported deployment is one user on Linux with a local filesystem. Cross-machine synchronization, shared team memory, full-text semantic search, automatic executable-skill generation, byte-for-byte Codex runtime parity, and Claude-mem data migration are outside v0.1.
 
 The existing `proletariat64/pi-bridge` remains a separate Claude-mem adapter. Its lifecycle and failure-isolation lessons are relevant, but this project does not change that repository's responsibilities or reuse its worker protocol.
 
@@ -43,13 +45,14 @@ The source manifest in the implementation MUST record upstream repository, commi
 ### 2.1 Important findings
 
 1. Codex v1 extracts `raw_memory`, `rollout_summary`, and `rollout_slug`; consolidation produces `MEMORY.md`, `memory_summary.md`, and optionally memory skills. It does not require vector retrieval. [C1–C5]
-2. Codex v2 omits `raw_memory` and consolidates summaries into a compact `memory_summary.md`. It is a distinct selectable pipeline, not the default at the inspected commit. v0.1 of this project targets v1. [C2, C3, C6]
+2. Codex v2 omits `raw_memory` and consolidates summaries into a compact `memory_summary.md`. It is a distinct selectable pipeline, not the default at the inspected commit. v0.1 of this project implements both contracts. [C2, C3, C6]
 3. Codex starts memory work asynchronously for eligible root sessions, extracts sufficiently idle previous sessions, and coordinates work in a state database. Consolidation has one global lease and uses workspace changes as its dirty check. [C4, C5, C7]
 4. pi extensions are TypeScript modules loaded into the pi process. Factories should register handlers, not start long-lived resources. `session_start` and `session_shutdown` bound the runtime. [P1, P2]
 5. `agent_end` is not final settlement: retries, compaction, and queued work can follow. `agent_settled` is the final notification boundary in the inspected pi API. [P1, P2]
 6. pi session files contain a tree. `getBranch()` follows the active ancestry; `buildSessionProjection()` returns the compacted model view, which can omit older raw evidence. Neither “all JSONL rows” nor “current model messages only” is a correct long-term-memory input by itself. [P3, P4]
 7. pi's `loadEntriesFromFile()` can append a missing trailing newline. A historical importer requiring read-only behavior must not blindly call this helper on source files. [P4]
 8. Some Codex README paths lag the code: orchestration is currently in `memories/write/src/`, and read prompts are in `ext/memories/templates/`. Code and tests take precedence over that README. [C1, C4, C8]
+9. A default pipeline version is different from an enabled feature. In the separately checked Codex 0.157.1 release, `[memories].version` defaults to `v1`, but `[features].memories` defaults to `false`. The pi extension has its own explicit configuration and does not inspect or modify Codex settings. [C11]
 
 ### 2.2 Codex v1 versus v2
 
@@ -70,7 +73,7 @@ The v2 summary cap is not a cap on the entire store: individual rollout summarie
 
 The likely tradeoff is a richer consolidated handbook in v1 versus fewer intermediate representations and more direct evidence retrieval in v2. Reduced duplication or better recall is an inference to test, not an established benchmark result. Neither version is automatically better for this user.
 
-This spec provisionally selects the v1 output structure because a consolidated record of decisions, rationale, and failure lessons is a stated goal. This is the specification author's proposed baseline, not a user instruction to reject v2. Keep capture, scheduling, model access, and provenance independent of output format so a later v2-style profile can be evaluated without rebuilding the integration. A second profile is not required for v0.1. [C2, C3, C5, C6, C10]
+Both pipelines are required in this revision. Keep capture, scheduling, model access, provenance, and controls shared; specialize prompts, extraction schemas, output allowlists, artifact validation, and read guidance by `memoryVersion`. v1 is the default for compatibility with the inspected upstream selection, not a claim of superior recall. Version selection and dual writing are specified in Section 5.4 and evaluated separately in Section 19. [C2, C3, C5, C6, C10]
 
 ### 2.3 Compatibility contract
 
@@ -96,6 +99,10 @@ Declare pi-provided packages as peer dependencies with `*`, as pi packaging docu
 | R10 | Exclude the extension's own injected memory and internal consolidation conversations from capture. |
 | R11 | Expose status, inspection, explicit run, correction, forgetting, and read-only diagnostics. |
 | R12 | Demonstrate useful recall with grounded answers and fewer repeated user corrections, not just successful writes. |
+| R13 | Implement complete v1 and v2 extraction, consolidation, publication, and retrieval; preserve their distinct contracts. |
+| R14 | Switch the selected version without deleting the other version or silently falling back to it. |
+| R15 | Isolate generated artifacts and processing state by version; share source enrollment, user controls, and total resource limits. |
+| R16 | Support optional dual writing with one selected read version, independent failure recovery, and combined cost accounting. |
 
 ## 4. Architecture
 
@@ -103,8 +110,8 @@ Declare pi-provided packages as peer dependencies with `*`, as pi packaging docu
 flowchart TD
     P["pi extension events"] --> S["Branch snapshots"]
     S --> D["SQLite job and source state"]
-    D --> E["Phase 1: extraction"]
-    E --> C["Phase 2: consolidation"]
+    D --> E["Phase 1: version-specific extraction"]
+    E --> C["Phase 2: version-specific consolidation"]
     C --> V["Validate and publish generation"]
     V --> M["Markdown memory"]
     M --> I["Summary injection and retrieval tools"]
@@ -119,9 +126,10 @@ Components:
 - **Capture adapter:** projects a selected session branch into sanitized, provenance-labeled evidence.
 - **Coordinator:** handles activity state, eligibility, durable jobs, leases, budgets, and cancellation.
 - **Model port:** accesses models through pi's registry without copying credentials or changing the foreground model.
-- **Extractor:** performs a tool-free structured-output request for each eligible source revision.
+- **Version policy:** selects pinned prompts, JSON schema, writer allowlist, artifact validator, and reader instructions for v1 or v2. It owns no second scheduler or provider runtime.
+- **Extractor:** performs a tool-free structured-output request for each eligible source revision and target memory version.
 - **Consolidator:** runs an isolated in-memory pi agent-core instance with only memory-workspace tools.
-- **Publisher:** validates a staging workspace and makes one immutable generation current.
+- **Publisher:** validates a staging workspace and makes one immutable generation current for its memory version.
 - **Reader:** injects a bounded summary and serves literal search/read/list operations.
 - **Evaluator:** measures memory behavior against fixtures with evidence-based answer keys.
 
@@ -133,9 +141,9 @@ The background runner is an asynchronous task owned by the extension runtime. It
 
 Use `<pi-agent-dir>/memory/`, where the agent directory is resolved through pi's `getAgentDir()` behavior, including `PI_CODING_AGENT_DIR`. [P9]
 
-This is one user's pi memory across participating workspaces. “Independent” means independent of Codex and Claude-mem; it does not mean one isolated database per repository. Project boundaries are recorded in memory metadata and `applies_to` sections, matching the intent of Codex v1's scope-aware handbook.
+This is one user's pi memory across participating workspaces. “Independent” means independent of Codex and Claude-mem; it does not mean one isolated database per repository. Project boundaries are recorded in shared source metadata and in each version's outputs: v1 handbook `applies_to` sections, and v2 project-scoped summary routes and rollout evidence.
 
-Never discover or import `~/.codex/memories`, `~/.codex/sessions`, or Claude-mem databases automatically. A configuration pointing the memory root into those locations must be rejected.
+Never discover or import `~/.codex/memories`, `~/.codex/memories_v2`, `~/.codex/sessions`, or Claude-mem databases automatically. A configuration pointing the memory root into those locations must be rejected.
 
 ### 5.2 Workspace identity
 
@@ -156,12 +164,37 @@ These are local routing identities, not claims about remote ownership. When Git 
 - A `branchId` is extension-owned and persists across forward progress on an ancestry chain.
 - `lineageKey = sha256(sessionKey + ":" + branchId)` identifies the branch across revisions; each immutable revision has its own `sourceId`. Commands receiving a source ID resolve it to this lineage when their contract suppresses all revisions.
 - Moving to an ancestor or sibling selects an existing compatible branch head or creates a new branch identity. Do not infer a branch from its textual topic.
-- `revisionHash` covers normalized evidence, selected leaf, extraction-policy version, scope metadata, and applied context-edit state.
-- Job uniqueness includes session, branch, revision, and prompt version.
+- `revisionHash` covers normalized evidence, selected leaf, shared normalization-policy version, scope metadata, and applied context-edit state. Version-specific prompt/input-rendering policy is included in the extraction job's prompt hash, not used to duplicate shared snapshots.
+- Job uniqueness includes memory version, session, branch, revision, and prompt hash. A v1 success or no-output record must never mark the same source processed for v2.
 
 On `session_tree`, conservatively deactivate previously selected heads for that session and invalidate their downstream generated memory until the new branch has a valid extraction. Historical decisions from an abandoned head must not silently guide its replacement. Resuming that old branch may reactivate it after validation.
 
 Forks create a new session identity and preserve parent lineage. Shared ancestor evidence retains original source identifiers where determinable; it is not independent corroboration of a user preference. A copied/forked conversation must not turn one statement into repeated preference evidence.
+
+### 5.4 Version selection, dual writing, and switching
+
+`version: "v1" | "v2"` selects the single foreground read pipeline. `dualWrite: boolean` defaults to `false`. These are memory-pipeline versions, unrelated to this document's 0.1.0 version, JSON `schemaVersion`, or the literal first-line marker in generated summaries.
+
+| Configuration | Automatic generation targets | Foreground context |
+|---|---|---|
+| `version=v1`, `dualWrite=false` | v1 | v1 only |
+| `version=v2`, `dualWrite=false` | v2 | v2 only |
+| `version=v1`, `dualWrite=true` | v1 and v2 | v1 only |
+| `version=v2`, `dualWrite=true` | v1 and v2 | v2 only |
+
+`generate=false` disables automatic model work for both versions regardless of this table. Global mode, workspace exclusions, and capture policy still apply. Dual writing is opt-in because it makes separate extraction and consolidation requests; it does not double the configured budget.
+
+Changing `version` updates the extension's JSON configuration atomically. A runtime samples validated configuration at startup, before each foreground run, and before claiming a background job or starting its next model request; no filesystem watcher is required. The selected version is pinned with the generation for that entire foreground run. A version switch takes effect for reading at the next `before_agent_start`, not between two tool calls. Concurrent configuration commands must compare the file's prior content hash under a short store-wide control lock; retry a conflict by rereading and applying only the requested field. Manual edits with an invalid schema preserve the file and disable generation as described in Section 14.
+
+Switching does not convert, merge, delete, or relabel existing outputs. Use an existing valid generation for the target version; otherwise report `warming_up` and inject no generated memory until that version publishes. Never silently read the other version as a fallback. Switching back can immediately reuse its still-valid generation. Configuration changes cannot retract old memory text already present in the current conversation; evaluate versions in separate fresh pi sessions to avoid that contamination.
+
+Enabling a version schedules missing version-specific extractions for already enrolled sources that still meet normal idle, age, suppression, and budget rules. Reuse a sanitized source snapshot, not another version's generated memory. If a snapshot was pruned, reconstruct the currently selected enrolled branch through the read-only importer; changed evidence becomes a new revision. If neither snapshot nor original evidence is available, report `source_unavailable_for_version`; do not synthesize v2 from v1's handbook or vice versa. Old unenrolled history still requires explicit import.
+
+When switching with dual writing off, stop claiming new jobs for the inactive version. An already in-flight request may finish and commit a valid fenced result to its original version. Do not start subsequent model calls for that inactive writer; discard incomplete staging and leave the job resumable. Complete valid generations may be retained, but never become the other version's read pointer. Dual writing gives each version independent processed watermarks and generations; one version's failure does not undo the other's successful publication.
+
+An explicit `/memory run --version ...` grants its bounded pass an additional generation target without changing the selected reader. Persist its target version, request ID, and scheduling-policy hash with the jobs. It remains eligible until that pass completes or a later version/mode/dual-write change cancels the grant; ordinary automatic targets may then resume the same unfinished work if eligible. Refresh configuration before each request so another pi process cannot keep generating an inactive version indefinitely from stale settings.
+
+Notes, branch retirement, corrections, explicit forgetting, and privacy-related context removal apply across both versions, including an inactive version. Each version must reconcile the current shared control epoch before its next read. Merely changing versions never clears tombstones.
 
 ## 6. Native pi extension contract
 
@@ -201,7 +234,7 @@ This is an API-shape example, not a complete implementation. Pi records system-p
 
 If another extension forces an opaque full system prompt, it can override section-based injection. Diagnose this as a compatibility limitation; do not overwrite the other extension's prompt or silently claim successful injection.
 
-Pin a generation for one foreground run. A generation published mid-run becomes visible at the next `before_agent_start`. Tools called in that run use the same pin, except that an explicit forget or invalidation can revoke it immediately.
+Pin `(memoryVersion, generationId)` for one foreground run. A new generation or selected-version change becomes visible at the next `before_agent_start`. Tools called in that run use the same pin, except that an explicit forget or invalidation can revoke it immediately.
 
 Before acquiring or serving a view, check the store's control epoch and source-retention eligibility, even when file content is cached. Schedule the earliest known retention deadline as a one-shot event. Expired evidence must not stay readable indefinitely just because no new session was extracted.
 
@@ -248,7 +281,7 @@ Default limits: 64 KiB per human/assistant text item; 8 KiB per tool result; 256
 
 If the input is too large, select user evidence first, then assistant conclusions, then supporting tool evidence; newest evidence wins within a tier, and selected items are rendered chronologically. Keep the adjacent question when a short answer such as “use option 1” depends on it. Record omitted entry IDs/counts in the local snapshot manifest. Never silently present a partial input as a complete transcript.
 
-The priority-selection behavior is an explicit adaptation informed by Codex v2's tiered input builder, combined with the v1 output contract. It is not claimed to be byte-for-byte v1 parity. A compatibility fixture must detect loss of decision rationale at the boundary.
+Use this shared priority-selection behavior for both pipelines. It adapts Codex v2's tiered input builder to pi's message types; v1 retains its separate output contract. The same normalized source revision can feed both versions, but each request renders its own pinned extraction prompt. This is not byte-for-byte input serialization parity. A compatibility fixture must detect loss of decision rationale at the boundary.
 
 ### 7.4 Historical import
 
@@ -260,19 +293,30 @@ For a branching file with no captured active leaf, require `--leaf <entry-id>`; 
 
 ## 8. Phase 1: extraction
 
-Input: immutable normalized evidence + source manifest + adapted v1 prompt. Output is exactly:
+Input: immutable normalized evidence + source manifest + the pinned extraction prompt for the job's memory version. Models return only the corresponding JSON payload; the host supplies the version discriminator.
 
 ```typescript
-interface ExtractionOutput {
+type MemoryVersion = "v1" | "v2";
+
+interface V1ExtractionOutput {
   raw_memory: string;
   rollout_summary: string;
   rollout_slug: string;
 }
+
+interface V2ExtractionOutput {
+  rollout_summary: string;
+  rollout_slug: string;
+}
+
+type VersionedExtraction =
+  | { memoryVersion: "v1"; output: V1ExtractionOutput }
+  | { memoryVersion: "v2"; output: V2ExtractionOutput };
 ```
 
-The host generates IDs, timestamps, paths, and hashes. The model does not choose filesystem paths.
+The host generates IDs, timestamps, paths, and hashes. The model does not choose filesystem paths. Runtime JSON validation rejects unknown fields: a v2 response containing `raw_memory` is invalid, even if a structurally permissive TypeScript assignment would accept it.
 
-### 8.1 Content contract
+### 8.1 Shared content contract
 
 For each substantive task, retain outcome (`success`, `partial`, `fail`, or `uncertain`), relevant user requests/corrections, important actions, validation evidence, open work, and scope.
 
@@ -284,41 +328,55 @@ A confirmed architecture decision should preserve:
 - Conditions that could reopen the decision.
 - Remaining uncertainty and unfinished work.
 
-Tentative discussion can remain in `rollout_summary` without promotion to durable `raw_memory`. Allow summary-only output as a documented pi adaptation. All-empty output is a successful no-op, and its revision is still marked processed.
+User preference claims must distinguish an explicit general preference from a one-task request. Repetition across copied branches is not corroboration. Assistant assertions of successful completion require actual evidence or must remain uncertain. Summaries must distinguish human-observed, programmatic, and unknown-origin user-role text using the captured provenance.
 
-User preference claims must distinguish an explicit general preference from a one-task request. Repetition across copied branches is not corroboration. Assistant assertions of successful completion require actual evidence or must remain uncertain.
+### 8.2 Version-specific content and no-output behavior
 
-### 8.2 Request and validation
+| Contract | v1 | v2 |
+|---|---|---|
+| Learning representation | Durable candidate lessons in `raw_memory`; fuller task evidence in `rollout_summary` | Faithful chronological task history in `rollout_summary`; no separate raw learning or user-profile payload |
+| Tentative discussion | May remain in the summary without promotion to raw learning | Retain material proposals, uncertainty, and superseded/unfinished work with their task |
+| No-output result | All three fields empty; mark this version processed | Both fields empty; mark this version processed |
+| Summary-only result | Allowed as an explicit pi adaptation | Normal non-empty output form |
+| Stored size | Combined fields <= configured 48 KiB default | Accepted summary <=9,000 UTF-8 bytes; slug separately capped |
+
+For v1, this pi contract uses a string slug; unlike upstream v1's nullable/optional decoding, missing or null slug is a schema error. This normalization is a documented adaptation. For v2, use the separate upstream v2 prompt family; deleting `raw_memory` from a v1 response does not implement v2.
+
+v2 must preserve distinct tasks, decisions, corrections, chronology, scope, safe exact identifiers, and supported uncertainty within its budget. A slug with no substantive summary is not a successful extraction; request repair or reject it. No-output records have independent `(source, version, prompt)` watermarks and are not repeated every startup.
+
+### 8.3 Request and validation
 
 Use `ctx.modelRegistry.find(provider, modelId)` and `ctx.modelRegistry.streamSimple(...).result()` through a captured model-port closure. Do not hardcode a provider HTTP endpoint or read credentials into memory files. [P6]
 
 A fulfilled stream-result promise is not itself success: inspect the resulting message's stop/error state. Aborted or provider-error messages must enter cancellation/retry handling, not JSON repair as if they were valid assistant output.
 
-Phase 1 has no tools. Where a provider supports structured-output enforcement through pi, use it; otherwise parse and validate JSON strictly. Strip at most one enclosing Markdown JSON fence. Reject extra prose, unknown keys, non-string fields, invalid UTF-8 boundaries, or oversize output. One bounded repair request may include schema errors and the prior output; it counts toward usage and attempts.
+Phase 1 has no tools. Where a provider supports structured-output enforcement through pi, use it; otherwise parse and validate JSON strictly. Strip at most one enclosing Markdown JSON fence. Reject extra prose, unknown keys, non-string fields, or payloads above the configured combined-field safety limit. One bounded repair request may include schema errors and the prior output; it counts toward usage and attempts.
 
-Default combined extraction-output limit is 48 KiB. Sanitize slug characters, cap at 80 characters, and prefix filenames with a host-generated unique source identifier; slug never supplies identity. Scan generated output for secrets again before persistence.
+Sanitize slug characters, cap at 80 characters, and prefix filenames with a host-generated unique source identifier; slug never supplies identity. Scan generated output for secrets again before persistence.
 
-Store the source revision, prompt hash, selected model, request usage, output hash, and outcome. A late response from an obsolete revision or lost lease is discarded. It cannot overwrite a newer extraction.
+For v2, redact first and then enforce `v2RolloutSummaryBytes`, at most 9,000 bytes. Following upstream's bounded-summary behavior, use deterministic UTF-8-safe truncation when necessary. The pi adaptation cuts at the last complete paragraph fitting the limit, or the last complete line if necessary, and appends a fixed omission marker inside the same byte budget. If no meaningful complete line fits, use the bounded repair opportunity and otherwise reject; do not cut a URL/identifier into a purported valid pointer. Record `truncated=true`, original byte count, and accepted byte count. The consolidator must see the omission marker and must not infer outcomes from missing evidence. This deliberate boundary policy is not byte-for-byte equivalence to Codex's truncation helper. [C3]
+
+Store memory version, source revision, prompt hash, selected model, request usage, output hash, truncation metadata, and outcome. In the shared database, v2's raw-memory column is NULL, never an inherited v1 value. A late response from an obsolete revision or lost lease is discarded. It cannot overwrite a newer extraction or one for the other version.
 
 ## 9. Phase 2: consolidation
 
 ### 9.1 Selection
 
-Claim one global consolidation lease before constructing a staging workspace. Select the newest valid extraction for each active branch lineage, excluding suppressed sources, invalidated branches, forgotten sources, and expired records.
+Claim one store-wide consolidation lease before constructing a staging workspace for one memory version. Select only that version's newest valid extraction for each active branch lineage, excluding suppressed sources, invalidated branches, forgotten sources, and expired records. Dual writing still permits only one consolidator at a time.
 
-Default selection follows Codex's inspected policy: up to 256 sources; eligible if their last real use, or source-update time when never used, falls within 30 days. Rank by `usageCount` descending, then last-use/source-update time descending, then stable source ID. Mechanically merge `raw_memories.md` in stable source-ID order, so usage ranking does not create text churn. [C7]
+Default selection follows Codex's inspected policy: up to 256 sources; eligible if their last real use, or source-update time when never used, falls within 30 days. Rank by `usageCount` descending, then last-use/source-update time descending, then stable source ID. For v1, mechanically merge `raw_memories.md` in stable source-ID order, so usage ranking does not create text churn. For v2, stage only its selected rollout summaries in stable source-ID order; do not create or consume raw-memory files. Usage statistics and retention watermarks are version-specific. [C7]
 
-An injection of `memory_summary.md` is not a use of every source. Increment source usage only for a successful detail read or an explicitly validated memory citation; deduplicate by consumer session, foreground run, and source. Literal-search hits alone do not extend retention.
+An injection of `memory_summary.md` is not a use of every source. Increment source usage only for a successful detail read or an explicitly validated memory citation; deduplicate by memory version, consumer session, foreground run, and source. Literal-search hits alone do not extend retention.
 
 Retention removes generated learning, not the user's original sessions. An expired processed revision is not automatically regenerated on every startup; explicit reimport or new activity can make it eligible again.
 
 ### 9.2 Staging workspace
 
-Create a private staging directory containing selected summaries, merged raw memories, prior valid outputs when allowed, active user notes, and `phase2_workspace_diff.md`.
+Create a private staging directory for the job's memory version containing selected same-version summaries, prior same-version valid outputs when allowed, a read-only snapshot of shared active user notes, and `phase2_workspace_diff.md`. v1 additionally receives merged raw memories and may receive its prior handbook/prose procedures. v2 must never receive v1 outputs, `raw_memories.md`, `MEMORY.md`, or generated skills as consolidation inputs.
 
-Use a deterministic manifest and unified textual diff against the last successful generation. This replaces Codex's private Git-baseline implementation while preserving addition/modification/deletion semantics. Every deletion must be represented; do not silently truncate a diff. If a diff exceeds 4 MiB, provide a complete changed-path index and require per-file reads, recording that fallback in the job.
+Use a deterministic manifest and unified textual diff against the last successful generation of the same memory version. This replaces Codex's private Git-baseline implementation while preserving addition/modification/deletion semantics. Every deletion must be represented; do not silently truncate a diff. If a diff exceeds 4 MiB, provide a complete changed-path index and require per-file reads, recording that fallback in the job.
 
-If selection hashes, prompt version, notes, invalidation epoch, and outputs are unchanged, skip the LLM. This dirty check is content-based, not merely timestamp-based.
+If the memory version, selection hashes, version-specific prompt hash, notes, invalidation epoch, and outputs are unchanged, skip the LLM. This dirty check is content-based, not merely timestamp-based.
 
 ### 9.3 Restricted consolidation agent
 
@@ -334,52 +392,67 @@ The only available tools are:
 | `workspace_read` | Read bounded line ranges of staged files |
 | `workspace_search` | Literal search of staged UTF-8 text |
 | `workspace_write` | Replace approved generated output files atomically within staging |
-| `workspace_delete` | Delete optional generated procedure files within staging |
+| `workspace_delete` | v1 only: delete optional generated procedure files within staging; not registered for v2 |
 
 No shell, network-fetch tool, repository write, original transcript read, package installation, or recursive delegation is available. Model API transport still uses the network. This is tool-surface confinement, not an OS sandbox for arbitrary third-party extension code.
 
-Reject absolute paths, `..`, symlinks, device files, and writes outside the output allowlist. Selected evidence and user notes are read-only. Tool descriptions must tell the agent these boundaries.
+Reject absolute paths, `..`, symlinks, device files, and writes outside the version-specific output allowlist. v2 can write only `memory_summary.md`; it cannot rewrite rollout evidence or add a handbook/skill. Selected evidence and user notes are read-only. Tool descriptions must tell the agent these boundaries.
 
 ### 9.4 Output requirements
 
-Required: `MEMORY.md`, `memory_summary.md`. Optional: `skills/<slug>/SKILL.md` containing prose-only procedures. No generated executable scripts, automatic installation into pi's skills directory, or implicit command execution in v0.1.
+| Artifact | v1 | v2 |
+|---|---|---|
+| `memory_summary.md` | Required | Required |
+| `MEMORY.md` | Required | Forbidden |
+| `rollout_summaries/*.md` | Host-staged selected v1 evidence | Host-staged selected v2 evidence |
+| `raw_memories.md` | Host-assembled writer input | Forbidden |
+| `skills/<slug>/SKILL.md` | Optional prose-only procedure | Forbidden |
+| `manifest.json` | Host-generated provenance and hashes | Host-generated provenance and hashes |
 
-`MEMORY.md` uses task groups with `scope`, `applies_to`, task-local source references and keywords, followed by supported preferences, reusable knowledge, and failure lessons. Preserve exact safe identifiers, model/user wording, and decision conditions. Do not create one flat chronological log.
+No generated executable scripts, automatic installation into pi's skills directory, or implicit command execution in v0.1. Forbidden artifacts must fail v2 publication, not merely disappear from its prompt.
 
-`memory_summary.md` starts with literal `v1` and contains, in order:
+For v1, `MEMORY.md` uses task groups with `scope`, `applies_to`, task-local source references and keywords, followed by supported preferences, reusable knowledge, and failure lessons. Preserve exact safe identifiers, model/user wording, and decision conditions. Do not create one flat chronological log.
+
+For both versions, `memory_summary.md` starts with literal `v1` and contains, in order:
 
 1. `## User Profile`
 2. `## User preferences`
 3. `## General Tips`
 4. `## What's in Memory`
 
-It is a compact routing and preference layer, not another full handbook. Default maximum: 10,000 UTF-8 bytes, with no mid-sentence slicing to make invalid output pass. This hard limit is a pi design choice informed by Codex v2, not a v1 default.
+The first-line `v1` is the upstream summary-format marker, including in Codex's v2 writer and validator. It is not a pipeline selector. Record the actual memory version in the manifest and database; do not infer it from this first line or rename it to `v2`. [C5, C10]
+
+Default summary maximum is 9,999 UTF-8 bytes for both profiles. v1's bound is a pi design choice. v2 MUST remain strictly below 10,000 bytes regardless of configuration; a configured lower limit is allowed. Reject and repair oversized consolidated summaries rather than cutting them after writing. Test bytes, not JavaScript character count.
+
+For v2, `## What's in Memory` routes directly to selected rollout summaries: recent work uses `### <project scope>` and `#### <YYYY-MM-DD>`; each useful retrieval intent includes the exact staged summary path and one sentence explaining when it matters. The host-supplied pi `session_key` and `source_id` replace Codex thread identifiers in adapted prompts. Older topics use `### Older Memory Topics` with concise project-scoped entries. Supported document, discussion, PR, and implementation pointers may be retained when worth the space, but must never be guessed or normalized into different identifiers. Recent and older grouping is prompt guidance, not proof of a claim's truth.
 
 Use the conversation's language for substantive memory, preserve exact technical identifiers, and retain original-language evidence for quoted preferences. English structural headings are stable schema markers; Chinese content is supported.
 
-Every task group must cite existing selected source files or explicit user-note IDs. Summary pointers must resolve to generated handbook sections or selected evidence. Claims whose only support was removed must be removed. Source-backed corrections outrank older summaries. No new claim can be justified solely by a previous generated claim.
+Every v1 task group must cite selected source files or explicit user-note IDs. v1 summary pointers resolve to handbook sections or selected evidence; v2 pointers resolve directly to its selected rollout summaries and may refer to shared note IDs in the manifest. Every retained source reference must exist in the candidate's selected input set. Claims whose only support was removed must be removed. Source-backed corrections outrank older summaries. No new claim can be justified solely by a previous generated claim, including a claim generated by the other version.
+
+When no supported sources or notes remain, publish a deterministic minimal summary with the required marker/headings and no invented preferences or pointers. v1 additionally needs a valid minimal handbook; v2 must remain valid without any `MEMORY.md`.
 
 ### 9.5 Publication protocol
 
-1. Build staging and snapshot its source-selection hash, control/invalidation epoch, base generation, and lease fencing token.
+1. Build version-scoped staging and snapshot its memory version, source-selection hash, shared control/invalidation epoch, per-version base generation, and lease fencing token.
 2. Run consolidation, or produce deterministic minimal required files when no sources/notes remain.
 3. Validate required headings, UTF-8/size bounds, path safety, pointer existence, source eligibility, and secret scan. Structural validation does not prove semantic truth; the quality suite covers that separately.
-4. Write `manifest.json` with file hashes and selected extraction IDs; fsync files and staging directory.
-5. Rename staging to a unique immutable `generations/<generationId>/` on the same filesystem.
-6. In one short SQLite transaction, verify lease token, expected base generation, selection state, and unchanged control epoch; mark the generation published and set `store_state.active_generation_id`.
+4. Write `manifest.json` with memory version, file hashes, selected same-version extraction IDs, note hashes, and prompt hashes; fsync files and staging directory.
+5. Rename staging to a unique immutable `versions/<memoryVersion>/generations/<generationId>/` on the same filesystem.
+6. In one short SQLite transaction, verify lease token, expected per-version base generation, same-version selection state, and unchanged shared control epoch; mark the generation published and set `pipeline_state[memoryVersion].active_generation_id`. The row must point only to a generation with the same memory version.
 7. Readers resolve only the DB-selected immutable generation. A failed CAS leaves an orphan directory that is never served and is later removed.
 
 SQLite is the sole publication pointer. There is no second `current` symlink or JSON pointer to reconcile. A crash before the transaction leaves the previous generation current; a crash after it leaves a complete new generation current. Fsync/transaction tests must cover both boundaries.
 
-Keep at most two old generations for ordinary recovery, plus any currently pinned reader generation. Invalidation/forget overrides recovery retention: no revoked generation can become current or be read through tools.
+Keep at most two old generations per version for ordinary recovery, plus any currently pinned reader generation. Invalidation/forget overrides recovery retention: no revoked generation can become current or be read through tools.
 
 ## 10. Read path and progressive disclosure
 
-Normal prompt handling uses no memory-related LLM request. Inject the cached bounded summary, current workspace applicability, generation ID, and adapted read guidance in the `pi_memory` section. If storage is unavailable or invalidated, omit memory and continue the user task.
+Normal prompt handling uses no memory-related LLM request. Inject exactly one selected-version summary, current workspace applicability, memory version, generation ID, and that version's adapted read guidance in the `pi_memory` section. Dual writing must not concatenate the two summaries or expose two competing guidance sections. If storage is unavailable or invalidated, omit memory and continue the user task.
 
 The section must label historical content as evidence, not instructions that override current user requests or higher-priority policy. Source text, generated memory, and user-note bodies must never be interpolated into tool definitions or trusted control instructions.
 
-For relevant requests, the agent should search `MEMORY.md`, read the relevant task group, and open one or two cited rollout summaries only if needed. Self-contained requests can skip detail retrieval. Stop after a small unsuccessful search rather than browsing every historical source. Historical status is not proof of current repository behavior.
+For v1, search `MEMORY.md`, read the relevant task group, and open one or two cited rollout summaries only if needed. For v2, use the injected summary directly when sufficient; read its matching rollout summary when wording, chronology, evidence, or uncertainty could change the answer. Search selected rollout summaries only when a needed route is missing. The v2 reader must never attempt a handbook lookup. Self-contained requests can skip detail retrieval. Stop after a small unsuccessful search rather than browsing every historical source. Historical status is not proof of current repository behavior.
 
 Register three read-only tools:
 
@@ -402,11 +475,11 @@ type MemoryReadArgs = {
 type MemoryListArgs = { path?: string; cursor?: string; limit?: number };
 ```
 
-Tool names: `pi_memory_search`, `pi_memory_read`, `pi_memory_list`. Tools resolve only the pinned generation, not source snapshots, the DB, arbitrary absolute paths, or another user's files. Default searchable paths are `MEMORY.md`, `rollout_summaries/`, and prose procedures. `raw_memories.md` and operational diffs are writer inputs, not normal reader targets.
+Tool names: `pi_memory_search`, `pi_memory_read`, `pi_memory_list`. Tools resolve only the pinned version and generation, not source snapshots, the DB, arbitrary absolute paths, another version, or another user's files. They have no model-controlled version override. v1 allows handbook, rollout-summary, and prose-procedure paths; v2 allows rollout-summary paths only. The compact summary is already injected; the manifest, note bodies, raw memories, and operational diffs are not reader targets. An explicitly requested disallowed path returns `path_not_available_for_version`, with no fallback to another namespace.
 
-Literal Unicode substring matching supports Chinese without an English-only tokenizer. Case folding applies only when requested; no silent transliteration. Sort by relative path and line for determinism. A cursor includes generation, query hash, and offset; reject a mismatched cursor. Cap each response at 16 KiB and expose `truncated` and continuation information.
+Literal Unicode substring matching supports Chinese without an English-only tokenizer. Case folding applies only when requested; no silent transliteration. Sort by relative path and line for determinism. A cursor includes memory version, generation, query hash, and offset; reject a mismatched cursor. Cap each response at 16 KiB and expose `truncated` and continuation information.
 
-Return generation ID, relative path, line numbers, source IDs when known, and content in tool `details` as well as readable text. Cite actual memory read evidence in ordinary Markdown only when relevant. Do not require Codex's proprietary citation wrapper, and do not reread files solely to construct citations.
+Return memory version, generation ID, relative path, line numbers, source IDs when known, and content in tool `details` as well as readable text. Cite actual memory read evidence in ordinary Markdown only when relevant. Do not require Codex's proprietary citation wrapper, and do not reread files solely to construct citations.
 
 The reader has no semantic ranking promise. If literal retrieval misses paraphrases, improve the summary's routing keywords and evaluate before adding new infrastructure.
 
@@ -418,11 +491,13 @@ The reader has no semantic ranking promise. If literal retrieval misses paraphra
 |---|---:|---|
 | Minimum source idle time | 6 hours | 6 hours |
 | Maximum source age for automatic extraction | 10 days | 10 days |
-| Extractions per scheduler pass | 2 | 2 per startup |
-| Phase 1 concurrency | 2 | Internal cap of 8 |
-| Consolidation input count | 256 | 256 |
+| Extractions per scheduler pass | 2 version-specific jobs total | 2 source candidates per startup pipeline |
+| Phase 1 concurrency | 2 jobs total across versions | Internal cap of 8 |
+| Consolidation input count | 256 per version | 256 |
 | Unused-memory window | 30 days | 30 days |
-| Global consolidators | 1 | 1 lease |
+| Global consolidators | 1 across both versions | Lease-coordinated pipeline |
+| Selected memory version | v1 | v1 |
+| Dual writing | false; explicit opt-in | false |
 | Triggers | Startup, final settlement, due-time timer, explicit command | Startup pipeline |
 | Quota control | Provider-neutral request/token budgets | Codex quota-window guard also exists |
 
@@ -430,13 +505,15 @@ Six hours means recent conversations may not be available in memory immediately.
 
 ### 11.2 Eligibility
 
-A source revision is eligible only when it is enrolled, persistent, permitted by effective mode, stable on its selected branch, not suppressed, not processed for this prompt version, within age/budget limits, and idle for the configured interval. No participating process may report the source session as busy. A currently settled session may become eligible after the full idle interval.
+A source revision is eligible only when it is enrolled, persistent, permitted by effective mode, stable on its selected branch, not suppressed, not processed for this memory version and prompt hash, within age/budget limits, and idle for the configured interval. No participating process may report the source session as busy. A currently settled session may become eligible after the full idle interval.
 
-At session startup and each final settlement, schedule bounded work. Use one-shot due-time timers; do not scan on a repeating interval. After a completed pass, schedule another pass only if known eligible backlog and remaining budgets exist. Timers are unreferenced so they do not keep pi alive.
+At session startup and each final settlement, schedule bounded work for the configured generation targets. Use one-shot due-time timers; do not scan on a repeating interval. After a completed pass, schedule another pass only if known eligible backlog and remaining budgets exist. Timers are unreferenced so they do not keep pi alive.
 
 While a foreground run is active, renew its process-activity record every 30 seconds with a 180-second expiry. This is coordination, not a source scan. A stale activity record can be retired after expiry, but jobs must still validate their captured revision and fencing token before committing. Normal shutdown removes the owned record.
 
 The same process starts new model requests only while its foreground session is idle. If a user begins work while one request is in flight, allow that request to complete under its budget, but pause subsequent requests until settlement. Shutdown/reload cancels it. Cross-process model contention is bounded by store-wide slots, not by holding a SQLite transaction open during network IO.
+
+When both versions have eligible work, take the selected version first and then alternate version-specific extraction jobs. The default pass of two jobs can process one source for each version; it does not authorize four jobs. Rotate consolidation opportunities between dirty versions. Shared request/token budgets, global slots, and foreground-idle rules bound all automatic and explicit runs. Status must distinguish partial dual-write progress from a completed result for both versions.
 
 ### 11.3 Leases and exactly-once effects
 
@@ -448,7 +525,7 @@ Retry transient network/429/5xx failures with scheduled backoff (1 minute, 5 min
 
 ### 11.4 Usage budgets
 
-Default automatic budget per local calendar day: 100,000 input-token units and 20,000 output-token units, at most 20 model requests across both phases. These are proposed starter limits, not price estimates. Count consolidation's repeated context input on every call.
+Default automatic budget per local calendar day: 100,000 input-token units and 20,000 output-token units, at most 20 model requests across both phases and both memory versions. These are proposed starter limits, not price estimates. Count consolidation's repeated context input on every call.
 
 Reserve capacity transactionally before starting each call, using actual tokenizer count when available and otherwise a conservative byte-based estimate; reconcile against provider usage after completion. Missing usage keeps the reservation as the conservative charge. If a request cannot fit, defer it and report the reason. `/memory run` obeys the same budget unless the user supplies an explicit one-run override.
 
@@ -460,18 +537,20 @@ Before every consolidation request, account for its full accumulated messages, t
 
 ### 12.1 Files
 
+All versioned paths below live under the independent pi memory root. The two version namespaces are siblings; shared sources, notes, and controls are outside them.
+
 | Path beneath memory root | Owner and meaning |
 |---|---|
 | `state.sqlite` plus WAL/SHM | State store; never user-edit as configuration |
 | `config.json` | User-owned versioned extension configuration |
 | `sources/<lineage-key>/<revision>.json` | Sanitized immutable extraction snapshot and source metadata |
-| `generations/<id>/memory_summary.md` | Published compact context |
-| `generations/<id>/MEMORY.md` | Published handbook |
-| `generations/<id>/rollout_summaries/*.md` | Selected extraction evidence |
-| `generations/<id>/skills/*/SKILL.md` | Optional prose-only procedures |
-| `generations/<id>/raw_memories.md` | Mechanically assembled writer input |
-| `generations/<id>/manifest.json` | File hashes, source IDs, prompt version, schema version |
-| `staging/<job-id>/` | Unpublished work; removable after expired ownership |
+| `versions/<v>/generations/<id>/memory_summary.md` | Published compact context for `<v>` = `v1` or `v2` |
+| `versions/v1/generations/<id>/MEMORY.md` | v1 handbook only |
+| `versions/<v>/generations/<id>/rollout_summaries/*.md` | Selected evidence extracted by that version |
+| `versions/v1/generations/<id>/skills/*/SKILL.md` | Optional v1 prose-only procedures |
+| `versions/v1/generations/<id>/raw_memories.md` | Mechanically assembled v1 writer input |
+| `versions/<v>/generations/<id>/manifest.json` | Memory version, file/source hashes, note hashes, prompt hashes, schema version |
+| `versions/<v>/staging/<job-id>/` | Unpublished work for one version; removable after expired ownership |
 | `notes/<note-id>.md` | Explicit user additions/corrections, with metadata in SQLite |
 | `logs/events.jsonl` | Rotated metadata-only operational log |
 
@@ -484,29 +563,31 @@ All timestamps are integer UTC milliseconds. IDs are host-generated strings. JSO
 | Table | Essential columns and constraints |
 |---|---|
 | `schema_migrations` | `version` PK, `applied_at` |
-| `store_state` | singleton PK, `active_generation_id`, `control_epoch`, `read_blocked`, `block_reason` |
+| `store_state` | singleton PK, shared `control_epoch`, store-wide coordination/disabled state |
+| `pipeline_state` | `memory_version` PK CHECK v1/v2; active generation ID; reconciled control epoch; read-blocked flag/reason |
 | `workspaces` | `workspace_key` PK, `repo_key`, `checkout_key`, `cwd`, `git_branch`, `git_head`, `updated_at` |
 | `sessions` | `session_key` PK, path, header ID, parent key, workspace key, enrollment time, active branch, mode, last activity |
 | `branch_heads` | PK `(session_key, branch_id)`, selected leaf, latest revision, state `active/retired/suppressed` |
-| `source_revisions` | `source_id` PK; `lineage_key`; session/branch/revision UNIQUE; snapshot path/hash; leaf; source time; status; extraction-policy hash |
-| `jobs` | `job_id` PK; kind `extract/consolidate`; unique work key; status; attempt count; due time; owner; fence; lease expiry; error code |
-| `extractions` | `extraction_id` PK; source/prompt hash UNIQUE; three output strings; model ref; output hash; outcome; usage; timestamps |
-| `memory_usage` | PK `(consumer_session, run_id, source_id)`; successful detail-read time |
-| `source_stats` | `lineage_key` PK; usage count; last used; processed/retention watermark |
-| `notes` | note ID PK; action; text path/hash; scope; creation; latest applied generation; active/superseded |
+| `source_revisions` | `source_id` PK; `lineage_key`; session/branch/revision UNIQUE; shared snapshot path/hash; leaf; source time; status; normalization-policy hash |
+| `jobs` | `job_id` PK; memory version; kind `extract/consolidate`; version-inclusive unique work key; status; attempt count; due time; owner; fence; lease expiry; error code |
+| `extractions` | extraction ID PK; `(source_id, memory_version, prompt_hash)` UNIQUE; summary/slug strings; raw memory nullable with CHECK NULL for v2/non-NULL for v1; truncation metadata; model; hash; outcome; usage; timestamps |
+| `memory_usage` | PK `(memory_version, consumer_session, run_id, source_id)`; successful detail-read time |
+| `source_stats` | PK `(memory_version, lineage_key)`; usage count; last used; retention watermark |
+| `notes` | shared note ID PK; action; text path/hash; scope; creation; active/superseded |
+| `note_applications` | PK `(note_id, memory_version)`; latest applied note hash/generation; shared control epoch |
 | `tombstones` | target kind/key UNIQUE; creation; reason category; no deleted plaintext |
-| `generations` | generation ID PK; status; base ID; input hash; directory; manifest hash; control epoch; created/published timestamps |
+| `generations` | generation ID PK; memory version; status; same-version base ID; input hash; directory; manifest hash; control epoch; created/published timestamps |
 | `generation_sources` | PK `(generation_id, extraction_id)` |
 | `process_activity` | owner ID PK; session key; activity state; heartbeat expiry |
 | `budget_usage` | PK `(local_day, provider, model)`; reserved/actual input/output; call count |
 
-Use explicit foreign keys where rows have a stable lifetime; avoid cascades that accidentally delete user notes or tombstones. Extracted content may reside in SQLite and published Markdown; deletion must address both copies.
+Use composite version-aware references or equivalent checked transactions to reject cross-version `pipeline_state`, generation-base, and generation-source links. Configuration `version` chooses which row is read; it is not a second generation pointer. Use explicit foreign keys where rows have a stable lifetime; avoid cascades that accidentally delete user notes or tombstones. Extracted content may reside in SQLite and published Markdown; deletion must address both copies.
 
 ### 12.3 Job states
 
 `queued → leased → succeeded | no_output | retry_wait | blocked | cancelled | superseded`.
 
-An expired lease can return to `queued`. `superseded` means evidence changed while work was in progress. `blocked` requires changed configuration or an explicit retry. A successful no-output job remains processed so it does not repeat every startup.
+An expired lease can return to `queued`. `superseded` means evidence changed while work was in progress. `blocked` requires changed configuration or an explicit retry. A successful no-output job remains processed for its own memory version and prompt hash so it does not repeat every startup. It does not suppress extraction by the other version.
 
 ### 12.4 Core interfaces
 
@@ -544,25 +625,31 @@ interface MemoryModelPort {
 }
 
 interface MemoryStore {
-  enqueue(snapshot: SourceSnapshot): Promise<void>;
+  enqueue(snapshot: SourceSnapshot, versions: MemoryVersion[]): Promise<void>;
   claimEligible(owner: string, now: number): Promise<LeasedJob[]>;
-  commitExtraction(job: LeasedJob, output: ExtractionOutput): Promise<boolean>;
+  commitExtraction(job: LeasedJob, result: VersionedExtraction): Promise<boolean>;
   publish(candidate: ValidatedGeneration, fence: number): Promise<boolean>;
-  acquireReadView(): Promise<MemoryReadView | undefined>;
+  acquireReadView(version: MemoryVersion): Promise<MemoryReadView | undefined>;
 }
 ```
 
+`LeasedJob`, `ValidatedGeneration`, and `MemoryReadView` MUST each include `memoryVersion`. A generation includes `generationId`, `controlEpoch`, and a manifest hash; a read view pins those values. The store rejects a job/result/candidate version mismatch independently of TypeScript types.
+
 Names such as `ResolvedMemoryModel` are project-owned contracts to be concretized during implementation, not claimed pi exports. Exact pi declarations must be imported from the pinned peer APIs.
+
+### 12.5 Store schema and legacy draft layouts
+
+Start new installations with this version-aware schema and layout. The earlier document's unversioned `generations/` layout is not a supported public format. If an early local implementation is encountered, disable generation with `legacy_layout_detected` and preserve the files; do not silently label its data v2 or overwrite it. Any supported migration must identify v1 explicitly, verify manifests and provenance, copy into the v1 namespace, and transactionally establish the matching DB rows. A migration is not required for the first release and must never inspect Codex's store.
 
 ## 13. Model configuration and credentials
 
-Extraction and consolidation models are configured independently. On first eligible foreground prompt, if unset, resolve and persist the current pi provider/model as both defaults. Subsequent foreground model switches do not silently change memory model cost or behavior. Users can change each memory model through `/memory model`.
+Extraction and consolidation models are configured independently. Both memory versions use these same two model selections in v0.1; per-version model overrides are outside this release so version comparisons can keep the model constant. On first eligible foreground prompt, if unset, resolve and persist the current pi provider/model as both defaults. Subsequent foreground model switches do not silently change memory model cost or behavior. Users can change each memory model through `/memory model`.
 
 If no model is available, continue read-only memory and show generation as blocked. Never silently switch provider or use a different account.
 
-Use pi's request-time auth and provider resolution. This supports the provider mechanisms actually configured in pi, including custom providers, without reimplementing OAuth or copying tokens. A provider must successfully complete the tool-free JSON probe for extraction and the tool-use probe for consolidation before being considered compatible.
+Use pi's request-time auth and provider resolution. This supports the provider mechanisms actually configured in pi, including custom providers, without reimplementing OAuth or copying tokens. Provider compatibility is tracked by phase, model, and memory version: extraction must satisfy that version's JSON schema, and consolidation must support tool use. A successful normal request can establish compatibility; `/memory test-models` provides explicit standalone paid probes. Switching versions does not assume that success with one schema validates the other.
 
-A DeepSeek model may be selected if available through the user's pi configuration and it passes those probes. This spec does not prescribe a model name, claim a price, or promise equal quality across providers.
+A DeepSeek model may be selected if available through the user's pi configuration and it satisfies those contracts. This spec does not prescribe a model name, claim a price, or promise equal quality across providers.
 
 Use a captured registry/model-port reference only while its owning runtime is valid. Abort all owned memory agents during reload/shutdown; a new runtime resolves fresh references and resumes durable jobs.
 
@@ -576,6 +663,8 @@ Illustrative complete configuration, with user-selected model references initial
   "enabled": true,
   "read": true,
   "generate": true,
+  "version": "v1",
+  "dualWrite": false,
   "captureModes": ["tui"],
   "excludedWorkspaces": [],
   "models": { "extract": null, "consolidate": null },
@@ -591,7 +680,8 @@ Illustrative complete configuration, with user-selected model references initial
     "inputBytes": 262144,
     "toolResultBytes": 8192,
     "extractionOutputBytes": 49152,
-    "summaryBytes": 10000,
+    "summaryBytes": 9999,
+    "v2RolloutSummaryBytes": 9000,
     "toolResponseBytes": 16384,
     "dailyInputTokens": 100000,
     "dailyOutputTokens": 20000,
@@ -602,13 +692,15 @@ Illustrative complete configuration, with user-selected model references initial
 }
 ```
 
+Set `version` to `"v2"` to select the complete v2 pipeline. Set `dualWrite` to `true` only when both should generate; it never merges their read contexts. `version` accepts only `v1` or `v2`. Require `summaryBytes` between 1,024 and 9,999 and `v2RolloutSummaryBytes` between 1,024 and 9,000; the v2 caps cannot be raised via configuration. These are pi JSON settings, not additions to Codex's `config.toml`.
+
 Timezone controls daily budgets and human-facing dates, not storage timestamps. The initial value comes from the host's configured local timezone; the example matches the user's current timezone.
 
 Configuration precedence: explicit extension CLI flag > user configuration > defaults. v0.1 does not load memory policy from repository-controlled files. Reject unknown schema versions and invalid ranges; preserve the file and disable generation rather than overwrite it. Distinguish `enabled=false` from `generate=false, read=true`.
 
 `excludedWorkspaces` applies to both capture and reading: no summary injection or retrieval tools may disclose stored memory while the active cwd is excluded. Canonicalize configured paths and enforce directory-boundary containment rather than string-prefix matching. Excluding a workspace does not itself delete previously captured evidence; use explicit forget for that purpose.
 
-When the store reaches its size cap, prune obsolete unreferenced staging and generations first. Never delete active notes/tombstones, pinned generations, or original sessions to meet the cap. If still full, pause capture/generation with `storage_limit`; reads of valid memory continue. Sanitized source snapshots can be deleted after successful extraction and a seven-day recovery window, provided no job needs them; the original source pointer remains.
+When the store reaches its size cap, prune obsolete unreferenced staging and generations first. Never delete active notes/tombstones, pinned generations, or original sessions to meet the cap. If still full, pause capture/generation with `storage_limit`; reads of valid memory continue. Sanitized source snapshots can be deleted after all currently requested versions have succeeded or returned no output and a seven-day recovery window has elapsed, provided no pending job needs them; the original source pointer remains. When only one version is enabled, the absent second result does not prevent garbage collection forever. Later activation follows the reconstruction rules in Section 5.4. The store cap covers both versions together; pruning must respect pins and must not erase the inactive version merely because a switch occurred.
 
 ## 15. User-facing commands and tools
 
@@ -616,14 +708,16 @@ Use one `/memory` command with subcommands. Outputs should explain the relevant 
 
 | Command | Contract |
 |---|---|
-| `/memory status` | Effective mode/model, active generation, captured vs extracted vs published counts, next due time, budget, last error |
+| `/memory status` | Selected version, dual-write mode, shared capture count/budget, and each version's generation, extraction/publication progress, next due time, readiness, and last error |
 | `/memory doctor` | Read-only checks of host API, paths, schema, file/DB consistency, configuration, model resolution; no paid calls |
-| `/memory test-models` | Explicit bounded paid JSON/tool-use compatibility probes; report actual usage |
-| `/memory inspect` | View summary and source routing; optionally select a source or generation |
-| `/memory run [--now]` | Queue a bounded pass; `--now` skips idle delay for a settled snapshot only |
-| `/memory model extract|consolidate <provider>/<model>` | Validate and persist a model selection |
-| `/memory mode off|read|read-write` | Set durable mode without deleting data |
-| `/memory import <path> --dry-run|--run [--leaf ID]` | Historical import per Section 7.4 |
+| `/memory test-models [--version v1\|v2\|both]` | Explicit bounded paid JSON/tool-use probes; default selected version; report actual usage |
+| `/memory inspect [--version v1\|v2]` | View that version's valid summary and source routing; default selected version; revoked generations remain unavailable |
+| `/memory run [--version v1\|v2\|both] [--now]` | Queue a bounded pass; default configured generation targets; explicit version is a one-run target, not a read-version switch; `--now` skips idle delay for settled sources only |
+| `/memory version v1\|v2` | Persist the selected read version; report ready/warming-up state; apply at the next foreground run |
+| `/memory dual-write on\|off` | Persist dual writing; on means separate model work under the same total budget; off preserves existing versioned data |
+| `/memory model extract\|consolidate <provider>/<model>` | Validate and persist a model selection |
+| `/memory mode off\|read\|read-write` | Set durable mode without deleting data |
+| `/memory import <path> --dry-run\|--run [--leaf ID]` | Historical import per Section 7.4 |
 | `/memory remember <text>` | Add a scoped explicit note and schedule consolidation |
 | `/memory correct <text>` | Add a correction note; invalidate old generated guidance until reconciled |
 | `/memory forget source <source-id>` | Suppress all revisions of a source lineage and invalidate derived memory |
@@ -637,26 +731,28 @@ Forgetting a note removes that evidence item, not every occurrence of its subjec
 
 To support natural-language explicit “remember/correct” requests, a fourth model-callable tool `pi_memory_note` accepts `{action: "remember" | "correct", text, scope}`. Its description restricts use to the user's explicit request. It records the triggering run and user-message pointer when available. It has no general delete capability; deterministic forget commands require concrete source IDs. This is an agent behavior contract, not a guarantee that arbitrary malicious tool callers obey it.
 
+A one-run explicit version request never bypasses global off/read-only mode, exclusions, forgetting, leases, or total budgets. A later explicit version switch cancels remaining requests for an inactive one-run target, following Section 5.4.
+
 No general-purpose standalone CLI is required for v0.1. All core logic remains UI-independent so a future CLI can call the same coordinator.
 
 ## 16. Correction, deletion, and privacy semantics
 
 On source deletion, branch invalidation, context-edit removal, or a user correction/forget:
 
-1. Commit a new `control_epoch` and block affected generated memory from being served. v0.1 may conservatively block the entire generated view.
+1. Commit a new shared `control_epoch` and block affected generated memory in both `pipeline_state` rows, including the inactive version. v0.1 may conservatively block both complete views.
 2. Revoke in-memory reader pins at the next tool/prompt boundary. The currently in-flight model request cannot be recalled.
 3. For explicit forget, record durable suppression/tombstones before deleting outputs; they prevent startup reimport of the same source lineage. Branch changes instead retire the old head without permanently suppressing it. Context edits invalidate affected revisions; corrections add active correction notes. These temporary changes must not accidentally create permanent source-wide forget tombstones.
-4. Rebuild from remaining eligible evidence and active correction notes. For deletion, do not give the consolidator the old potentially contaminated outputs.
-5. Publish a clean generation; unblock reading only after successful validation.
-6. Remove revoked generations and affected staging. Explicit forget or privacy-related context removal also removes affected snapshots/extractions in the extension store, retaining minimal tombstones without deleted text. Ordinary branch retirement may keep historical evidence at rest for later validated reactivation, but cannot serve it through memory tools while retired.
+4. Rebuild each enabled version from its remaining eligible same-version evidence and shared active correction notes. For deletion, do not give either consolidator its old potentially contaminated outputs. An inactive version remains blocked until explicitly activated or run and successfully reconciled.
+5. Publish a clean generation for the completing version; unblock only that version after successful validation at the current shared epoch. Success in v1 does not mark v2 reconciled, or vice versa.
+6. Remove revoked generations and affected staging across both namespaces. Explicit forget or privacy-related context removal also removes affected snapshots/extractions in the extension store, retaining minimal tombstones without deleted text. Ordinary branch retirement may keep historical evidence at rest for later validated reactivation, but cannot serve it through memory tools while retired.
 
-Failure to rebuild leaves memory temporarily unavailable, not stale. Ordinary expiry uses the same invalidation principle; a failing provider must not indefinitely keep expired guidance eligible.
+Failure to rebuild leaves the affected version's memory temporarily unavailable, not stale. Ordinary retention expiry blocks and rebuilds only the version whose evidence expired; it does not create shared tombstones or revoke the other version merely because its usage statistics differ. Shared source/privacy changes still invalidate both versions. Recheck time-sensitive source eligibility during publication and reading so a failing provider cannot indefinitely keep expired guidance eligible.
 
 Deleting memory does not delete pi's original transcript, backups outside this extension, or content already sent to a model provider. State this in command results when relevant. Semantic requests such as “forget everything about X” require selecting concrete sources or submitting a correction; v0.1 does not promise exact semantic erasure by keyword.
 
 Redact obvious credentials and signed/access-bearing URL values before extraction, after extraction, and before publication. Preserve safe references. Test redaction, but do not claim perfect secret detection. Raw source files are never printed in routine logs.
 
-Disabling or uninstalling this package leaves its data intact. `/memory clear` explicitly removes its store and sets generation off before cleanup so it does not immediately recreate memory. Re-enabling capture is a separate user action.
+Disabling or uninstalling this package leaves its data intact. `/memory clear` explicitly removes both version namespaces and shared memory data from its store and sets generation off before cleanup so it does not immediately recreate memory. Re-enabling capture is a separate user action.
 
 ## 17. Error and recovery behavior
 
@@ -675,16 +771,20 @@ Disabling or uninstalling this package leaves its data intact. `/memory clear` e
 | Session switch/reload | Cancel owned jobs; discard old context references; resume under new runtime |
 | pi API mismatch | Disable extension behavior with actionable minimum-version diagnostic |
 | Missing original transcript | Retain already extracted memory with unavailable-source marker unless user forgot it; do not infer a deletion request |
+| Selected version has no valid generation | Show `warming_up` or its actual blocker; omit generated context; never fall back to the other version |
+| v2 schema, size, or artifact violation | Fail that version's job/publication; preserve its prior valid generation unless revoked |
+| One side of dual writing fails | Continue the other under shared limits; report partial progress and separate retries |
+| Version changes while a request is in flight | Finish only a valid fenced result in its original namespace; pin current foreground run and stop subsequent inactive-version requests |
 
 `source file missing` is different from an explicit forget. Retention and suppression must not be inferred from transient filesystem availability.
 
 ## 18. Observability and performance
 
-Record metadata for capture, skipped eligibility, claimed jobs, provider requests, retries, no-output results, validation failures, generation commits, retrieval, and invalidation. Each event includes IDs, duration, bytes, model reference, token/cost data if supplied, and error code. No prompt bodies, credentials, or full tool results in normal logs.
+Record metadata for capture, skipped eligibility, claimed jobs, provider requests, retries, no-output results, validation failures, generation commits, retrieval, and invalidation. Each event includes IDs, memory version where applicable, duration, bytes, model reference, token/cost data if supplied, and error code. Report per-version usage as a breakdown of the same shared totals, not as separate spending allowances. No prompt bodies, credentials, or full tool results in normal logs.
 
-Status distinguishes `captured`, `pending idle window`, `extracting`, `extracted`, `consolidating`, `published`, `blocked`, and `read invalidated`. “Memory enabled” alone is insufficient evidence that useful data was written or injected.
+Status reports the selected version and dual-write targets separately. For each version it distinguishes `warming_up`, `captured`, `pending idle window`, `extracting`, `extracted`, `consolidating`, `published`, `blocked`, and `read invalidated`. “Memory enabled” alone is insufficient evidence that useful data was written or injected.
 
-Proposed performance gates on a 2-vCPU, 4-GB Linux host with local SSD and 256 selected sources:
+Proposed performance gates on a 2-vCPU, 4-GB Linux host with local SSD and 256 selected sources per version (512 versioned extractions in dual-write mode):
 
 - Cached prompt-section preparation: p95 <20 ms; no network.
 - Bounded state/view refresh: p95 <100 ms; fail open after 200 ms.
@@ -713,7 +813,7 @@ These are acceptance targets, not measured claims. Use bounded SQLite operations
 | T10 | Context edit removes sensitive content | New evidence excludes it; previously derived view is invalidated |
 | T11 | Provider retry after `agent_end` | Only final settled snapshot is treated as the completed run |
 | T12 | No reusable signal | No-output result stored once; no repeated extraction churn |
-| T13 | Parallel pi processes | One accepted extraction per revision and one published consolidation winner |
+| T13 | Parallel pi processes | One accepted extraction per revision/version/prompt and one published consolidation winner at a time |
 | T14 | Crash at each publication boundary | Readers see complete old or complete new generation, never a mixture |
 | T15 | Memory tool output appears in session | It is excluded from future extraction; no self-reinforcement loop |
 | T16 | Correction/forget then provider outage | Revoked memory is unavailable; it is not served because rebuild failed |
@@ -723,20 +823,39 @@ These are acceptance targets, not measured claims. Use bounded SQLite operations
 | T20 | Malformed or branching historic JSONL | No file modification; reject ambiguity or require explicit leaf |
 | T21 | Another extension forces system prompt | Diagnose section-injection conflict; do not silently override it |
 | T22 | Disabled or ephemeral mode | No capture/model generation and no unintended persistent artifacts |
+| T23 | v2 extraction schema | Exactly summary + slug; reject extra raw-memory field; v2 DB raw memory remains NULL |
+| T24 | v2 summary crosses 9,000 bytes with Chinese text | Valid UTF-8 and complete retained pointers; omission metadata/marker; accepted summary <= configured cap |
+| T25 | v2 consolidated size boundary | 9,999-byte valid summary passes; 10,000-byte summary fails; marker remains literal `v1` |
+| T26 | v2 consolidation attempts handbook/skill writes | Tools deny them; candidate containing forbidden artifacts cannot publish |
+| T27 | v2 detail retrieval | Summary routes directly to its rollout evidence; no `MEMORY.md` read or v1 fallback |
+| T28 | v1 → unbuilt v2 → v1 switch | v2 shows warm-up without inherited context; v1 files remain intact and reusable if still valid |
+| T29 | Mid-run switch and delayed provider completion | Foreground version pin stays stable; late result writes only to its original version |
+| T30 | Dual writing with one failed model request | Separate watermarks/retries; successful version remains usable; combined budget is unchanged |
+| T31 | v1 no-output result followed by v2 processing | v2 is still eligible for its own extraction; no repeated jobs after each version is processed |
+| T32 | Forget/correction while v2 is inactive | Both versions are revoked; switching cannot revive deleted or superseded guidance |
+| T33 | Cross-version manifest, source reference, cursor, or DB pointer | Reject mismatch before any content is served or published |
+| T34 | Enable second version after snapshot pruning | Reconstruct enrolled evidence read-only or report unavailable; never learn from other-version outputs |
+| T35 | Shared notes during dual writing | Both apply the same active note revision independently; one publication does not mark the other applied |
+| T36 | v2 has no remaining evidence/notes | Publish minimal valid summary without a handbook or invented pointers |
+| T37 | Version-sensitive dirty checks and retention | Changes/no-op/expiry are evaluated per version; shared privacy invalidation affects both |
+| T38 | Config changes, restart, and conflicting commands | Selected version/dual-write persist; unrelated settings survive; only the selected profile is injected |
 
-Use deterministic fake model responses for state-machine and crash tests. These tests do not establish memory quality; use real models for the next gate.
+Run T01–T22 against both memory versions; execute T23–T38 for the stated version/cross-version cases. Use deterministic fake model responses for state-machine and crash tests. These tests do not establish memory quality; use real models for the next gate.
 
 ### 19.2 Semantic evaluation
 
 Create at least 30 self-contained multi-session cases: 10 decisions/rationale, 5 scoped preferences, 5 failures/open work, 5 corrections/branch conflicts, and 5 noise/abstention cases. At least 10 contain Chinese or mixed-language discussion, and at least 5 contain no tool calls. Each case includes expected facts, prohibited claims, evidence pointers, and query intent.
 
-Compare three modes using the same answering model and query prompts:
+Compare four modes using the same source snapshots, extraction/consolidation model choices, answering model, and query prompts:
 
 1. No cross-session memory.
 2. A manually curated compact summary baseline.
-3. This implementation's generated memory.
+3. This implementation's v1 memory.
+4. This implementation's v2 memory.
 
-Run three repetitions per case, record model IDs/prompt hashes and costs, and review ambiguous scores manually. Release targets:
+Use separate fresh answering sessions and isolated evaluation stores so injected context, tool history, and usage ranking cannot leak between modes. Dual writing is a generation option, not a fifth combined-read strategy. Report extraction/consolidation cost, injected bytes, detail-read count, latency, and grounded answer quality separately for v1 and v2.
+
+Run three repetitions per case and mode, record model IDs/prompt hashes and costs, and review ambiguous scores manually. Each version must independently meet these release targets:
 
 - >=90% correct adopted decision + rationale on the decision cases.
 - Zero critical invented approval, reversed decision, wrong-project action, or forgotten-source disclosure in the required fixtures.
@@ -748,7 +867,7 @@ Scores are go/no-go engineering targets for these fixtures, not public claims ab
 
 ### 19.3 Ready-to-release gate
 
-All T01–T22 pass; actual pi TUI and one read-only noninteractive path are exercised; crash/concurrency tests pass; semantic targets are met; no credentials appear in generated/log fixtures; installation/removal preserves unrelated pi settings; source/prompt provenance and licenses are included.
+All T01–T38 pass in their required version matrix; actual pi TUI and one read-only noninteractive path are exercised with both versions; switch/dual-write and crash/concurrency tests pass; each version meets the semantic targets; no credentials appear in generated/log fixtures; installation/removal preserves unrelated pi settings; source/prompt provenance and licenses are included.
 
 ## 20. Implementation organization
 
@@ -764,14 +883,15 @@ Suggested modules:
 | `src/capture/import.ts` | Read-only historical parser |
 | `src/state/db.ts`, `migrations/` | SQLite schema, transactions, leases, fencing |
 | `src/pipeline/scheduler.ts` | Eligibility, one-shot scheduling, budgets |
-| `src/pipeline/extract.ts` | Phase 1 request and validation |
+| `src/pipeline/extract.ts` | Shared Phase 1 execution with version-specific policy |
+| `src/versions/v1.ts`, `src/versions/v2.ts` | Prompt set, JSON schema, writer allowlist, artifact validation, and read guidance |
 | `src/pipeline/consolidate.ts` | Restricted agent-core loop and tools |
 | `src/pipeline/publish.ts` | Staging validation, fsync, generation CAS |
 | `src/read/` | Prompt section, search/read/list, generation pins |
 | `src/control/` | Notes, correction, forgetting, invalidation |
 | `src/commands/` | `/memory` interface and diagnostics |
-| `prompts/upstream/` | Immutable pinned Codex source templates |
-| `prompts/pi/` | Explicitly adapted templates and rendering |
+| `prompts/upstream/v1/`, `prompts/upstream/v2/` | Immutable pinned Codex prompt families |
+| `prompts/pi/v1/`, `prompts/pi/v2/` | Reviewed per-version adaptations and rendering |
 | `eval/` | Fixtures, expected evidence, runner and score reports |
 | `UPSTREAM.md`, `NOTICE`, `LICENSE` | Provenance and attribution |
 
@@ -801,10 +921,10 @@ Local installation for the developed package is `pi install ./pi-memory`; restar
 ## 21. Delivery sequence
 
 1. **Source and compatibility baseline:** pin sources, record licenses/adaptations, establish host API tests, implement read-only normalized session fixtures. Exit: branch/compaction/context-edit fixtures are correct.
-2. **Durable capture and Phase 1:** implement state, leases, model port, budgets, output validation, no-output behavior. Exit: discussion-only extraction and restart tests pass.
-3. **Consolidation and publication:** add confined tools, workspace diff, schemas, atomic generation commit, recovery. Exit: crash/concurrency tests pass.
-4. **Read path and controls:** add bounded section injection, read tools, explicit notes, invalidation/forget, status/doctor. Exit: no prompt-path network calls and no revoked-memory readback.
-5. **Quality gate and packaging:** run real-model comparisons, resolve failing categories, document measured footprint and model configuration, package for pi installation.
+2. **Durable capture and both Phase 1 contracts:** implement shared state, version-scoped jobs, leases, model port, budgets, separate prompts/schemas, truncation, and no-output behavior. Exit: discussion-only extraction, v2 field/byte boundaries, and restart tests pass.
+3. **Both consolidation and publication paths:** add confined tools, per-version workspace diffs/allowlists/validators, atomic per-version generation commits, and recovery. Exit: v2 publishes without a handbook; forbidden outputs and cross-version references fail; crash/concurrency tests pass.
+4. **Read paths, switching, and controls:** add version-specific injection/retrieval, persistent version selection, bounded dual writing, shared notes/forget, and per-version status/doctor. Exit: no prompt-path network calls, mixed-version context, or revoked-memory readback.
+5. **Quality gate and packaging:** run both real-model evaluations and the switch/dual-write matrix, resolve failing categories, document measured footprint/cost/quality by version and model configuration, and package for pi installation. A v1-only implementation does not satisfy v0.1.0.
 
 Do not implement synchronization or additional memory backends before the semantic gate establishes value. No change to `pi-bridge` or a new GitHub repository is implied by this document alone.
 
@@ -813,16 +933,19 @@ Do not implement synchronization or additional memory backends before the semant
 | Element | Decision |
 |---|---|
 | Rust memory runtime | Reimplement behavior in TS; no runtime dependency on Codex binary |
-| v1 extraction/consolidation/read prompts | Vendor pinned originals, adapt names/APIs with a reviewed change log |
-| v1 schemas and progressive disclosure | Preserve core structure |
-| v2 provenance-priority input idea | Adopt narrowly for bounded pi input; label as an adaptation |
+| v1 and v2 extraction/consolidation/read prompts | Vendor both pinned families; adapt names/APIs with separate reviewed change logs |
+| v1 schemas and progressive disclosure | Preserve core structure; require string slug as an explicit pi normalization |
+| v2 schemas and direct summary retrieval | Required; no raw memory, handbook, or generated skills; enforce 9,000-byte rollout and <10,000-byte consolidated-summary contracts |
+| v2 rollout truncation | Preserve bounded-summary behavior; use the documented complete-paragraph/line boundary adaptation and omission metadata |
+| Version selection and dual writing | Implement both; one selected reader; shared budgets and version-isolated generated state |
+| v2 provenance-priority input | Adapt to pi message types and share with v1; keep per-version prompts/output schemas distinct |
 | Root-session detection | Use pi mode/launcher contract; do not invent a universal pi root flag |
 | Codex state database | New independent SQLite schema |
 | Git-baseline memory workspace | Replace with manifest diff + immutable generations |
 | Codex consolidation subagent | Replace with in-memory pi agent-core and restricted tools |
 | Codex quota metadata | Replace with explicit provider-neutral budgets |
 | Codex private citation format | Replace with ordinary evidence references and tool metadata |
-| Generated skills/scripts | Prose procedures only; no auto-registered executable skills |
+| Generated skills/scripts | v1 prose procedures only; none in v2; no auto-registered executable skills |
 | Global personal vs project scope | One independent pi user store with explicit project/checkout applicability |
 | Live sharing with Codex/Claude-mem | Excluded |
 
@@ -832,6 +955,7 @@ Preserve Apache-2.0 attribution for reused Codex material and applicable MIT not
 
 - The user's installed pi version has not been inspected. Compatibility is pinned to the researched host API; older installs may require upgrading or a separately specified adapter.
 - These are source-level findings, not an end-to-end runtime benchmark. SDK/tool-call plumbing, cancellation timing, SQLite behavior, and provider compatibility must pass the defined implementation gates.
+- Supporting both pipelines does not establish that either has better recall. Default v1 is an upstream-aligned selection, not a measured quality ranking. Switching cannot remove old injected text from an existing conversation; fresh sessions are required for clean comparisons.
 - Prompt quality and model quality remain material. A correct scheduler cannot guarantee faithful extraction or useful recall.
 - Literal retrieval can miss paraphrases. The initial remedy is better routing summaries and keyword coverage, measured through the evaluation suite.
 - A shared user-level pi store is not a security boundary between mutually untrusted projects. v0.1 is for one user's trusted workspaces; exclude sensitive workspaces or disable reading there.
@@ -840,7 +964,7 @@ Preserve Apache-2.0 attribution for reused Codex material and applicable MIT not
 
 ## 24. Source references
 
-The source links below are pinned to the inspected commits. They are the implementation basis; mutable README prose does not override the code.
+The implementation-basis links below are pinned to the inspected commits; C11 additionally links the checked 0.157.1 release tag for configuration defaults. They are the implementation basis; mutable README prose does not override the code.
 
 ### Codex
 
@@ -854,6 +978,8 @@ The source links below are pinned to the inspected commits. They are the impleme
 - **C8 — Reader and literal search:** [ext/memories/src/prompts.rs](https://github.com/openai/codex/blob/1cc7e2361237ce7244430ee1d581c77f95c57ac8/codex-rs/ext/memories/src/prompts.rs), [read_path.md](https://github.com/openai/codex/blob/1cc7e2361237ce7244430ee1d581c77f95c57ac8/codex-rs/ext/memories/templates/memories/read_path.md), [local/search.rs](https://github.com/openai/codex/blob/1cc7e2361237ce7244430ee1d581c77f95c57ac8/codex-rs/ext/memories/src/local/search.rs).
 - **C9 — License:** [LICENSE](https://github.com/openai/codex/blob/1cc7e2361237ce7244430ee1d581c77f95c57ac8/LICENSE).
 - **C10 — v2 prompts:** [stage_one_system_v2.md](https://github.com/openai/codex/blob/1cc7e2361237ce7244430ee1d581c77f95c57ac8/codex-rs/memories/write/templates/memories/stage_one_system_v2.md), [consolidation_v2.md](https://github.com/openai/codex/blob/1cc7e2361237ce7244430ee1d581c77f95c57ac8/codex-rs/memories/write/templates/memories/consolidation_v2.md), [read_path_v2.md](https://github.com/openai/codex/blob/1cc7e2361237ce7244430ee1d581c77f95c57ac8/codex-rs/ext/memories/templates/memories/read_path_v2.md).
+
+- **C11 — Codex 0.157.1 feature gate and version defaults:** [features/src/lib.rs](https://github.com/openai/codex/blob/rust-v0.157.1/codex-rs/features/src/lib.rs), [config/src/types.rs](https://github.com/openai/codex/blob/rust-v0.157.1/codex-rs/config/src/types.rs).
 
 ### Pi
 

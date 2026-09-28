@@ -114,9 +114,21 @@ export function loadConfig(root: string, opts?: { timezone?: string; create?: bo
     if (opts?.create === false) {
       return { status: "missing", path };
     }
-    const config = defaultConfig(opts?.timezone ?? "UTC");
-    writeConfigAtomic(path, config);
-    return { status: "created", config, path };
+    // Create under the same control lock updateConfig uses, so a locked
+    // update in another process can never be renamed over (and vice versa).
+    // If the lock is held, report missing rather than racing the writer.
+    const lockDir = join(root, "config.json.lock");
+    mkdirSync(root, { recursive: true });
+    if (!acquireLock(lockDir)) {
+      return { status: "missing", path };
+    }
+    try {
+      const config = defaultConfig(opts?.timezone ?? "UTC");
+      writeConfigAtomic(path, config);
+      return { status: "created", config, path };
+    } finally {
+      rmSync(lockDir, { recursive: true, force: true });
+    }
   }
   let raw: unknown;
   try {
@@ -259,6 +271,10 @@ export function updateConfig(
 ): { ok: true; config: MemoryConfig } | { ok: false; reason: string } {
   const attempts = opts?.maxAttempts ?? 5;
   const lockDir = join(root, "config.json.lock");
+  // The root may not exist yet (first-ever update): create it before
+  // acquiring the lock, otherwise mkdir of the lock dir fails ENOENT and
+  // the update would be misreported as lock contention.
+  mkdirSync(root, { recursive: true });
   for (let i = 0; i < attempts; i++) {
     if (!acquireLock(lockDir)) {
       briefSleep(25 * (i + 1));
@@ -266,20 +282,23 @@ export function updateConfig(
     }
     try {
       // Fresh read under the lock: the mutation always applies to the
-      // newest committed content.
-      const loaded = loadConfig(root, opts);
+      // newest committed content. create:false avoids nested lock
+      // acquisition; a missing file starts from in-memory defaults and is
+      // created by the final write below.
+      const loaded = loadConfig(root, { ...opts, create: false });
       if (loaded.status === "invalid") {
         return { ok: false, reason: `config invalid: ${loaded.problems.join("; ")}` };
       }
-      if (loaded.status === "missing") {
-        return { ok: false, reason: "config missing and could not be created" };
-      }
-      const next = mutate(loaded.config);
+      const current =
+        loaded.status === "missing"
+          ? defaultConfig(opts?.timezone ?? "UTC")
+          : loaded.config;
+      const next = mutate(current);
       const problems = validateConfig(next);
       if (problems.length > 0) {
         return { ok: false, reason: `mutation produced invalid config: ${problems.join("; ")}` };
       }
-      writeConfigAtomic(loaded.path, next);
+      writeConfigAtomic(join(root, CONFIG_FILE), next);
       return { ok: true, config: next };
     } finally {
       rmSync(lockDir, { recursive: true, force: true });

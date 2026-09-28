@@ -179,3 +179,21 @@ test("invalid IANA timezones are rejected; valid ones accepted", () => {
     assert.deepEqual(validateConfig({ ...defaultConfig("UTC"), timezone: tz }), []);
   }
 });
+
+test("updateConfig on a fresh root creates it and applies the mutation", (t) => {
+  const root = join(makeRoot(t), "memory"); // memory root itself does not exist yet
+  const result = updateConfig(root, (c) => ({ ...c, dualWrite: true }), { timezone: "UTC" });
+  assert.equal(result.ok, true);
+  const reloaded = loadConfig(root);
+  assert.equal(reloaded.status, "ok");
+  if (reloaded.status === "ok") assert.equal(reloaded.config.dualWrite, true);
+});
+
+test("loadConfig create path respects a held control lock instead of racing it", (t) => {
+  const root = makeRoot(t);
+  mkdirSync(join(root, "config.json.lock")); // foreign writer active
+  const result = loadConfig(root, { timezone: "UTC" });
+  // Must not write defaults over an in-flight locked update: reports missing instead
+  assert.equal(result.status, "missing");
+  assert.throws(() => readFileSync(join(root, "config.json")));
+});

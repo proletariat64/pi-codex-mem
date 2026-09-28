@@ -124,6 +124,9 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     state.modelRegistry = (ctx as { modelRegistry?: { find?: unknown } }).modelRegistry ?? null;
+    // Per-session observations reset: a previous session's missing-sections
+    // run must not poison this session's diagnostics.
+    state.promptSections = "unobserved";
     const caps = await probeHost(ctx);
     state.compat = checkHostCompat(caps);
     const root = resolveMemoryRoot();
@@ -171,6 +174,10 @@ export default function (pi: ExtensionAPI) {
       // of leaving the capability looking merely unobserved.
       state.promptSections = "unavailable";
     }
+    // spec §5.4: sample configuration before each foreground run, so
+    // mid-session edits take effect here rather than only at restart.
+    // Read-only: never creates the file.
+    state.config = loadConfig(resolveMemoryRoot(), { create: false });
   });
 
   function gatherDoctorInput(): DoctorInput {

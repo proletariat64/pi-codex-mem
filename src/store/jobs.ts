@@ -55,20 +55,41 @@ export function enqueueExtraction(db: DatabaseSync, item: {
   }
 }
 
+function recoverExpired(db: DatabaseSync, now: number): void {
+  db.prepare(
+    `UPDATE jobs SET status = 'blocked', error_code = 'max_attempts', owner = NULL, lease_expires_at = NULL
+     WHERE status = 'leased' AND lease_expires_at <= ? AND attempt_count >= ?`,
+  ).run(now, MAX_NETWORK_ATTEMPTS);
+  db.prepare(
+    `UPDATE jobs SET status = 'queued', owner = NULL, lease_expires_at = NULL
+     WHERE status = 'leased' AND lease_expires_at <= ? AND attempt_count < ?`,
+  ).run(now, MAX_NETWORK_ATTEMPTS);
+  // A graceful shutdown cancels the live request, but not the durable work.
+  db.prepare(
+    `UPDATE jobs SET status = 'queued', due_at = ?, error_code = NULL
+     WHERE status = 'cancelled' AND attempt_count < ?`,
+  ).run(now, MAX_NETWORK_ATTEMPTS);
+}
+
+/** Recover crashed workers at startup even if no other source is already due. */
+export function recoverExpiredExtractions(db: DatabaseSync, now: number): void {
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    recoverExpired(db, now);
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
+}
+
 /** Claim bounded store-wide slots without holding SQLite open during provider I/O. */
 export function claimDueExtractions(db: DatabaseSync, opts: {
   owner: string; now: number; limit: number; slots?: number; minIdleMs?: number; maxAgeMs?: number;
 }): LeasedJob[] {
   db.exec("BEGIN IMMEDIATE");
   try {
-    db.prepare(
-      `UPDATE jobs SET status = 'blocked', error_code = 'max_attempts', owner = NULL, lease_expires_at = NULL
-       WHERE status = 'leased' AND lease_expires_at <= ? AND attempt_count >= ?`,
-    ).run(opts.now, MAX_NETWORK_ATTEMPTS);
-    db.prepare(
-      `UPDATE jobs SET status = 'queued', owner = NULL, lease_expires_at = NULL
-       WHERE status = 'leased' AND lease_expires_at <= ? AND attempt_count < ?`,
-    ).run(opts.now, MAX_NETWORK_ATTEMPTS);
+    recoverExpired(db, opts.now);
     const active = (db.prepare("SELECT COUNT(*) AS n FROM jobs WHERE status = 'leased' AND lease_expires_at > ?")
       .get(opts.now) as { n: number }).n;
     const capacity = Math.max(0, Math.min(opts.limit, (opts.slots ?? 2) - active));
@@ -137,10 +158,19 @@ export function deferExtractionForBudget(db: DatabaseSync, job: LeasedJob,
   ).run(nextDue, reason, now, job.jobId, job.owner, job.fence, now).changes === 1;
 }
 
+/** Pause after an in-flight request when foreground work resumed. Keep consumed attempts. */
+export function pauseExtraction(db: DatabaseSync, job: LeasedJob, now: number): boolean {
+  return db.prepare(
+    `UPDATE jobs SET status = 'retry_wait', due_at = ?, error_code = 'foreground_active',
+       owner = NULL, lease_expires_at = NULL, updated_at = ?
+     WHERE job_id = ? AND status = 'leased' AND owner = ? AND fence = ? AND lease_expires_at > ?`,
+  ).run(now, now, job.jobId, job.owner, job.fence, now).changes === 1;
+}
+
 /** Retry transient failures with bounded backoff; never mutate another lease's job. */
 export function failExtraction(
   db: DatabaseSync, job: LeasedJob, kind: "transient" | "blocked" | "cancelled",
-  errorCode: string, now: number,
+  errorCode: string, now: number, options?: { retryAfterMs?: number },
 ): boolean {
   db.exec("BEGIN IMMEDIATE");
   try {
@@ -161,7 +191,8 @@ export function failExtraction(
         current.latest_revision !== job.sourceId) status = "superseded";
     else if (kind === "transient") status = current.attempt_count >= MAX_NETWORK_ATTEMPTS ? "blocked" : "retry_wait";
     else status = kind;
-    const delay = current.attempt_count === 1 ? 60_000 : current.attempt_count === 2 ? 300_000 : 1_800_000;
+    const backoff = current.attempt_count === 1 ? 60_000 : current.attempt_count === 2 ? 300_000 : 1_800_000;
+    const delay = Math.max(backoff, options?.retryAfterMs ?? 0);
     db.prepare(
       `UPDATE jobs SET status = ?, error_code = ?, due_at = ?, owner = NULL,
         lease_expires_at = NULL, updated_at = ? WHERE job_id = ?`,

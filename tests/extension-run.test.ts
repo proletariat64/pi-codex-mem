@@ -23,6 +23,8 @@ test("/memory run --now extracts a settled v1 snapshot through Pi's model regist
   const entry = { type: "message", id: "u1", parentId: null, timestamp: new Date().toISOString(),
     message: { role: "user", content: [{ type: "text", text: "We chose TypeScript" }], timestamp: Date.now() } };
   writeFileSync(file, JSON.stringify(header) + "\n" + JSON.stringify(entry) + "\n");
+  let branch: Array<Omit<typeof entry, "parentId"> & { parentId: string | null }> = [entry];
+  let leafId = "u1";
   const model = { provider: "mock", id: "extract", contextWindow: 200_000, maxTokens: 8_000 };
   const requests: unknown[] = [];
   const mock = makeMockPi(); memoryExtension(mock.pi);
@@ -37,12 +39,13 @@ test("/memory run --now extracts a settled v1 snapshot through Pi's model regist
         usage: { input: 300, output: 60 } }) };
       },
     },
-    sessionManager: { getBranch: () => [entry], getHeader: () => header, getSessionFile: () => file, getLeafId: () => "u1" },
+    sessionManager: { getBranch: () => branch, getHeader: () => header, getSessionFile: () => file, getLeafId: () => leafId },
     ui: { notify: (message: string) => notifications.push(message) },
   };
   await mock.fire("session_start", { type: "session_start" }, ctx);
   await mock.fire("before_agent_start", { type: "before_agent_start", systemPromptOptions: { sections: {} } }, ctx);
   await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
+  assert.equal(requests.length, 0, "the default six-hour idle window prevents immediate automatic work");
 
   await mock.commands.get("memory")!.handler("run --now", ctx);
 
@@ -60,5 +63,20 @@ test("/memory run --now extracts a settled v1 snapshot through Pi's model regist
   const cfg = JSON.parse(readFileSync(join(agentDir, "memory", "config.json"), "utf8"));
   assert.deepEqual(cfg.models.extract, { provider: "mock", modelId: "extract" });
   assert.deepEqual(cfg.models.consolidate, { provider: "mock", modelId: "extract" });
+  await mock.commands.get("memory")!.handler("status", ctx);
+  assert.match(notifications.at(-1) ?? "", /v1 extraction: extracted/);
+
+  const configPath = join(agentDir, "memory", "config.json");
+  writeFileSync(configPath, JSON.stringify({ ...cfg, limits: { ...cfg.limits, dailyInputTokens: 100 } }));
+  const next = { ...entry, id: "u2", parentId: "u1", timestamp: new Date().toISOString(),
+    message: { ...entry.message, content: [{ type: "text", text: "Further TypeScript decision" }] } };
+  branch = [entry, next]; leafId = "u2";
+  await mock.fire("before_agent_start", { type: "before_agent_start", systemPromptOptions: { sections: {} } }, ctx);
+  await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
+  await mock.commands.get("memory")!.handler("run --now", ctx);
+  assert.match(notifications.at(-1) ?? "", /budget_deferred \(input_budget\)/);
+  assert.equal(requests.length, 1, "budget exhaustion must not make a provider request");
+  await mock.commands.get("memory")!.handler("status", ctx);
+  assert.match(notifications.at(-1) ?? "", /v1 extraction: retry_wait — input_budget/);
   await mock.fire("session_shutdown", { type: "session_shutdown" }, ctx);
 });

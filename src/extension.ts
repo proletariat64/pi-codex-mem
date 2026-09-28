@@ -26,9 +26,9 @@ import {
   type HostCapabilities,
 } from "./pi/compat.ts";
 import { runDoctor, type DoctorInput } from "./doctor.ts";
-import { claimDueExtractions, enqueueExtraction } from "./store/jobs.ts";
+import { clearProcessActivity, enqueueExtraction, recordProcessActivity } from "./store/jobs.ts";
 import { createRegistryModelPort } from "./extraction/model-port.ts";
-import { runV1Extraction } from "./extraction/runner.ts";
+import { ExtractionScheduler } from "./extraction/scheduler.ts";
 import { v1PromptHash } from "./extraction/v1.ts";
 
 const EXTENSION_VERSION = "0.1.0";
@@ -120,6 +120,12 @@ export default function (pi: ExtensionAPI) {
     capture: null,
     captureError: null,
   };
+  const activityOwner = randomUUID();
+  let scheduler: ExtractionScheduler | null = null;
+  let heartbeat: NodeJS.Timeout | null = null;
+  let foregroundIdle = true;
+  let activeCwd = "";
+  let activeMode = "";
 
   pi.registerFlag("pi-memory-mode", {
     description: "Pi Memory runtime mode: off | read | read-write (overrides config)",
@@ -140,6 +146,65 @@ export default function (pi: ExtensionAPI) {
       return { mode: modeFromConfig(cfg.config), source: "config" };
     }
     return { mode: "off", source: "config" };
+  }
+
+  function ensureScheduler(ctx: ExtensionContext): void {
+    if (scheduler || !state.db || !state.compat?.supported || !ctx.modelRegistry) return;
+    const root = resolveMemoryRoot();
+    if (rootPointsIntoForeignMemory(root) || legacyLockPath(root)) return;
+    const port = createRegistryModelPort(ctx.modelRegistry);
+    scheduler = new ExtractionScheduler({ db: state.db, root, modelPort: () => port,
+      now: Date.now, isForegroundIdle: () => foregroundIdle,
+      onError: (err) => { state.captureError = `scheduler failed: ${(err as Error).message}`; },
+      config: () => {
+        const loaded = loadConfig(root, { create: false });
+        if (loaded.status !== "ok" || !loaded.config.enabled || !loaded.config.generate ||
+            flagMode() === "off" || flagMode() === "read" ||
+            !loaded.config.captureModes.includes(activeMode as typeof ctx.mode) ||
+            isExcludedWorkspace(activeCwd, loaded.config.excludedWorkspaces)) return null;
+        return loaded.config;
+      },
+    });
+  }
+
+  function triggerScheduler(): void { scheduler?.trigger(); }
+
+  function markForegroundActive(ctx: ExtensionContext): void {
+    foregroundIdle = false;
+    scheduler?.foregroundStarted();
+    if (heartbeat) clearInterval(heartbeat);
+    heartbeat = null;
+    try {
+      const header = ctx.sessionManager.getHeader();
+      const file = ctx.sessionManager.getSessionFile();
+      if (!state.db || !header || !file) return;
+      const sessionKey = computeSessionKey(getAgentDir(), file, header.id);
+      const beat = () => {
+        try {
+          if (state.db) recordProcessActivity(state.db, { owner: activityOwner, sessionKey,
+            state: "active", now: Date.now() });
+        } catch (err) {
+          state.captureError = `activity heartbeat failed: ${(err as Error).message}`;
+        }
+      };
+      beat();
+      heartbeat = setInterval(beat, 30_000);
+      heartbeat.unref();
+    } catch {
+      // Ephemeral/unavailable session metadata must not break the foreground run.
+    }
+  }
+
+  function markForegroundSettled(): void {
+    if (heartbeat) clearInterval(heartbeat);
+    heartbeat = null;
+    foregroundIdle = true;
+    try {
+      if (state.db) clearProcessActivity(state.db, activityOwner);
+      scheduler?.foregroundSettled();
+    } catch (err) {
+      state.captureError = `scheduler failed: ${(err as Error).message}`;
+    }
   }
 
   async function probeHost(ctx: { sessionManager?: unknown; modelRegistry?: unknown }): Promise<HostCapabilities> {
@@ -167,11 +232,19 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.on("session_start", async (_event, ctx) => {
+    if (heartbeat) clearInterval(heartbeat);
+    heartbeat = null;
+    await scheduler?.stop();
+    scheduler = null;
+    if (state.db) clearProcessActivity(state.db, activityOwner);
     state.db?.close();
     state.db = null;
     state.capture = null;
     state.captureError = null;
     state.modelRegistry = (ctx as { modelRegistry?: { find?: unknown } }).modelRegistry ?? null;
+    activeCwd = ctx.cwd;
+    activeMode = ctx.mode;
+    foregroundIdle = typeof ctx.isIdle === "function" ? ctx.isIdle() : true;
     // Per-session observations reset: a previous session's missing-sections
     // run must not poison this session's diagnostics.
     state.promptSections = "unobserved";
@@ -240,6 +313,12 @@ export default function (pi: ExtensionAPI) {
     if (legacy && ctx.hasUI && state.config.status !== "missing") {
       ctx.ui.notify(`pi-memory: ${legacyLockRecovery(legacy)}; configuration updates blocked`, "warning");
     }
+    try {
+      ensureScheduler(ctx);
+      triggerScheduler();
+    } catch (err) {
+      state.captureError = `scheduler startup failed: ${(err as Error).message}`;
+    }
   });
 
   function captureNow(ctx: ExtensionContext): void {
@@ -268,7 +347,8 @@ export default function (pi: ExtensionAPI) {
         },
       });
       state.captureError = null;
-      if (state.capture.status === "captured" && config.config.generate) {
+      if (state.capture.status === "captured" && config.config.generate &&
+          (config.config.version === "v1" || config.config.dualWrite)) {
         enqueueExtraction(state.db, { sourceId: state.capture.sourceId,
           memoryVersion: "v1", promptHash: v1PromptHash(), now: Date.now() });
       }
@@ -278,7 +358,11 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  pi.on("agent_settled", (_event, ctx) => captureNow(ctx));
+  pi.on("agent_start", (_event, ctx) => markForegroundActive(ctx));
+  pi.on("agent_settled", (_event, ctx) => {
+    captureNow(ctx);
+    markForegroundSettled();
+  });
   pi.on("session_before_compact", (_event, ctx) => captureNow(ctx));
 
   pi.on("session_tree", (_event, ctx) => {
@@ -297,13 +381,19 @@ export default function (pi: ExtensionAPI) {
       // new branch is captured and validated (§5.3, T08).
       retireOtherHeads(state.db, key, "");
       state.capture = null;
+      scheduler?.trigger();
     } catch (err) {
       state.captureError = `tree reconciliation failed: ${(err as Error).message}`;
     }
   });
 
-  pi.on("session_shutdown", (_event, ctx) => {
+  pi.on("session_shutdown", async (_event, ctx) => {
+    if (heartbeat) clearInterval(heartbeat);
+    heartbeat = null;
+    await scheduler?.stop();
+    scheduler = null;
     try {
+      if (state.db) clearProcessActivity(state.db, activityOwner);
       captureNow(ctx);
     } finally {
       state.db?.close();
@@ -312,6 +402,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", (event, ctx) => {
+    markForegroundActive(ctx);
     const opts = event.systemPromptOptions as { sections?: unknown } | undefined;
     if (opts && typeof opts === "object" && "sections" in opts) {
       state.promptSections = "confirmed";
@@ -328,7 +419,9 @@ export default function (pi: ExtensionAPI) {
     state.config = loadConfig(root, { create: false });
     const cfg = state.config;
     if (state.compat?.supported && cfg.status === "ok" && cfg.config.enabled && cfg.config.generate &&
-        ctx.model && !rootPointsIntoForeignMemory(root) && !legacyLockPath(root) &&
+        ctx.model && cfg.config.captureModes.includes(ctx.mode) &&
+        flagMode() !== "off" && flagMode() !== "read" &&
+        !rootPointsIntoForeignMemory(root) && !legacyLockPath(root) &&
         !isExcludedWorkspace(ctx.cwd, cfg.config.excludedWorkspaces) &&
         (cfg.config.models.extract === null || cfg.config.models.consolidate === null)) {
       const ref = { provider: ctx.model.provider, modelId: ctx.model.id };
@@ -404,6 +497,33 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
+  function extractionStatusLine(root: string): string {
+    const storePath = join(root, "state.sqlite");
+    if (!state.db && (storeSchemaState(root) !== "current" || lstatSync(storePath).isSymbolicLink())) {
+      return "v1 extraction: not queued";
+    }
+    const db = state.db ?? new DatabaseSync(storePath, { readOnly: true });
+    try {
+      const row = db.prepare(
+        `SELECT j.status, j.error_code, j.due_at FROM jobs j
+         JOIN source_revisions r ON r.source_id = j.source_id
+         JOIN branch_heads h ON h.session_key = r.session_key AND h.branch_id = r.branch_id
+         WHERE j.kind = 'extract' AND j.memory_version = 'v1'
+           AND h.state = 'active' AND h.latest_revision = r.source_id
+         ORDER BY j.updated_at DESC LIMIT 1`,
+      ).get() as { status: string; error_code: string | null; due_at: number } | undefined;
+      if (!row) return "v1 extraction: not queued";
+      const outcome = row.status === "leased" ? "extracting" : row.status === "succeeded" ? "extracted" : row.status;
+      const reason = row.error_code ? ` — ${row.error_code}` : "";
+      const due = row.status === "retry_wait" ? ` (next due ${new Date(row.due_at).toISOString()})` : "";
+      return `v1 extraction: ${outcome}${reason}${due}`;
+    } catch {
+      return "v1 extraction: store unavailable";
+    } finally {
+      if (!state.db) db.close();
+    }
+  }
+
   function statusLines(): string[] {
     const root = resolveMemoryRoot();
     const lines = [`pi-memory ${EXTENSION_VERSION} (pi ${PI_VERSION})`, `memory root: ${root}`];
@@ -431,10 +551,11 @@ export default function (pi: ExtensionAPI) {
             ? "store: unavailable or corrupt (preserved)"
             : "store: not initialized yet",
         state.capture?.status === "captured"
-          ? `capture: captured (${state.capture.sourceId}), pending idle window`
+          ? `capture: captured (${state.capture.sourceId})`
           : state.capture?.status === "ephemeral"
             ? "capture: ephemeral (no persistent session)"
             : "capture: pending settlement",
+        extractionStatusLine(root),
         ...(state.captureError ? [`capture error: ${state.captureError}`] : []),
       );
     }
@@ -468,45 +589,32 @@ export default function (pi: ExtensionAPI) {
     const cfg = loadConfig(root, { create: false });
     if (!state.compat?.supported || rootPointsIntoForeignMemory(root) || legacyLockPath(root) ||
         cfg.status !== "ok" || !cfg.config.enabled || !cfg.config.generate ||
+        !cfg.config.captureModes.includes(ctx.mode) ||
         flagMode() === "off" || flagMode() === "read" ||
         isExcludedWorkspace(ctx.cwd, cfg.config.excludedWorkspaces)) {
       report("blocked by host, configuration, mode, or workspace policy", "warning");
       return;
     }
-    if (!ctx.isIdle()) { report("foreground session is busy", "warning"); return; }
-    const ref = cfg.config.models.extract;
-    if (!ref) { report("blocked: no extraction model configured", "warning"); return; }
+    if (!ctx.isIdle() || !foregroundIdle) { report("foreground session is busy", "warning"); return; }
+    if (cfg.config.version !== "v1" && !cfg.config.dualWrite) {
+      report("v1 is not a configured generation target", "warning"); return;
+    }
+    if (!cfg.config.models.extract) {
+      report("blocked: no extraction model configured", "warning"); return;
+    }
     try {
       state.db ??= openStateDb(root);
-      const active = state.db.prepare(
-        `SELECT r.source_id FROM source_revisions r JOIN branch_heads h
-         ON h.session_key = r.session_key AND h.branch_id = r.branch_id
-         WHERE r.status = 'captured' AND h.state = 'active' AND h.latest_revision = r.source_id`,
-      ).all() as { source_id: string }[];
-      const now = Date.now();
-      for (const row of active) enqueueExtraction(state.db, {
-        sourceId: row.source_id, memoryVersion: "v1", promptHash: v1PromptHash(), now,
-      });
-      const jobs = claimDueExtractions(state.db, { owner: randomUUID(), now,
-        limit: cfg.config.schedule.maxExtractionsPerPass, slots: cfg.config.schedule.extractionConcurrency,
-        minIdleMs: 0, maxAgeMs: cfg.config.schedule.maxSourceAgeDays * 86_400_000 });
-      if (!jobs.length) { report("no eligible settled sources"); return; }
-      const port = createRegistryModelPort(ctx.modelRegistry);
-      const results = await Promise.all(jobs.map(async (job) => {
-        const controller = new AbortController();
-        try {
-          return await runV1Extraction({ db: state.db!, root, job, modelRef: ref, port,
-            now, clock: Date.now, timezone: cfg.config.timezone,
-            limits: { outputBytes: cfg.config.limits.extractionOutputBytes,
-              dailyInputTokens: cfg.config.limits.dailyInputTokens,
-              dailyOutputTokens: cfg.config.limits.dailyOutputTokens,
-              dailyRequests: cfg.config.limits.dailyRequests }, signal: controller.signal });
-        } finally {
-          controller.abort();
-        }
-      }));
-      report(results.map((result) => result.status === "budget_deferred"
-        ? `${result.status} (${result.reason})` : result.status).join(", "));
+      ensureScheduler(ctx);
+      if (!scheduler) { report("scheduler unavailable", "warning"); return; }
+      const results = await scheduler.runPass(true);
+      let message = "no eligible settled sources";
+      if (results.length) {
+        message = results.map((result) => result.status === "budget_deferred"
+          ? `${result.status} (${result.reason})` : result.status).join(", ");
+      } else if (state.captureError?.startsWith("scheduler failed:")) {
+        message = state.captureError;
+      }
+      report(message, message.startsWith("scheduler failed:") ? "warning" : "info");
     } catch (err) {
       report(`failed: ${(err as Error).message}`, "warning");
     }

@@ -17,7 +17,7 @@ const sourceId = "source-1";
 const modelRef = { provider: "mock", modelId: "extract" };
 const limits = { outputBytes: 49_152, dailyInputTokens: 100_000, dailyOutputTokens: 20_000, dailyRequests: 20 };
 
-function setup(t: test.TestContext) {
+function setup(t: test.TestContext, items?: { entryId: string; role: string; origin: string | null; text: string; timestamp: number }[]) {
   const root = mkdtempSync(join(tmpdir(), "pi-memory-extract-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const cwd = join(root, "repo"); mkdirSync(cwd);
@@ -26,7 +26,7 @@ function setup(t: test.TestContext) {
   const db = openStateDb(memoryRoot);
   t.after(() => db.close());
   const workspace = computeWorkspaceIdentity(cwd);
-  const snapshot = { schemaVersion: 1, sourceId, items: [
+  const snapshot = { schemaVersion: 1, sourceId, items: items ?? [
     { entryId: "u1", role: "user", origin: "unknown", text: "User chose TypeScript over Rust", timestamp: NOW - 30_000 },
   ] };
   const saved = writeSnapshotFile(memoryRoot, "l".repeat(64), "v".repeat(64), snapshot);
@@ -78,6 +78,33 @@ test("run --now stores a sanitized v1 extraction with model, prompt, usage, and 
   assert.equal(row.usage_input, 100);
   assert.equal(row.usage_output, 20);
   assert.match(String(row.output_hash), /^[a-f0-9]{64}$/);
+});
+
+test("rendered input fits a conservative 70% context budget and prioritizes user rationale", async (t) => {
+  const { db, job, root } = setup(t, [
+    { entryId: "u1", role: "user", origin: "unknown", text: "User decided TypeScript for reproducibility", timestamp: NOW - 30_000 },
+    { entryId: "tool1", role: "tool", origin: null, text: "verbose tool log: " + "X".repeat(50_000), timestamp: NOW - 20_000 },
+  ]);
+  const { port, calls } = fakePort([response('{"raw_memory":"TypeScript chosen","rollout_summary":"TypeScript chosen","rollout_slug":"typescript"}')]);
+  port.resolve = () => ({ provider: "mock", modelId: "extract", contextWindow: 60_000, maxTokens: 8_000 });
+
+  assert.deepEqual(await runV1Extraction({ db, root, job, modelRef, port, now: NOW + 1,
+    timezone: "UTC", limits, signal: new AbortController().signal }), { status: "succeeded" });
+  assert.equal(calls.length, 1);
+  assert.match(calls[0]?.text ?? "", /User decided TypeScript for reproducibility/);
+  assert.doesNotMatch(calls[0]?.text ?? "", /verbose tool log/);
+  assert.match(calls[0]?.text ?? "", /omitted for model context budget/);
+});
+
+test("a model with insufficient context blocks before spending budget", async (t) => {
+  const { db, job, root } = setup(t);
+  const { port, calls } = fakePort([]);
+  port.resolve = () => ({ provider: "mock", modelId: "extract", contextWindow: 8_000, maxTokens: 8_000 });
+  const result = await runV1Extraction({ db, root, job, modelRef, port, now: NOW + 1,
+    timezone: "UTC", limits, signal: new AbortController().signal });
+  assert.deepEqual(result, { status: "blocked" });
+  assert.equal(calls.length, 0);
+  assert.equal((db.prepare("SELECT error_code FROM jobs").get() as { error_code: string }).error_code, "context_too_small");
 });
 
 test("one invalid JSON reply gets exactly one budgeted repair; no-output records once", async (t) => {
@@ -147,6 +174,17 @@ test("authentication failure blocks rather than hot-retrying or repairing JSON",
   assert.deepEqual(result, { status: "blocked" });
   assert.equal(calls.length, 1);
   assert.equal((db.prepare("SELECT error_code FROM jobs").get() as { error_code: string }).error_code, "auth_or_model");
+});
+
+test("provider Retry-After hints extend transient backoff without persisting raw errors", async (t) => {
+  const { db, job, root } = setup(t);
+  const { port } = fakePort([{ stopReason: "error", text: "", errorMessage: "429 Retry-After: 600" }]);
+  const result = await runV1Extraction({ db, root, job, modelRef, port, now: NOW + 1,
+    timezone: "UTC", limits, signal: new AbortController().signal });
+  assert.deepEqual(result, { status: "retry_wait" });
+  const row = db.prepare("SELECT due_at, error_code FROM jobs").get() as { due_at: number; error_code: string };
+  assert.equal(row.due_at, NOW + 1 + 600_000);
+  assert.equal(row.error_code, "provider_error");
 });
 
 test("exhausted daily budget defers work without making a model request", async (t) => {

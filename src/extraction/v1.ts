@@ -70,6 +70,15 @@ export interface V1RequestInput {
   snapshotPath: string;
   cwd: string;
   items: readonly { entryId: string; role: string; origin: string | null; text: string }[];
+  manifest?: {
+    sourceId: string; sessionKey?: string; branchId?: string; leafId?: string;
+    workspaceKey?: string; omittedSourceItems?: number; omissionReasons?: string[];
+  };
+  omittedForContext?: number;
+}
+
+export function v1EvidenceLine(item: V1RequestInput["items"][number]): string {
+  return `[entry=${JSON.stringify(item.entryId)} role=${item.role} origin=${item.origin ?? "none"}] ${JSON.stringify(item.text)}`;
 }
 
 /** Read the immutable pinned files and render only sanitized snapshot evidence. */
@@ -78,9 +87,12 @@ export function renderV1Request(input: V1RequestInput): {
 } {
   const systemPrompt = readFileSync(new URL("../../prompts/upstream/v1/stage_one_system.md", import.meta.url), "utf8");
   const template = readFileSync(new URL("../../prompts/upstream/v1/stage_one_input.md", import.meta.url), "utf8");
-  const contents = input.items.map((item) =>
-    `[entry=${JSON.stringify(item.entryId)} role=${item.role} origin=${item.origin ?? "none"}] ${JSON.stringify(item.text)}`,
-  ).join("\n");
+  const contents = [
+    input.manifest ? `[source manifest ${JSON.stringify(input.manifest)}]` : "",
+    input.manifest?.omittedSourceItems ? `[${input.manifest.omittedSourceItems} source items omitted during normalization]` : "",
+    ...input.items.map(v1EvidenceLine),
+    input.omittedForContext ? `[${input.omittedForContext} evidence items omitted for model context budget]` : "",
+  ].filter(Boolean).join("\n");
   const userPrompt = template
     .replace("{{ rollout_path }}", JSON.stringify(input.snapshotPath))
     .replace("{{ rollout_cwd }}", JSON.stringify(input.cwd))

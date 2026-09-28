@@ -48,7 +48,8 @@ test("v1 parser enforces UTF-8 combined field bytes, sanitizes bounded slug, and
 
 test("v1 request uses pinned upstream prompt and only normalized, origin-labeled evidence", () => {
   const request = renderV1Request({ snapshotPath: "/memory/sources/lineage/revision.json",
-    cwd: "/repo", items: [
+    cwd: "/repo", manifest: { sourceId: "src_123", branchId: "main", omittedSourceItems: 2,
+      omissionReasons: ["unsupported media"] }, items: [
       { entryId: "u1", role: "user", origin: "unknown", text: "User chose TypeScript" },
       { entryId: "a1", role: "assistant", origin: null, text: "I propose Rust" },
     ] });
@@ -57,6 +58,8 @@ test("v1 request uses pinned upstream prompt and only normalized, origin-labeled
   assert.equal(request.systemPrompt, system);
   assert.equal(request.promptHash, createHash("sha256").update(system + "\n" + input).digest("hex"));
   assert.match(request.userPrompt, /origin=unknown.*User chose TypeScript/s);
+  assert.match(request.userPrompt, /source manifest.*src_123/);
+  assert.match(request.userPrompt, /2 source items omitted during normalization/);
   assert.match(request.userPrompt, /\/memory\/sources\/lineage\/revision\.json/);
   assert.doesNotMatch(request.userPrompt, /\{\{\s*rollout_/);
 });

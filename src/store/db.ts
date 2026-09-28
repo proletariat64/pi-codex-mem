@@ -209,6 +209,9 @@ export function openStateDb(root: string): DatabaseSync {
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
   db.exec("PRAGMA busy_timeout = 5000");
+  // Privacy revocation must overwrite deleted payload cells, not only unlink
+  // their logical rows. WAL is truncated after the removal commits below.
+  db.exec("PRAGMA secure_delete = ON");
   const hasMigrations = db
     .prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'")
     .get() as { n: number };
@@ -255,9 +258,14 @@ export function openStateDb(root: string): DatabaseSync {
       throw err;
     }
   }
-  prunePrivacyRevoked(db, root);
-  sweepOrphanSnapshots(db, root);
-  return db;
+  try {
+    prunePrivacyRevoked(db, root);
+    sweepOrphanSnapshots(db, root);
+    return db;
+  } catch (err) {
+    db.close();
+    throw err;
+  }
 }
 
 /**
@@ -316,22 +324,29 @@ export function prunePrivacyRevoked(db: DatabaseSync, root: string): void {
     .all() as { snapshot_path: string }[];
   if (rows.length === 0) return;
   const sourceDir = join(root, "sources");
-  if (!existsSync(sourceDir)) return; // already removed by an earlier cleanup
-  if (lstatSync(sourceDir).isSymbolicLink()) throw new Error("sources symlink rejected during privacy cleanup");
-  const sources = realpathSync(sourceDir);
-  for (const row of rows) {
-    const path = resolve(row.snapshot_path);
-    if (!/^[a-f0-9]{64}\.json$/.test(path.split(sep).at(-1) ?? "")) {
-      throw new Error(`invalid revoked snapshot filename: ${path}`);
-    }
-    try {
-      // Resolve the parent to reject a symlink escaping the owned store.
-      if (!realpathSync(dirname(path)).startsWith(sources + sep)) throw new Error("revoked snapshot parent escaped sources");
-      unlinkSync(path);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+  if (existsSync(sourceDir)) {
+    if (lstatSync(sourceDir).isSymbolicLink()) throw new Error("sources symlink rejected during privacy cleanup");
+    const sources = realpathSync(sourceDir);
+    for (const row of rows) {
+      const path = resolve(row.snapshot_path);
+      if (!/^[a-f0-9]{64}\.json$/.test(path.split(sep).at(-1) ?? "")) {
+        throw new Error(`invalid revoked snapshot filename: ${path}`);
+      }
+      try {
+        // Resolve the parent to reject a symlink escaping the owned store.
+        if (!realpathSync(dirname(path)).startsWith(sources + sep)) throw new Error("revoked snapshot parent escaped sources");
+        unlinkSync(path);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+      }
     }
   }
+  // Secure-delete rewrites live database pages; old WAL frames may still
+  // contain the superseded extraction. Do not report privacy cleanup as
+  // complete while any reader prevents truncation. Startup retries cleanup.
+  const checkpoint = db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get() as
+    { busy: number; log: number; checkpointed: number } | undefined;
+  if (!checkpoint || checkpoint.busy !== 0) throw new Error("privacy WAL cleanup deferred: active SQLite reader");
 }
 
 function blockBothViews(db: DatabaseSync, reason: string): void {

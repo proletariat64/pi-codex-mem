@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -66,7 +66,12 @@ test("privacy revocation deletes derived extraction text in the same transaction
   enqueueExtraction(db, { sourceId: SOURCE_ID, memoryVersion: "v1", promptHash: PROMPT_HASH, now: NOW });
   const [job] = claimDueExtractions(db, { owner: "one", now: NOW, limit: 1 });
   assert.ok(job);
-  assert.equal(commitExtraction(db, job, { ...accepted(), rawMemory: "private decision" }, NOW + 1), true);
+  const marker = "PRIVATE_REVOKED_EXTRACTION_a73e9f_UNIQUE";
+  assert.equal(commitExtraction(db, job, { ...accepted(), rawMemory: marker }, NOW + 1), true);
+  const containsDeletedText = () => ["state.sqlite", "state.sqlite-wal", "state.sqlite-shm"]
+    .map((name) => join(root, name)).filter(existsSync)
+    .some((path) => readFileSync(path).includes(Buffer.from(marker)));
+  assert.equal(containsDeletedText(), true, "test fixture must place extracted text on disk");
   recordSnapshot(db, { ...record, revision: { ...record.revision, sourceId: "edited-source",
     revisionHash: "e".repeat(64), leafId: "edited-leaf" }, capturedAt: NOW + 2,
     revokedSourceIds: [SOURCE_ID] }, root);
@@ -74,19 +79,28 @@ test("privacy revocation deletes derived extraction text in the same transaction
     .get(SOURCE_ID) as { status: string }).status, "privacy_revoked");
   assert.equal((db.prepare("SELECT COUNT(*) AS n FROM extractions WHERE source_id = ?")
     .get(SOURCE_ID) as { n: number }).n, 0);
+  assert.equal(containsDeletedText(), false, "privacy removal must purge SQLite and WAL bytes");
 });
 
-test("startup purges legacy extraction rows for already privacy-revoked sources", (t) => {
+test("startup scrubs legacy privacy-revoked extraction bytes from a pre-secure-delete DB", (t) => {
   const { root, db } = fixture(t);
+  db.exec("PRAGMA secure_delete = OFF"); // simulate the previous on-disk policy
   enqueueExtraction(db, { sourceId: SOURCE_ID, memoryVersion: "v1", promptHash: PROMPT_HASH, now: NOW });
   const [job] = claimDueExtractions(db, { owner: "old", now: NOW, limit: 1 });
   assert.ok(job);
-  assert.equal(commitExtraction(db, job, { ...accepted(), rawMemory: "private historical text" }, NOW + 1), true);
+  const marker = "PRIVATE_LEGACY_EXTRACTION_b53d87_UNIQUE";
+  assert.equal(commitExtraction(db, job, { ...accepted(), rawMemory: marker }, NOW + 1), true);
+  db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
+  const databasePath = join(root, "state.sqlite");
+  assert.equal(readFileSync(databasePath).includes(Buffer.from(marker)), true);
   db.prepare("UPDATE source_revisions SET status = 'privacy_revoked' WHERE source_id = ?").run(SOURCE_ID);
   db.close();
   const reopened = openStateDb(root);
   t.after(() => reopened.close());
   assert.equal((reopened.prepare("SELECT COUNT(*) AS n FROM extractions").get() as { n: number }).n, 0);
+  assert.equal(readFileSync(databasePath).includes(Buffer.from(marker)), false);
+  const wal = databasePath + "-wal";
+  if (existsSync(wal)) assert.equal(readFileSync(wal).includes(Buffer.from(marker)), false);
 });
 
 test("schema 5 jobs upgrade to configuration epochs without losing durable work", (t) => {

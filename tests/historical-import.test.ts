@@ -31,6 +31,21 @@ function user(id: string, parentId: string | null, text: string) {
     message: { role: "user", content: [{ type: "text", text }], timestamp: 1704067201000 } };
 }
 
+async function cliFixture(t: test.TestContext, root: string, cwd: string, supported = true) {
+  const agentDir = join(root, "agent");
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  t.after(() => { if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previous; });
+  const mock = makeMockPi(); memoryExtension(mock.pi);
+  const notifications: string[] = [];
+  const modelRegistry = supported ? { find: () => ({}), streamSimple: () => ({}) } : { find: () => ({}) };
+  const ctx = { cwd, hasUI: true, mode: "tui", sessionManager: { getBranch: () => [] },
+    modelRegistry, ui: { notify: (text: string) => notifications.push(text) } };
+  await mock.fire("session_start", { type: "session_start" }, ctx);
+  return { agentDir, mock, ctx, notifications };
+}
+
 test("unreadable source is reported without hiding other directory candidates", (t) => {
   const { root, cwd } = sandbox(t);
   const dir = join(root, "history"); mkdirSync(dir);
@@ -84,20 +99,40 @@ test("planning a directory lists eligible and unsupported files with total bytes
   assert.ok(report.unsupported.some((item: { reason: string }) => item.reason.includes("version 9")));
 });
 
+test("dry-run distinguishes parsed sources from eligible sources when configuration is invalid", async (t) => {
+  const { root, cwd } = sandbox(t);
+  const file = join(root, "old-session.jsonl");
+  writeFileSync(file, jsonl(cwd, [user("u1", null, "candidate only")]));
+  const { agentDir, mock, ctx, notifications } = await cliFixture(t, root, cwd);
+  const configPath = join(agentDir, "memory", "config.json");
+  writeFileSync(configPath, "{invalid");
+
+  await mock.commands.get("memory")!.handler(`import ${file} --dry-run`, ctx);
+
+  assert.match(notifications.at(-1) ?? "", /candidates:\s*0/);
+  assert.match(notifications.at(-1) ?? "", /parsed candidates:\s*1/);
+  assert.match(notifications.at(-1) ?? "", /configuration invalid/);
+  assert.equal(readFileSync(configPath, "utf8"), "{invalid");
+  assert.equal(existsSync(join(agentDir, "memory", "sources")), false);
+});
+
+test("unsupported host cannot run an explicit historical import", async (t) => {
+  const { root, cwd } = sandbox(t);
+  const file = join(root, "old-session.jsonl");
+  writeFileSync(file, jsonl(cwd, [user("u1", null, "must not import")]));
+  const { agentDir, mock, ctx, notifications } = await cliFixture(t, root, cwd, false);
+
+  await mock.commands.get("memory")!.handler(`import ${file} --run`, ctx);
+
+  assert.match(notifications.at(-1) ?? "", /blocked.*unsupported host/i);
+  assert.equal(existsSync(join(agentDir, "memory", "sources")), false);
+});
+
 test("explicit import respects excluded workspace configuration", async (t) => {
   const { root, cwd } = sandbox(t);
-  const agentDir = join(root, "agent");
-  const oldAgentDir = process.env.PI_CODING_AGENT_DIR;
-  process.env.PI_CODING_AGENT_DIR = agentDir;
-  t.after(() => { if (oldAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-    else process.env.PI_CODING_AGENT_DIR = oldAgentDir; });
   const file = join(root, "old-session.jsonl");
   writeFileSync(file, jsonl(cwd, [user("u1", null, "excluded decision")]));
-  const mock = makeMockPi(); memoryExtension(mock.pi);
-  const notifications: string[] = [];
-  const ctx = { cwd, hasUI: true, mode: "tui", sessionManager: { getBranch: () => [] },
-    modelRegistry: { find: () => ({}), streamSimple: () => ({}) }, ui: { notify: (text: string) => notifications.push(text) } };
-  await mock.fire("session_start", { type: "session_start" }, ctx);
+  const { agentDir, mock, ctx, notifications } = await cliFixture(t, root, cwd);
   const configPath = join(agentDir, "memory", "config.json");
   const cfg = JSON.parse(readFileSync(configPath, "utf8"));
   writeFileSync(configPath, JSON.stringify({ ...cfg, excludedWorkspaces: [cwd] }));
@@ -113,20 +148,11 @@ test("explicit import respects excluded workspace configuration", async (t) => {
 
 test("/memory import --run enrolls sanitized evidence without modifying the source", async (t) => {
   const { root, cwd } = sandbox(t);
-  const agentDir = join(root, "agent");
-  const oldAgentDir = process.env.PI_CODING_AGENT_DIR;
-  process.env.PI_CODING_AGENT_DIR = agentDir;
-  t.after(() => { if (oldAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-    else process.env.PI_CODING_AGENT_DIR = oldAgentDir; });
   const file = join(root, "old-session.jsonl");
   const original = jsonl(cwd, [user("u1", null, "historic decision sk-ABCDEFGHIJKLMNOPQRSTUVWX")]);
   writeFileSync(file, original);
   const fixtureHash = createHash("sha256").update(readFileSync(file)).digest("hex");
-  const mock = makeMockPi(); memoryExtension(mock.pi);
-  const notifications: string[] = [];
-  const ctx = { cwd, hasUI: true, mode: "tui", sessionManager: { getBranch: () => [] },
-    modelRegistry: { find: () => ({}), streamSimple: () => ({}) }, ui: { notify: (text: string) => notifications.push(text) } };
-  await mock.fire("session_start", { type: "session_start" }, ctx);
+  const { agentDir, mock, ctx, notifications } = await cliFixture(t, root, cwd);
 
   await mock.commands.get("memory")!.handler(`import ${file} --run`, ctx);
 
@@ -151,22 +177,19 @@ test("/memory import --run enrolls sanitized evidence without modifying the sour
   assert.equal(readFileSync(file, "utf8"), original);
   assert.equal(createHash("sha256").update(readFileSync(file)).digest("hex"), fixtureHash,
     "import and reconstruction leave the original fixture byte-identical");
+  rmSync(snapshots[0]!);
+  rmSync(file);
+  await mock.commands.get("memory")!.handler(`import ${file} --run`, ctx);
+  assert.match(notifications.at(-1) ?? "", /source unavailable/i);
+  assert.equal(existsSync(snapshots[0]!), false);
+  assert.equal(existsSync(file), false);
 });
 
 test("historical import applies the live input budget and reports omitted entry IDs", async (t) => {
   const { root, cwd } = sandbox(t);
-  const agentDir = join(root, "agent");
-  const oldAgentDir = process.env.PI_CODING_AGENT_DIR;
-  process.env.PI_CODING_AGENT_DIR = agentDir;
-  t.after(() => { if (oldAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-    else process.env.PI_CODING_AGENT_DIR = oldAgentDir; });
   const file = join(root, "budget.jsonl");
   writeFileSync(file, jsonl(cwd, [user("u1", null, "a".repeat(700)), user("u2", "u1", "b".repeat(700))]));
-  const mock = makeMockPi(); memoryExtension(mock.pi);
-  const notifications: string[] = [];
-  const ctx = { cwd, hasUI: true, mode: "tui", sessionManager: { getBranch: () => [] },
-    modelRegistry: { find: () => ({}), streamSimple: () => ({}) }, ui: { notify: (text: string) => notifications.push(text) } };
-  await mock.fire("session_start", { type: "session_start" }, ctx);
+  const { agentDir, mock, ctx, notifications } = await cliFixture(t, root, cwd);
   const configPath = join(agentDir, "memory", "config.json");
   const cfg = JSON.parse(readFileSync(configPath, "utf8"));
   writeFileSync(configPath, JSON.stringify({ ...cfg, limits: { ...cfg.limits, inputBytes: 1024 } }));
@@ -184,18 +207,9 @@ test("historical import applies the live input budget and reports omitted entry 
 
 test("/memory import reuses a captured active leaf instead of guessing the last branch", async (t) => {
   const { root, cwd } = sandbox(t);
-  const agentDir = join(root, "agent");
-  const oldAgentDir = process.env.PI_CODING_AGENT_DIR;
-  process.env.PI_CODING_AGENT_DIR = agentDir;
-  t.after(() => { if (oldAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-    else process.env.PI_CODING_AGENT_DIR = oldAgentDir; });
   const file = join(root, "branches.jsonl");
   writeFileSync(file, jsonl(cwd, [user("u1", null, "selected decision")]));
-  const mock = makeMockPi(); memoryExtension(mock.pi);
-  const notifications: string[] = [];
-  const ctx = { cwd, hasUI: true, mode: "tui", sessionManager: { getBranch: () => [] },
-    modelRegistry: { find: () => ({}), streamSimple: () => ({}) }, ui: { notify: (text: string) => notifications.push(text) } };
-  await mock.fire("session_start", { type: "session_start" }, ctx);
+  const { agentDir, mock, ctx, notifications } = await cliFixture(t, root, cwd);
   await mock.commands.get("memory")!.handler(`import ${file} --run`, ctx);
   appendFileSync(file, JSON.stringify(user("a1", "u1", "first")) + "\n" + JSON.stringify(user("a2", "u1", "physical last")) + "\n");
 
@@ -215,18 +229,9 @@ test("/memory import reuses a captured active leaf instead of guessing the last 
 
 test("/memory import accepts a quoted path containing spaces", async (t) => {
   const { root, cwd } = sandbox(t);
-  const agentDir = join(root, "agent");
-  const oldAgentDir = process.env.PI_CODING_AGENT_DIR;
-  process.env.PI_CODING_AGENT_DIR = agentDir;
-  t.after(() => { if (oldAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-    else process.env.PI_CODING_AGENT_DIR = oldAgentDir; });
   const file = join(root, "old conversation.jsonl");
   writeFileSync(file, jsonl(cwd, [user("u1", null, "quoted path")]));
-  const mock = makeMockPi(); memoryExtension(mock.pi);
-  const notifications: string[] = [];
-  const ctx = { cwd, hasUI: true, mode: "tui", sessionManager: { getBranch: () => [] },
-    modelRegistry: { find: () => ({}), streamSimple: () => ({}) }, ui: { notify: (text: string) => notifications.push(text) } };
-  await mock.fire("session_start", { type: "session_start" }, ctx);
+  const { mock, ctx, notifications } = await cliFixture(t, root, cwd);
 
   await mock.commands.get("memory")!.handler(`import "${file}" --dry-run`, ctx);
 
@@ -235,19 +240,10 @@ test("/memory import accepts a quoted path containing spaces", async (t) => {
 
 test("/memory import --dry-run reports one candidate without enrolling or editing it", async (t) => {
   const { root, cwd } = sandbox(t);
-  const agentDir = join(root, "agent");
-  const oldAgentDir = process.env.PI_CODING_AGENT_DIR;
-  process.env.PI_CODING_AGENT_DIR = agentDir;
-  t.after(() => { if (oldAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
-    else process.env.PI_CODING_AGENT_DIR = oldAgentDir; });
   const file = join(root, "old-session.jsonl");
   const original = jsonl(cwd, [user("u1", null, "historic decision")]);
   writeFileSync(file, original);
-  const mock = makeMockPi(); memoryExtension(mock.pi);
-  const notifications: string[] = [];
-  const ctx = { cwd, hasUI: true, mode: "tui", sessionManager: { getBranch: () => [] },
-    modelRegistry: { find: () => ({}), streamSimple: () => ({}) }, ui: { notify: (text: string) => notifications.push(text) } };
-  await mock.fire("session_start", { type: "session_start" }, ctx);
+  const { agentDir, mock, ctx, notifications } = await cliFixture(t, root, cwd);
 
   await mock.commands.get("memory")!.handler(`import ${file} --dry-run`, ctx);
 

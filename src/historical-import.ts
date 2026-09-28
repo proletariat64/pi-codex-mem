@@ -31,8 +31,14 @@ export function planHistoricalImport(path: string, options: {
   resolveSelectedLeaf?: (file: string, header: SessionHeader) => string | undefined;
 } = {}): ImportReport {
   const file = resolve(path);
-  const before = lstatSync(file);
   const report: ImportReport = { candidates: [], unsupported: [], deferred: [], ambiguous: [], totalBytes: 0 };
+  let before: ReturnType<typeof lstatSync>;
+  try {
+    before = lstatSync(file);
+  } catch (err) {
+    report.unsupported.push({ path: file, reason: `source unavailable: ${(err as Error).message}` });
+    return report;
+  }
   if (before.isDirectory()) {
     for (const name of readdirSync(file).sort((a, b) => a.localeCompare(b))) {
       const childPath = resolve(file, name);

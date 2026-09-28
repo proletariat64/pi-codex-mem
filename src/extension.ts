@@ -472,9 +472,12 @@ export default function (pi: ExtensionAPI) {
           const cfg = loadConfig(root, { create: false });
           const excluded = cfg.status === "ok" ? report.candidates.filter((candidate) =>
             isExcludedWorkspace(candidate.header.cwd, cfg.config.excludedWorkspaces)) : [];
-          const eligible = report.candidates.filter((candidate) => !excluded.includes(candidate));
+          const eligible = cfg.status === "ok" ? report.candidates.filter((candidate) => !excluded.includes(candidate)) : [];
           const lines = [`candidates: ${eligible.length}`, `bytes: ${report.totalBytes}`];
-          if (cfg.status !== "ok") lines.push(`eligibility not confirmed: configuration ${cfg.status}`);
+          if (cfg.status !== "ok") {
+            lines.push(`parsed candidates: ${report.candidates.length}; eligibility not confirmed: configuration ${cfg.status}`);
+            for (const item of report.candidates) lines.push(`${item.path}: parsed leaf ${item.leafId}; not eligible until configuration is valid`);
+          }
           for (const item of eligible) {
             lines.push(`${item.path}: leaf ${item.leafId}; scope: ${item.workspace.repoKey ? `repo ${item.workspace.repoKey}` : `cwd ${item.workspace.cwdReal}`}; bytes: ${item.bytes}`);
           }
@@ -483,9 +486,9 @@ export default function (pi: ExtensionAPI) {
           for (const item of report.unsupported) lines.push(`${item.path}: unsupported — ${item.reason}`);
           for (const item of report.deferred) lines.push(`${item.path}: deferred — ${item.reason}`);
           if (run) {
-            if (rootPointsIntoForeignMemory(root) || legacyLockPath(root) || cfg.status !== "ok" ||
+            if (!state.compat?.supported || rootPointsIntoForeignMemory(root) || legacyLockPath(root) || cfg.status !== "ok" ||
                 !cfg.config.enabled || flagMode() === "off" || flagMode() === "read") {
-              ctx.ui.notify("pi-memory: import blocked by memory root, legacy lock, configuration, or runtime mode", "warning");
+              ctx.ui.notify("pi-memory: import blocked by unsupported host, memory root, legacy lock, configuration, or runtime mode", "warning");
               return;
             }
             if (eligible.length > 0) {

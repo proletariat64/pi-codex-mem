@@ -36,7 +36,7 @@ export interface SnapshotRecord {
   evidenceRemoved?: boolean;
 }
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 7;
 
 const MIGRATION_1 = `
 CREATE TABLE schema_migrations (
@@ -119,7 +119,98 @@ ALTER TABLE privacy_edit_targets ADD COLUMN edit_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE privacy_edit_targets ADD COLUMN edit_time INTEGER NOT NULL DEFAULT 0;
 `;
 
-export function openStateDb(root: string): DatabaseSync {
+const MIGRATION_5 = `
+CREATE TABLE jobs (
+  job_id TEXT PRIMARY KEY,
+  source_id TEXT REFERENCES source_revisions(source_id),
+  memory_version TEXT NOT NULL CHECK (memory_version IN ('v1', 'v2')),
+  kind TEXT NOT NULL CHECK (kind IN ('extract', 'consolidate')),
+  work_key TEXT NOT NULL UNIQUE,
+  prompt_hash TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('queued', 'leased', 'succeeded', 'no_output', 'retry_wait', 'blocked', 'cancelled', 'superseded')),
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  due_at INTEGER NOT NULL,
+  owner TEXT,
+  fence INTEGER NOT NULL DEFAULT 0,
+  lease_expires_at INTEGER,
+  error_code TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE (source_id, memory_version, kind, prompt_hash),
+  CHECK ((kind = 'extract' AND source_id IS NOT NULL) OR
+         (kind = 'consolidate' AND source_id IS NULL))
+);
+CREATE INDEX jobs_due ON jobs (status, due_at);
+CREATE TABLE extractions (
+  extraction_id TEXT PRIMARY KEY,
+  source_id TEXT NOT NULL REFERENCES source_revisions(source_id),
+  memory_version TEXT NOT NULL CHECK (memory_version IN ('v1', 'v2')),
+  prompt_hash TEXT NOT NULL,
+  job_id TEXT NOT NULL REFERENCES jobs(job_id),
+  raw_memory TEXT,
+  rollout_summary TEXT NOT NULL,
+  rollout_slug TEXT NOT NULL,
+  model_provider TEXT NOT NULL,
+  model_id TEXT NOT NULL,
+  output_hash TEXT NOT NULL,
+  outcome TEXT NOT NULL CHECK (outcome IN ('succeeded', 'no_output')),
+  usage_input INTEGER NOT NULL,
+  usage_output INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  UNIQUE (source_id, memory_version, prompt_hash),
+  CHECK ((memory_version = 'v1' AND raw_memory IS NOT NULL) OR
+         (memory_version = 'v2' AND raw_memory IS NULL))
+);
+CREATE TABLE process_activity (
+  owner_id TEXT PRIMARY KEY,
+  session_key TEXT NOT NULL,
+  activity_state TEXT NOT NULL CHECK (activity_state IN ('active', 'idle')),
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX process_activity_busy ON process_activity (session_key, activity_state, expires_at);
+CREATE TABLE budget_usage (
+  local_day TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  model TEXT NOT NULL,
+  reserved_input INTEGER NOT NULL DEFAULT 0,
+  reserved_output INTEGER NOT NULL DEFAULT 0,
+  actual_input INTEGER NOT NULL DEFAULT 0,
+  actual_output INTEGER NOT NULL DEFAULT 0,
+  call_count INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (local_day, provider, model)
+);
+CREATE TABLE budget_reservations (
+  reservation_id TEXT PRIMARY KEY,
+  local_day TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  model TEXT NOT NULL,
+  estimate_input INTEGER NOT NULL,
+  estimate_output INTEGER NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('reserved', 'charged')),
+  actual_input INTEGER,
+  actual_output INTEGER,
+  FOREIGN KEY (local_day, provider, model) REFERENCES budget_usage(local_day, provider, model)
+);
+`;
+
+const MIGRATION_6 = `ALTER TABLE jobs ADD COLUMN config_epoch TEXT NOT NULL DEFAULT '';`;
+
+// Earlier releases may have deleted a revoked row while secure_delete was
+// disabled. Its bytes can survive on a SQLite free page after the row is gone.
+// A one-time upgrade VACUUM rebuilds from live rows to scrub that free space.
+const MIGRATION_7 = `
+CREATE TABLE privacy_scrub_state (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  legacy_vacuum_pending INTEGER NOT NULL CHECK (legacy_vacuum_pending IN (0, 1))
+);
+INSERT INTO privacy_scrub_state (singleton, legacy_vacuum_pending) VALUES (1, 1);
+`;
+
+export function openStateDb(root: string, options?: { busyTimeoutMs?: number }): DatabaseSync {
+  const busyTimeout = options?.busyTimeoutMs ?? 5_000;
+  if (!Number.isSafeInteger(busyTimeout) || busyTimeout < 0 || busyTimeout > 5_000) {
+    throw new Error("invalid SQLite busy timeout");
+  }
   mkdirSync(root, { recursive: true, mode: 0o700 });
   chmodSync(root, 0o700);
   const path = join(root, "state.sqlite");
@@ -132,7 +223,10 @@ export function openStateDb(root: string): DatabaseSync {
   chmodSync(path, 0o600);
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
-  db.exec("PRAGMA busy_timeout = 5000");
+  db.exec(`PRAGMA busy_timeout = ${busyTimeout}`);
+  // Privacy revocation must overwrite deleted payload cells, not only unlink
+  // their logical rows. WAL is truncated after the removal commits below.
+  db.exec("PRAGMA secure_delete = ON");
   const hasMigrations = db
     .prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'")
     .get() as { n: number };
@@ -164,6 +258,18 @@ export function openStateDb(root: string): DatabaseSync {
         db.exec(MIGRATION_4);
         db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(4, Date.now());
       }
+      if (current < 5) {
+        db.exec(MIGRATION_5);
+        db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(5, Date.now());
+      }
+      if (current < 6) {
+        db.exec(MIGRATION_6);
+        db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(6, Date.now());
+      }
+      if (current < 7) {
+        db.exec(MIGRATION_7);
+        db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(7, Date.now());
+      }
       db.exec("COMMIT");
     } catch (err) {
       db.exec("ROLLBACK");
@@ -171,9 +277,14 @@ export function openStateDb(root: string): DatabaseSync {
       throw err;
     }
   }
-  prunePrivacyRevoked(db, root);
-  sweepOrphanSnapshots(db, root);
-  return db;
+  try {
+    prunePrivacyRevoked(db, root);
+    sweepOrphanSnapshots(db, root);
+    return db;
+  } catch (err) {
+    db.close();
+    throw err;
+  }
 }
 
 /**
@@ -217,25 +328,65 @@ function sweepOrphanSnapshots(db: DatabaseSync, root: string): void {
 
 /** Retry removal after a crash between DB revocation and filesystem cleanup. */
 export function prunePrivacyRevoked(db: DatabaseSync, root: string): void {
+  // Also purge derived text created before the current revocation policy.
+  // Keep the source/job tombstone for provenance and failed late-write fences.
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    db.exec(`DELETE FROM extractions WHERE source_id IN
+      (SELECT source_id FROM source_revisions WHERE status = 'privacy_revoked')`);
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
   const rows = db.prepare("SELECT snapshot_path FROM source_revisions WHERE status = 'privacy_revoked'")
     .all() as { snapshot_path: string }[];
-  if (rows.length === 0) return;
+  const legacy = db.prepare("SELECT legacy_vacuum_pending FROM privacy_scrub_state WHERE singleton = 1")
+    .get() as { legacy_vacuum_pending: number };
+  // Even without a surviving tombstone, a pre-secure-delete row may have
+  // left plaintext in SQLite free space. Run the one-time upgrade VACUUM.
+  if (rows.length === 0 && !legacy.legacy_vacuum_pending) return;
   const sourceDir = join(root, "sources");
-  if (!existsSync(sourceDir)) return; // already removed by an earlier cleanup
-  if (lstatSync(sourceDir).isSymbolicLink()) throw new Error("sources symlink rejected during privacy cleanup");
-  const sources = realpathSync(sourceDir);
-  for (const row of rows) {
-    const path = resolve(row.snapshot_path);
-    if (!/^[a-f0-9]{64}\.json$/.test(path.split(sep).at(-1) ?? "")) {
-      throw new Error(`invalid revoked snapshot filename: ${path}`);
+  if (existsSync(sourceDir)) {
+    if (lstatSync(sourceDir).isSymbolicLink()) throw new Error("sources symlink rejected during privacy cleanup");
+    const sources = realpathSync(sourceDir);
+    for (const row of rows) {
+      const path = resolve(row.snapshot_path);
+      if (!/^[a-f0-9]{64}\.json$/.test(path.split(sep).at(-1) ?? "")) {
+        throw new Error(`invalid revoked snapshot filename: ${path}`);
+      }
+      try {
+        // Resolve the parent to reject a symlink escaping the owned store.
+        if (!realpathSync(dirname(path)).startsWith(sources + sep)) throw new Error("revoked snapshot parent escaped sources");
+        unlinkSync(path);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+      }
     }
+  }
+  if (legacy.legacy_vacuum_pending) {
+    // secure_delete cannot erase already-freed cells from a previous release.
+    // VACUUM copies only live rows into a new database image. Keep the marker
+    // set on failure so a later startup retries before reporting cleanup.
     try {
-      // Resolve the parent to reject a symlink escaping the owned store.
-      if (!realpathSync(dirname(path)).startsWith(sources + sep)) throw new Error("revoked snapshot parent escaped sources");
-      unlinkSync(path);
+      db.exec("VACUUM");
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+      if (/locked|busy/i.test((err as Error).message)) {
+        throw new Error("privacy WAL cleanup deferred: active SQLite reader", { cause: err });
+      }
+      throw err;
     }
+  }
+  // Secure-delete rewrites live database pages; old WAL frames may still
+  // contain the superseded extraction. Do not report privacy cleanup as
+  // complete while any reader prevents truncation. Startup retries cleanup.
+  const checkpoint = db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get() as
+    { busy: number; log: number; checkpointed: number } | undefined;
+  if (!checkpoint || checkpoint.busy !== 0) throw new Error("privacy WAL cleanup deferred: active SQLite reader");
+  // Do not clear the upgrade marker until the old main DB AND WAL are gone.
+  // A busy reader can delay truncation even after VACUUM succeeded.
+  if (legacy.legacy_vacuum_pending) {
+    db.prepare("UPDATE privacy_scrub_state SET legacy_vacuum_pending = 0 WHERE singleton = 1").run();
   }
 }
 
@@ -359,6 +510,8 @@ export function recordSnapshot(db: DatabaseSync, rec: SnapshotRecord, root?: str
     }
     for (const sourceId of rec.revokedSourceIds ?? []) {
       db.prepare("UPDATE source_revisions SET status = 'privacy_revoked' WHERE source_id = ? AND source_id != ?")
+        .run(sourceId, rec.revision.sourceId);
+      db.prepare("DELETE FROM extractions WHERE source_id = ? AND source_id != ?")
         .run(sourceId, rec.revision.sourceId);
     }
     if (rec.revokedSourceIds?.length || rec.evidenceRemoved || rec.privacyPolicyChanged) {

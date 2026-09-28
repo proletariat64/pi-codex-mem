@@ -5,6 +5,8 @@ import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import memoryExtension from "../src/extension.ts";
+import { openStateDb } from "../src/store/db.ts";
+import { claimDueExtractions, commitExtraction, enqueueExtraction } from "../src/store/jobs.ts";
 import { makeMockPi } from "./mock-pi.ts";
 
 const savedAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -176,6 +178,85 @@ test("context edit removes sensitive evidence, supersedes old revision, and neve
   const blocks = db.prepare("SELECT read_blocked FROM pipeline_state").all() as { read_blocked: number }[];
   assert.deepEqual(blocks.map((r) => r.read_blocked), [1, 1]);
   db.close();
+});
+
+test("privacy WAL cleanup retries after a concurrent reader releases its snapshot", async (t) => {
+  const { cwd, memoryRoot } = makeSandbox(t);
+  const mock = makeMockPi(); memoryExtension(mock.pi);
+  const entries: unknown[] = [userEntry("u1", "a sensitive decision")];
+  const ctx = { cwd, hasUI: false, mode: "tui", sessionManager: fakeSessionManager(cwd, entries),
+    modelRegistry: { find: () => ({}), streamSimple: () => ({}) }, ui: { notify: () => {} } };
+  await mock.fire("session_start", { type: "session_start" }, ctx);
+  await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
+  const writer = openStateDb(memoryRoot);
+  const source = writer.prepare("SELECT source_id FROM source_revisions").get() as { source_id: string };
+  const now = Date.now();
+  enqueueExtraction(writer, { sourceId: source.source_id, memoryVersion: "v1", promptHash: "a".repeat(64), now });
+  const [job] = claimDueExtractions(writer, { owner: "privacy-test", now: now + 1, limit: 1 });
+  assert.ok(job);
+  const marker = "PRIVACY_READER_WAL_4e671b_UNIQUE";
+  assert.equal(commitExtraction(writer, job, { memoryVersion: "v1", promptHash: job.promptHash,
+    model: { provider: "mock", modelId: "extract" }, rawMemory: marker,
+    rolloutSummary: "private", rolloutSlug: "private", outputHash: "b".repeat(64),
+    usage: { input: 1, output: 1 }, outcome: "succeeded" }, now + 2), true);
+  writer.close();
+  const { DatabaseSync } = await import("node:sqlite");
+  const reader = new DatabaseSync(join(memoryRoot, "state.sqlite"), { readOnly: true });
+  t.after(() => { if (reader.isOpen) reader.close(); });
+  reader.exec("BEGIN");
+  assert.equal((reader.prepare("SELECT raw_memory FROM extractions").get() as { raw_memory: string }).raw_memory, marker);
+  entries.push({ type: "context_edit", id: "e1", parentId: "u1", targetId: "u1",
+    replacement: null, timestamp: new Date().toISOString() });
+  await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
+  const wal = join(memoryRoot, "state.sqlite-wal");
+  assert.equal(readFileSync(wal).includes(Buffer.from(marker)), true);
+  reader.exec("ROLLBACK"); reader.close();
+  const deadline = Date.now() + 4_000;
+  while (existsSync(wal) && readFileSync(wal).includes(Buffer.from(marker)) && Date.now() < deadline) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 100));
+  }
+  assert.equal(existsSync(wal) && readFileSync(wal).includes(Buffer.from(marker)), false,
+    "cleanup must retry without requiring pi to restart");
+  await mock.fire("session_shutdown", { type: "session_shutdown" }, ctx);
+});
+
+test("shutdown stays bounded when a concurrent reader delays privacy WAL cleanup", async (t) => {
+  const { cwd, memoryRoot } = makeSandbox(t);
+  const mock = makeMockPi(); memoryExtension(mock.pi);
+  const entries: unknown[] = [userEntry("u1", "private shutdown decision")];
+  const ctx = { cwd, hasUI: false, mode: "tui", sessionManager: fakeSessionManager(cwd, entries),
+    modelRegistry: { find: () => ({}), streamSimple: () => ({}) }, ui: { notify: () => {} } };
+  await mock.fire("session_start", { type: "session_start" }, ctx);
+  await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
+  const writer = openStateDb(memoryRoot);
+  const source = writer.prepare("SELECT source_id FROM source_revisions").get() as { source_id: string };
+  const now = Date.now();
+  enqueueExtraction(writer, { sourceId: source.source_id, memoryVersion: "v1", promptHash: "c".repeat(64), now });
+  const [job] = claimDueExtractions(writer, { owner: "shutdown-test", now: now + 1, limit: 1 });
+  assert.ok(job);
+  const marker = "PRIVACY_SHUTDOWN_WAL_68a12_UNIQUE";
+  assert.equal(commitExtraction(writer, job, { memoryVersion: "v1", promptHash: job.promptHash,
+    model: { provider: "mock", modelId: "extract" }, rawMemory: marker,
+    rolloutSummary: "private", rolloutSlug: "private", outputHash: "d".repeat(64),
+    usage: { input: 1, output: 1 }, outcome: "succeeded" }, now + 2), true);
+  writer.close();
+  const { DatabaseSync } = await import("node:sqlite");
+  const reader = new DatabaseSync(join(memoryRoot, "state.sqlite"), { readOnly: true });
+  t.after(() => { if (reader.isOpen) reader.close(); });
+  reader.exec("BEGIN");
+  reader.prepare("SELECT raw_memory FROM extractions").get();
+  entries.push({ type: "context_edit", id: "e1", parentId: "u1", targetId: "u1",
+    replacement: null, timestamp: new Date().toISOString() });
+  const started = performance.now();
+  await mock.fire("session_shutdown", { type: "session_shutdown" }, ctx);
+  assert.ok(performance.now() - started < 500, "shutdown cleanup must be bounded under WAL contention");
+  reader.exec("ROLLBACK"); reader.close();
+  const reopened = openStateDb(memoryRoot);
+  reopened.close();
+  const path = join(memoryRoot, "state.sqlite");
+  for (const file of [path, path + "-wal"]) {
+    if (existsSync(file)) assert.equal(readFileSync(file).includes(Buffer.from(marker)), false);
+  }
 });
 
 test("a fork cannot recapture an ancestor entry after a privacy removal", async (t) => {

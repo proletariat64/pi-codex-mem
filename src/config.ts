@@ -372,7 +372,11 @@ function isPidAlive(pid: number): boolean {
 export function acquireLock(lockDir: string): string | false {
   const token = `${process.pid}:${randomBytes(8).toString("hex")}`;
   if (tryClaim(lockDir, token)) return token;
-  // Exists — decide staleness by owner liveness, not just age.
+  // Exists — decide staleness. A lock is stale when its owner process is
+  // dead (ESRCH) or its metadata is old: legitimate holds last
+  // milliseconds, so an old lock is abandoned (or its PID was reused).
+  // Fencing (verifyLockOwnership before commit) makes a wrongly-broken
+  // lock detectable rather than silently corrupting.
   let owner: string | undefined;
   try {
     owner = readFileSync(join(lockDir, LOCK_OWNER_FILE), "utf8");
@@ -380,21 +384,16 @@ export function acquireLock(lockDir: string): string | false {
     owner = undefined;
   }
   const pid = owner ? Number(owner.split(":")[0]) : NaN;
-  let stale: boolean;
-  if (Number.isInteger(pid) && pid > 0) {
-    stale = !isPidAlive(pid);
-  } else {
-    // No readable owner: fall back to age (a fresh ownerless dir is a
-    // holder mid-acquire — never stale).
-    try {
-      stale = Date.now() - statSync(lockDir).mtimeMs > LOCK_STALE_MS;
-    } catch {
-      return false;
-    }
+  let held;
+  try {
+    held = statSync(lockDir);
+  } catch {
+    return false; // another breaker already moved it
   }
-  if (!stale) return false;
+  const ownerDead = Number.isInteger(pid) && pid > 0 && !isPidAlive(pid);
+  const tooOld = Date.now() - held.mtimeMs > LOCK_STALE_MS;
+  if (!ownerDead && !tooOld) return false;
   // Break the stale lock: move it aside atomically and verify identity.
-  const held = statSync(lockDir);
   const trash = `${lockDir}.stale-${process.pid}`;
   rmSync(trash, { recursive: true, force: true });
   try {
@@ -417,9 +416,16 @@ export function acquireLock(lockDir: string): string | false {
 function tryClaim(lockDir: string, token: string): boolean {
   try {
     mkdirSync(lockDir);
+  } catch {
+    return false; // already held
+  }
+  try {
     writeFileSync(join(lockDir, LOCK_OWNER_FILE), token, { mode: 0o600 });
     return true;
   } catch {
+    // Owner write failed: remove the dir so it doesn't look held (an
+    // ownerless fresh dir would block others for up to LOCK_STALE_MS).
+    rmSync(lockDir, { recursive: true, force: true });
     return false;
   }
 }

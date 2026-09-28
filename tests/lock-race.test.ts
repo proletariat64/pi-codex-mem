@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, utimesSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -12,19 +12,24 @@ import { pathToFileURL } from "node:url";
  * Each child holds the lock briefly before exiting, so a second winner
  * would overlap the hold. Invariant: exactly one winner per round.
  */
-function race(lockDir: string, racers: number): Promise<number[]> {
+function race(lockDir: string, barrierFile: string, racers: number): Promise<number[]> {
   const configUrl = pathToFileURL(join(process.cwd(), "src", "config.ts")).href;
   const script = `
     import { acquireLock } from ${JSON.stringify(configUrl)};
-    const ok = acquireLock(process.env.LOCK_DIR);
-    if (!ok) process.exit(2);
-    setTimeout(() => process.exit(0), 200); // hold window
+    import { existsSync } from "node:fs";
+    // Start barrier: all racers attempt at the same time.
+    while (!existsSync(process.env.BARRIER)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+    const token = acquireLock(process.env.LOCK_DIR);
+    if (!token) process.exit(2);
+    // Stay ALIVE holding the lock: owner-PID liveness makes the hold
+    // unbreakable, so any racer inside this window must lose.
+    setTimeout(() => process.exit(0), 1500);
   `;
   return Promise.all(
     Array.from({ length: racers }, () =>
       new Promise<number>((resolvePromise, reject) => {
         const child = spawn(process.execPath, ["--input-type=module", "-e", script], {
-          env: { ...process.env, LOCK_DIR: lockDir },
+          env: { ...process.env, LOCK_DIR: lockDir, BARRIER: barrierFile },
           stdio: "ignore",
         });
         child.on("error", reject);
@@ -43,8 +48,13 @@ test("concurrent stale-lock breakers: exactly one winner per round", async (t) =
     mkdirSync(lock);
     const old = new Date(Date.now() - 120_000);
     utimesSync(lock, old, old); // stale
+    const barrier = join(root, `barrier-${round}`);
 
-    const exits = await race(lock, 4);
+    const pending = race(lock, barrier, 4);
+    // Let all racers reach the barrier, then release them together.
+    await new Promise((r) => setTimeout(r, 300));
+    writeFileSync(barrier, "go");
+    const exits = await pending;
     const winners = exits.filter((code) => code === 0).length;
     const losers = exits.filter((code) => code === 2).length;
     assert.equal(winners, 1, `round ${round}: expected exactly 1 winner, got ${winners} (exits: ${exits})`);

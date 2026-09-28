@@ -95,6 +95,22 @@ export function defaultConfig(timezone: string): MemoryConfig {
  * run. Pass `create: false` from read-only paths (e.g. /memory doctor) to get
  * "missing" instead of writing a file.
  */
+/** Parse + validate shared by the ordinary path and the under-lock create path. */
+function parseAndValidate(text: string, path: string): LoadConfigResult {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch (err) {
+    // Preserve the file; caller disables generation (spec §14).
+    return { status: "invalid", problems: [`config.json is not valid JSON: ${(err as Error).message}`], path };
+  }
+  const problems = validateConfig(raw);
+  if (problems.length > 0) {
+    return { status: "invalid", problems, path };
+  }
+  return { status: "ok", config: raw as MemoryConfig, path };
+}
+
 export function loadConfig(root: string, opts?: { timezone?: string; create?: boolean }): LoadConfigResult {
   const path = join(root, CONFIG_FILE);
   let text: string;
@@ -128,17 +144,7 @@ export function loadConfig(root: string, opts?: { timezone?: string; create?: bo
       // Re-check under the lock: another process may have committed a
       // config while we waited. Adopt it instead of renaming defaults over.
       try {
-        const committed = readFileSync(path, "utf8");
-        let raw: unknown;
-        try {
-          raw = JSON.parse(committed);
-        } catch (err) {
-          return { status: "invalid", problems: [`config.json is not valid JSON: ${(err as Error).message}`], path };
-        }
-        const problems = validateConfig(raw);
-        return problems.length > 0
-          ? { status: "invalid", problems, path }
-          : { status: "ok", config: raw as MemoryConfig, path };
+        return parseAndValidate(readFileSync(path, "utf8"), path);
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
           return {
@@ -154,23 +160,21 @@ export function loadConfig(root: string, opts?: { timezone?: string; create?: bo
       }
       const config = defaultConfig(opts?.timezone ?? "UTC");
       writeConfigAtomic(path, config);
+      // Post-commit fence: losing the lock mid-commit means a takeover may
+      // have raced our write — fail loudly, never silently (spec §5.4).
+      if (!verifyLockOwnership(lockDir, token)) {
+        return {
+          status: "invalid",
+          problems: ["control lock was displaced during config creation; re-run the command to reconcile"],
+          path,
+        };
+      }
       return { status: "created", config, path };
     } finally {
       releaseLock(lockDir, token);
     }
   }
-  let raw: unknown;
-  try {
-    raw = JSON.parse(text);
-  } catch (err) {
-    // Preserve the file; caller disables generation (spec §14).
-    return { status: "invalid", problems: [`config.json is not valid JSON: ${(err as Error).message}`], path };
-  }
-  const problems = validateConfig(raw);
-  if (problems.length > 0) {
-    return { status: "invalid", problems, path };
-  }
-  return { status: "ok", config: raw as MemoryConfig, path };
+  return parseAndValidate(text, path);
 }
 
 /** Structural and range validation. Returns a list of human-readable problems. */
@@ -315,27 +319,57 @@ export function updateConfig(
       // newest committed content. create:false avoids nested lock
       // acquisition; a missing file starts from in-memory defaults and is
       // created by the final write below.
-      const loaded = loadConfig(root, { ...opts, create: false });
-      if (loaded.status === "invalid") {
-        return { ok: false, reason: `config invalid: ${loaded.problems.join("; ")}` };
+      const path = join(root, CONFIG_FILE);
+      let baseText: string | null;
+      try {
+        baseText = readFileSync(path, "utf8");
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+          baseText = null;
+        } else {
+          return { ok: false, reason: `config unreadable (${(err as NodeJS.ErrnoException).code}); preserved` };
+        }
+      }
+      const base = baseText === null ? null : parseAndValidate(baseText, path);
+      if (base && base.status === "invalid") {
+        return { ok: false, reason: `config invalid: ${base.problems.join("; ")}` };
       }
       const current =
-        loaded.status === "missing"
-          ? defaultConfig(opts?.timezone ?? "UTC")
-          : loaded.config;
+        base === null ? defaultConfig(opts?.timezone ?? "UTC") : base.status === "ok" ? base.config : null;
+      if (!current) return { ok: false, reason: "unexpected config state" };
       const next = mutate(current);
       const problems = validateConfig(next);
       if (problems.length > 0) {
         return { ok: false, reason: `mutation produced invalid config: ${problems.join("; ")}` };
       }
-      // Fence: a displaced lock (stale-break race) means another writer may
-      // hold the path now. Abort rather than risk a silent overwrite; the
-      // caller retries from fresh content.
+      // Commit protocol (spec §5.4): fence, content-hash CAS, fence, rename,
+      // fence. rename() is kernel-atomic; the fences bracket it so a
+      // displaced holder never commits silently.
       if (!verifyLockOwnership(lockDir, token)) {
         briefSleep(25 * (i + 1));
         continue;
       }
-      writeConfigAtomic(join(root, CONFIG_FILE), next);
+      let nowText: string | null;
+      try {
+        nowText = readFileSync(path, "utf8");
+      } catch {
+        nowText = null;
+      }
+      if (nowText !== baseText) {
+        briefSleep(25 * (i + 1));
+        continue; // content changed under us — reload and re-apply
+      }
+      const tmp = `${path}.tmp-${process.pid}-${i}`;
+      writeFileSync(tmp, JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });
+      if (!verifyLockOwnership(lockDir, token)) {
+        rmSync(tmp, { force: true });
+        briefSleep(25 * (i + 1));
+        continue;
+      }
+      renameSync(tmp, path);
+      if (!verifyLockOwnership(lockDir, token)) {
+        return { ok: false, reason: "control lock displaced during commit; re-run the command to reconcile" };
+      }
       return { ok: true, config: next };
     } finally {
       releaseLock(lockDir, token);
@@ -377,23 +411,38 @@ export function acquireLock(lockDir: string): string | false {
   // milliseconds, so an old lock is abandoned (or its PID was reused).
   // Fencing (verifyLockOwnership before commit) makes a wrongly-broken
   // lock detectable rather than silently corrupting.
-  let owner: string | undefined;
-  try {
-    owner = readFileSync(join(lockDir, LOCK_OWNER_FILE), "utf8");
-  } catch {
-    owner = undefined;
-  }
-  const pid = owner ? Number(owner.split(":")[0]) : NaN;
   let held;
   try {
     held = statSync(lockDir);
   } catch {
     return false; // another breaker already moved it
   }
+  let owner: string | undefined;
+  try {
+    owner = readFileSync(join(lockDir, LOCK_OWNER_FILE), "utf8");
+  } catch {
+    owner = undefined; // ownerless: staleness decided by age alone
+  }
+  if (owner !== undefined) {
+    // Bind owner metadata to the same directory instance: if the directory
+    // was replaced between the stat and the owner read, yield.
+    try {
+      if (statSync(lockDir).ino !== held.ino) return false;
+    } catch {
+      return false;
+    }
+  }
+  const pid = owner ? Number(owner.split(":")[0]) : NaN;
   const ownerDead = Number.isInteger(pid) && pid > 0 && !isPidAlive(pid);
   const tooOld = Date.now() - held.mtimeMs > LOCK_STALE_MS;
   if (!ownerDead && !tooOld) return false;
-  // Break the stale lock: move it aside atomically and verify identity.
+  // Break the stale lock: move it aside atomically, then re-evaluate
+  // staleness on the MOVED instance. (Inode identity is not reliable here:
+  // deleting the old dir frees its inode number, and a fresh mkdir may
+  // immediately reuse it — observed as overlapping winners in the race
+  // test.) A moved lock that turns out to have a live owner, or to be
+  // freshly created and still ownerless (a holder mid-claim), is restored
+  // and the break is yielded.
   const trash = `${lockDir}.stale-${process.pid}`;
   rmSync(trash, { recursive: true, force: true });
   try {
@@ -401,9 +450,18 @@ export function acquireLock(lockDir: string): string | false {
   } catch {
     return false; // another breaker moved it first
   }
-  if (statSync(trash).ino !== held.ino) {
+  let movedOwner: string | undefined;
+  try {
+    movedOwner = readFileSync(join(trash, LOCK_OWNER_FILE), "utf8");
+  } catch {
+    movedOwner = undefined;
+  }
+  const movedPid = movedOwner ? Number(movedOwner.split(":")[0]) : NaN;
+  const movedOwnerAlive = Number.isInteger(movedPid) && movedPid > 0 && isPidAlive(movedPid);
+  const movedFresh = Date.now() - statSync(trash).mtimeMs <= LOCK_STALE_MS;
+  if (movedOwnerAlive || (movedOwner === undefined && movedFresh)) {
     try {
-      renameSync(trash, lockDir); // restore the fresh lock we disturbed
+      renameSync(trash, lockDir); // restore the live lock we disturbed
     } catch {
       // path already reclaimed; the displaced lock survives as trash
     }

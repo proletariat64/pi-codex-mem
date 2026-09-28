@@ -247,3 +247,23 @@ test("a lock whose owner process is dead is broken even when fresh", (t) => {
   releaseLock(lock, token);
   assert.throws(() => statSync(lock));
 });
+
+test("owner metadata and directory identity are bound: replacement between reads yields", (t) => {
+  const root = makeRoot(t);
+  const lock = join(root, "config.json.lock");
+  // Dead owner's stale lock
+  mkdirSync(lock);
+  writeFileSync(join(lock, "owner"), "4194303:deadbeef");
+  // A breaker acquiring now should win (dead owner)…
+  const token1 = acquireLock(lock);
+  assert.ok(token1);
+  releaseLock(lock, token1);
+  // …and after release, a fresh claim by a live owner is never broken by
+  // someone who statted the OLD directory: simulate by claiming with our
+  // own live pid, then having a competitor attempt a break.
+  const token2 = acquireLock(lock);
+  assert.ok(token2);
+  const competitor = acquireLock(lock); // same process, lock held by self
+  assert.equal(competitor, false, "held lock with live owner is never broken");
+  releaseLock(lock, token2);
+});

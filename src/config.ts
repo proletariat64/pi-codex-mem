@@ -3,6 +3,7 @@
 // reusable from a future standalone CLI.
 
 import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
 
 export type MemoryVersion = "v1" | "v2";
@@ -119,7 +120,8 @@ export function loadConfig(root: string, opts?: { timezone?: string; create?: bo
     // If the lock is held, report missing rather than racing the writer.
     const lockDir = join(root, "config.json.lock");
     mkdirSync(root, { recursive: true });
-    if (!acquireLock(lockDir)) {
+    const token = acquireLock(lockDir);
+    if (!token) {
       return { status: "missing", path };
     }
     try {
@@ -146,11 +148,15 @@ export function loadConfig(root: string, opts?: { timezone?: string; create?: bo
           };
         }
       }
+      // Fence: if our lock was displaced by a stale-break race, do not write.
+      if (!verifyLockOwnership(lockDir, token)) {
+        return { status: "missing", path };
+      }
       const config = defaultConfig(opts?.timezone ?? "UTC");
       writeConfigAtomic(path, config);
       return { status: "created", config, path };
     } finally {
-      rmSync(lockDir, { recursive: true, force: true });
+      releaseLock(lockDir, token);
     }
   }
   let raw: unknown;
@@ -299,7 +305,8 @@ export function updateConfig(
   // the update would be misreported as lock contention.
   mkdirSync(root, { recursive: true });
   for (let i = 0; i < attempts; i++) {
-    if (!acquireLock(lockDir)) {
+    const token = acquireLock(lockDir);
+    if (!token) {
       briefSleep(25 * (i + 1));
       continue; // another process holds the control lock
     }
@@ -321,56 +328,115 @@ export function updateConfig(
       if (problems.length > 0) {
         return { ok: false, reason: `mutation produced invalid config: ${problems.join("; ")}` };
       }
+      // Fence: a displaced lock (stale-break race) means another writer may
+      // hold the path now. Abort rather than risk a silent overwrite; the
+      // caller retries from fresh content.
+      if (!verifyLockOwnership(lockDir, token)) {
+        briefSleep(25 * (i + 1));
+        continue;
+      }
       writeConfigAtomic(join(root, CONFIG_FILE), next);
       return { ok: true, config: next };
     } finally {
-      rmSync(lockDir, { recursive: true, force: true });
+      releaseLock(lockDir, token);
     }
   }
   return { ok: false, reason: "config control lock held by another process" };
 }
 
-/** Locks are held for milliseconds; anything older is a crashed holder. */
+/** Fallback staleness for owner files that cannot be parsed. */
 const LOCK_STALE_MS = 30_000;
+const LOCK_OWNER_FILE = "owner";
 
-/** Atomic lock via mkdir; breaks locks abandoned by crashed processes. Exported for concurrency tests. */
-export function acquireLock(lockDir: string): boolean {
+function isPidAlive(pid: number): boolean {
   try {
-    mkdirSync(lockDir);
+    process.kill(pid, 0);
     return true;
-  } catch {
-    // exists — maybe stale
+  } catch (err) {
+    // EPERM means the process exists but is not ours to signal.
+    return (err as NodeJS.ErrnoException).code === "EPERM";
   }
+}
+
+/**
+ * Atomic lock via mkdir with an ownership token (fencing). Returns the
+ * token, or false when the lock is held by a live process. A lock is only
+ * ever broken when its owner is demonstrably dead (ESRCH) or its metadata
+ * is unreadable and old — a live holder's lock is never considered stale,
+ * which removes the displacement race entirely for living processes.
+ * The break itself moves the directory aside atomically and verifies the
+ * moved inode is the one inspected; a mismatch means we disturbed a fresh
+ * lock, which is restored. Callers MUST re-verify with
+ * verifyLockOwnership before committing a write.
+ */
+export function acquireLock(lockDir: string): string | false {
+  const token = `${process.pid}:${randomBytes(8).toString("hex")}`;
+  if (tryClaim(lockDir, token)) return token;
+  // Exists — decide staleness by owner liveness, not just age.
+  let owner: string | undefined;
   try {
-    const held = statSync(lockDir);
-    if (Date.now() - held.mtimeMs <= LOCK_STALE_MS) return false;
-    // Break the stale lock without a TOCTOU race: move it aside atomically
-    // and verify the moved directory is the SAME inode we statted. If it
-    // isn't, we grabbed someone's fresh live lock — put it back and yield.
-    const trash = `${lockDir}.stale-${process.pid}`;
-    rmSync(trash, { recursive: true, force: true });
+    owner = readFileSync(join(lockDir, LOCK_OWNER_FILE), "utf8");
+  } catch {
+    owner = undefined;
+  }
+  const pid = owner ? Number(owner.split(":")[0]) : NaN;
+  let stale: boolean;
+  if (Number.isInteger(pid) && pid > 0) {
+    stale = !isPidAlive(pid);
+  } else {
+    // No readable owner: fall back to age (a fresh ownerless dir is a
+    // holder mid-acquire — never stale).
     try {
-      renameSync(lockDir, trash);
+      stale = Date.now() - statSync(lockDir).mtimeMs > LOCK_STALE_MS;
     } catch {
-      return false; // another breaker moved it first
-    }
-    if (statSync(trash).ino !== held.ino) {
-      try {
-        renameSync(trash, lockDir); // restore the live lock we disturbed
-      } catch {
-        // a third process already claimed the path; the lock survives as trash
-      }
       return false;
     }
-    rmSync(trash, { recursive: true, force: true });
+  }
+  if (!stale) return false;
+  // Break the stale lock: move it aside atomically and verify identity.
+  const held = statSync(lockDir);
+  const trash = `${lockDir}.stale-${process.pid}`;
+  rmSync(trash, { recursive: true, force: true });
+  try {
+    renameSync(lockDir, trash);
+  } catch {
+    return false; // another breaker moved it first
+  }
+  if (statSync(trash).ino !== held.ino) {
     try {
-      mkdirSync(lockDir);
-      return true;
+      renameSync(trash, lockDir); // restore the fresh lock we disturbed
     } catch {
-      return false; // another breaker won the recreate
+      // path already reclaimed; the displaced lock survives as trash
     }
+    return false;
+  }
+  rmSync(trash, { recursive: true, force: true });
+  return tryClaim(lockDir, token) ? token : false;
+}
+
+function tryClaim(lockDir: string, token: string): boolean {
+  try {
+    mkdirSync(lockDir);
+    writeFileSync(join(lockDir, LOCK_OWNER_FILE), token, { mode: 0o600 });
+    return true;
   } catch {
     return false;
+  }
+}
+
+/** Fencing check: true only while the lock still belongs to this token. */
+export function verifyLockOwnership(lockDir: string, token: string): boolean {
+  try {
+    return readFileSync(join(lockDir, LOCK_OWNER_FILE), "utf8") === token;
+  } catch {
+    return false;
+  }
+}
+
+/** Release only if we still own the lock — never delete another holder's. */
+export function releaseLock(lockDir: string, token: string): void {
+  if (verifyLockOwnership(lockDir, token)) {
+    rmSync(lockDir, { recursive: true, force: true });
   }
 }
 

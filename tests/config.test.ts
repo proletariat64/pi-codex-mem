@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { defaultConfig, loadConfig, updateConfig, validateConfig } from "../src/config.ts";
+import { acquireLock, defaultConfig, loadConfig, releaseLock, updateConfig, validateConfig, verifyLockOwnership } from "../src/config.ts";
 
 function makeRoot(t: test.TestContext): string {
   const root = mkdtempSync(join(tmpdir(), "pi-memory-config-"));
@@ -218,4 +218,32 @@ test("create path does not clobber a config committed while we waited for the lo
   const result = loadConfig(root, { timezone: "UTC" });
   assert.equal(result.status, "ok");
   if (result.status === "ok") assert.equal(result.config.dualWrite, true);
+});
+
+test("a displaced lock holder detects loss and never deletes the new holder's lock", (t) => {
+  const root = makeRoot(t);
+  const lock = join(root, "config.json.lock");
+  const token = acquireLock(lock);
+  assert.ok(token, "first acquire succeeds");
+  // Simulate a stale-break race displacing us: another process claims it
+  rmSync(lock, { recursive: true, force: true });
+  mkdirSync(lock);
+  writeFileSync(join(lock, "owner"), "999999:foreign");
+  assert.equal(verifyLockOwnership(lock, token), false);
+  releaseLock(lock, token); // must NOT remove the foreign lock
+  assert.equal(readFileSync(join(lock, "owner"), "utf8"), "999999:foreign");
+  rmSync(lock, { recursive: true, force: true });
+});
+
+test("a lock whose owner process is dead is broken even when fresh", (t) => {
+  const root = makeRoot(t);
+  const lock = join(root, "config.json.lock");
+  mkdirSync(lock);
+  // 4194303 is above Linux's default pid_max — guaranteed dead
+  writeFileSync(join(lock, "owner"), "4194303:deadbeef");
+  const token = acquireLock(lock);
+  assert.ok(token, "dead owner's lock is broken and claimed");
+  assert.equal(verifyLockOwnership(lock, token), true);
+  releaseLock(lock, token);
+  assert.throws(() => statSync(lock));
 });

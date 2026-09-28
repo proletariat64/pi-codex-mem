@@ -2,7 +2,7 @@
 // This module is pure Node — no pi imports — so it is unit-testable and
 // reusable from a future standalone CLI.
 
-import { chmodSync, closeSync, constants as fsConstants, existsSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, constants as fsConstants, existsSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
@@ -51,7 +51,7 @@ export interface MemoryConfig {
 export type LoadConfigResult =
   | { status: "ok"; config: MemoryConfig; path: string }
   | { status: "created"; config: MemoryConfig; path: string }
-  | { status: "missing"; path: string }
+  | { status: "missing"; path: string; reason?: string }
   | { status: "invalid"; problems: string[]; path: string };
 
 export const CONFIG_FILE = "config.json";
@@ -137,9 +137,14 @@ export function loadConfig(root: string, opts?: { timezone?: string; create?: bo
     // If the lock is held, report missing rather than racing the writer.
     const lockDir = join(root, "config.json.lock");
     mkdirSync(root, { recursive: true });
-    const token = acquireLock(lockDir);
+    let token: string | false;
+    try {
+      token = acquireLock(lockDir);
+    } catch (err) {
+      return { status: "missing", path, reason: `control store unavailable: ${(err as Error).message}` };
+    }
     if (!token) {
-      return { status: "missing", path };
+      return { status: "missing", path, reason: existsSync(lockDir) ? legacyLockRecovery(lockDir) : "config control lock busy" };
     }
     try {
       // Re-check under the lock: another process may have committed a
@@ -306,14 +311,19 @@ export function updateConfig(
   const attempts = opts?.maxAttempts ?? 5;
   const lockDir = join(root, "config.json.lock");
   // The root may not exist yet (first-ever update): create it before
-  // acquiring the lock, otherwise mkdir of the lock dir fails ENOENT and
-  // the update would be misreported as lock contention.
+  // opening the control database, avoiding an ENOENT startup failure.
   mkdirSync(root, { recursive: true });
   for (let i = 0; i < attempts; i++) {
-    const token = acquireLock(lockDir);
+    let token: string | false;
+    try {
+      token = acquireLock(lockDir);
+    } catch (err) {
+      return { ok: false, reason: `control store unavailable: ${(err as Error).message}` };
+    }
     if (!token) {
+      if (existsSync(lockDir)) return { ok: false, reason: legacyLockRecovery(lockDir) };
       briefSleep(25 * (i + 1));
-      continue; // another process holds the control lock
+      continue; // another SQLite writer holds the control lock
     }
     try {
       // Fresh read under the lock: the mutation always applies to the
@@ -385,41 +395,14 @@ export function updateConfig(
  * no PID, lease, stale-break, compare-and-unlink, or token-file race exists.
  * Configuration I/O happens while the transaction is open. state.sqlite is
  * also the shared store DB; its schema can be initialized later by capture.
- * A directory guard is additionally kept during migration so older pi
- * processes using the prior mkdir protocol cannot write concurrently.
+ * Upgrade policy: stop all pre-SQLite pi processes and manually clear their
+ * legacy config.json.lock file/directory. NEVER auto-delete that path: an
+ * old process could replace it between inspection and deletion.
  */
 const heldLocks = new Map<string, { db: DatabaseSync; lockPath: string }>();
 
-function isPidAlive(pid: number): boolean {
-  try { process.kill(pid, 0); return true; }
-  catch (err) { return (err as NodeJS.ErrnoException).code === "EPERM"; }
-}
-
-function processBirth(pid: number): string | null {
-  try {
-    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-    return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19] ?? null;
-  } catch { return null; }
-}
-
-/** A leftover pre-upgrade file/dir needs a demonstrably dead owner. */
-function clearDeadLegacyLock(lockPath: string): boolean {
-  if (!existsSync(lockPath)) return true;
-  try {
-    const state = statSync(lockPath);
-    const text = readFileSync(state.isDirectory() ? join(lockPath, "owner") : lockPath, "utf8");
-    const [rawPid, claimedBirth, nonce] = text.split(":");
-    const pid = Number(rawPid);
-    if (!Number.isInteger(pid) || pid <= 0) return false;
-    const born = processBirth(pid);
-    const recycled = Boolean(nonce && /^\d+$/.test(claimedBirth ?? "") && born && born !== claimedBirth);
-    if (isPidAlive(pid) && !recycled) return false;
-    rmSync(lockPath, { recursive: true, force: true });
-    return true;
-  } catch {
-    // Unknown owner may still be mid-claim in an old process. Fail closed.
-    return false;
-  }
+function legacyLockRecovery(lockPath: string): string {
+  return `legacy control lock at ${lockPath}; stop all pre-upgrade pi processes, verify they have exited, then manually remove the legacy lock before retrying`;
 }
 
 export function acquireLock(lockPath: string): string | false {
@@ -446,27 +429,15 @@ export function acquireLock(lockPath: string): string | false {
     if (/SQLITE_BUSY|database is locked/i.test((err as Error).message)) return false;
     throw err;
   }
-  if (!clearDeadLegacyLock(lockPath)) {
+  // A legacy guard is an explicit upgrade blocker, never an invitation to
+  // auto-break it. A new old-version claimant after this check is excluded
+  // by the operator's quiescent-upgrade precondition.
+  if (existsSync(lockPath)) {
     db.exec("ROLLBACK");
     db.close();
     return false;
   }
-  const token = `${process.pid}:${processBirth(process.pid) ?? "unknown"}:${randomBytes(16).toString("hex")}`;
-  let guardCreated = false;
-  try {
-    mkdirSync(lockPath, { mode: 0o700 });
-    guardCreated = true;
-    writeFileSync(join(lockPath, "owner"), token, { mode: 0o600, flag: "wx" });
-  } catch (err) {
-    // A prior-version contender may have claimed its guard after we checked.
-    // Never delete a guard we did not create (or one since displaced).
-    const owner = readFileSyncIfExists(join(lockPath, "owner"));
-    if (guardCreated && (owner === undefined || owner === token)) rmSync(lockPath, { recursive: true, force: true });
-    db.exec("ROLLBACK");
-    db.close();
-    if ((err as NodeJS.ErrnoException).code === "EEXIST") return false;
-    throw err;
-  }
+  const token = `${process.pid}:${randomBytes(16).toString("hex")}`;
   heldLocks.set(token, { db, lockPath });
   return token;
 }
@@ -475,10 +446,8 @@ export function acquireLock(lockPath: string): string | false {
 export function verifyLockOwnership(lockPath: string, token: string): boolean {
   const held = heldLocks.get(token);
   if (!held || held.lockPath !== lockPath) return false;
-  try {
-    held.db.prepare("SELECT 1").get();
-    return readFileSyncIfExists(join(lockPath, "owner")) === token;
-  } catch { return false; }
+  try { held.db.prepare("SELECT 1").get(); return true; }
+  catch { return false; }
 }
 
 /** Release only our exact connection; never unlink a successor's lock. */
@@ -486,18 +455,8 @@ export function releaseLock(lockPath: string, token: string): void {
   const held = heldLocks.get(token);
   if (!held || held.lockPath !== lockPath) return;
   heldLocks.delete(token);
-  try {
-    if (readFileSyncIfExists(join(lockPath, "owner")) === token) {
-      rmSync(lockPath, { recursive: true, force: true });
-    }
-  } finally {
-    try { held.db.exec("ROLLBACK"); }
-    finally { held.db.close(); }
-  }
-}
-
-function readFileSyncIfExists(path: string): string | undefined {
-  try { return readFileSync(path, "utf8"); } catch { return undefined; }
+  try { held.db.exec("ROLLBACK"); }
+  finally { held.db.close(); }
 }
 
 /** Synchronous short sleep for lock contention backoff (ms). */

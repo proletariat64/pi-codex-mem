@@ -60,6 +60,9 @@ test("config edited mid-session takes effect at the next foreground run", async 
   const status = notifyLog.find((m) => m.includes("mode:"));
   assert.ok(status, "status notify emitted");
   assert.match(status!, /mode: read \(from config\)/);
+  assert.match(status!, /store: not initialized yet/, "control DB alone is not a captured store");
+  await commands.get("memory")!.handler("doctor", ctx as never);
+  assert.ok(notifyLog.some((m) => m.includes("state.sqlite not initialized")));
 });
 
 test("a foreground run without structured sections marks them unavailable; next session resets", async (t) => {

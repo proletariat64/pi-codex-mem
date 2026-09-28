@@ -203,17 +203,38 @@ test("loadConfig create path respects a held control lock instead of racing it",
   releaseLock(lock, held);
 });
 
-test("a stale control lock from a crashed process is broken, not obeyed forever", (t) => {
+test("old lock files and directories require a quiescent manual migration", (t) => {
   const root = makeRoot(t);
   const lock = join(root, "config.json.lock");
-  // Migrating a file-format lock from a provably dead old process.
-  writeFileSync(lock, "4194303:stale");
-  const result = loadConfig(root, { timezone: "UTC" });
-  assert.equal(result.status, "created");
-  assert.equal(loadConfig(root).status, "ok");
+  writeFileSync(lock, "4194303:dead-owner");
+  assert.equal(acquireLock(lock), false, "never break a possibly replaced old lock");
+  const result = updateConfig(root, (c) => ({ ...c, dualWrite: true }));
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.match(result.reason, /stop all pre-upgrade pi processes.*manually remove/);
+  assert.equal(readFileSync(lock, "utf8"), "4194303:dead-owner");
+  rmSync(lock);
+  mkdirSync(lock);
+  assert.equal(acquireLock(lock), false, "ownerless old directories are also left untouched");
+  rmSync(lock, { recursive: true });
+  const token = acquireLock(lock);
+  assert.ok(token, "after an operator clears the legacy path, SQLite can claim");
+  releaseLock(lock, token);
 });
 
-test("process exit releases SQLite transaction and recovers its leftover migration guard", (t) => {
+test("corrupt control database preserves files and reports failure instead of rejecting startup", (t) => {
+  const root = makeRoot(t);
+  writeFileSync(join(root, "state.sqlite"), "not a SQLite database");
+  const loaded = loadConfig(root);
+  assert.equal(loaded.status, "missing");
+  if (loaded.status === "missing") assert.match(loaded.reason ?? "", /control store unavailable/);
+  assert.equal(existsSync(join(root, "config.json")), false);
+  const updated = updateConfig(root, (c) => ({ ...c, dualWrite: true }));
+  assert.equal(updated.ok, false);
+  if (!updated.ok) assert.match(updated.reason, /control store unavailable/);
+  assert.equal(readFileSync(join(root, "state.sqlite"), "utf8"), "not a SQLite database");
+});
+
+test("process exit releases SQLite transaction with no stale token to break", (t) => {
   const root = makeRoot(t);
   const lock = join(root, "config.json.lock");
   const moduleUrl = new URL("../src/config.ts", import.meta.url).href;
@@ -221,54 +242,11 @@ test("process exit releases SQLite transaction and recovers its leftover migrati
     `import {acquireLock} from ${JSON.stringify(moduleUrl)}; process.exit(acquireLock(process.env.LOCK_PATH) ? 0 : 2);`],
     { env: { ...process.env, LOCK_PATH: lock }, encoding: "utf8" });
   assert.equal(child.status, 0, child.stderr);
-  assert.equal(statSync(lock).isDirectory(), true, "crash left compatibility guard");
+  assert.equal(existsSync(lock), false, "new protocol creates no filesystem guard");
   const token = acquireLock(lock);
-  assert.ok(token, "SQLite transaction was released by OS and old guard recovered");
+  assert.ok(token, "SQLite lock was released automatically by OS");
   assert.equal(statSync(join(root, "state.sqlite")).mode & 0o777, 0o600);
   releaseLock(lock, token);
-});
-
-test("pre-upgrade directory lock with a dead owner is recovered", (t) => {
-  const root = makeRoot(t);
-  const lock = join(root, "config.json.lock");
-  mkdirSync(lock);
-  writeFileSync(join(lock, "owner"), "4194303:crashed");
-  const token = acquireLock(lock);
-  assert.ok(token, "dead legacy owner no longer blocks updates");
-  assert.equal(readFileSync(join(lock, "owner"), "utf8"), token, "new migration guard belongs to SQLite holder");
-  releaseLock(lock, token);
-  assert.equal(existsSync(lock), false);
-});
-
-test("recycled PID cannot strand a new-format compatibility guard", (t) => {
-  if (process.platform !== "linux") return;
-  const lock = join(makeRoot(t), "config.json.lock");
-  mkdirSync(lock);
-  writeFileSync(join(lock, "owner"), `${process.pid}:1:previous-process`);
-  const token = acquireLock(lock);
-  assert.ok(token, "birth mismatch proves the old owner is gone");
-  releaseLock(lock, token);
-});
-
-test("ownerless pre-upgrade directory fails closed regardless of age", (t) => {
-  const root = makeRoot(t);
-  const lock = join(root, "config.json.lock");
-  mkdirSync(lock);
-  assert.equal(acquireLock(lock), false);
-  const old = new Date(Date.now() - 120_000);
-  utimesSync(lock, old, old);
-  assert.equal(acquireLock(lock), false, "unknown owner could still be live");
-});
-
-test("aged pre-upgrade directory with a live owner is not broken", (t) => {
-  const root = makeRoot(t);
-  const lock = join(root, "config.json.lock");
-  mkdirSync(lock);
-  writeFileSync(join(lock, "owner"), `${process.pid}:legacy`);
-  const old = new Date(Date.now() - 120_000);
-  utimesSync(lock, old, old);
-  assert.equal(acquireLock(lock), false);
-  assert.equal(statSync(lock).isDirectory(), true);
 });
 
 test("a held SQLite transaction excludes competitors; release permits reuse", (t) => {
@@ -303,34 +281,4 @@ test("a foreign token cannot release a live SQLite holder", (t) => {
   assert.equal(acquireLock(lock), false);
   assert.equal(verifyLockOwnership(lock, token), true);
   releaseLock(lock, token);
-});
-
-test("a lock whose owner process is dead is broken even when fresh", (t) => {
-  const root = makeRoot(t);
-  const lock = join(root, "config.json.lock");
-  // 4194303 is above Linux's default pid_max — guaranteed dead
-  writeFileSync(lock, "4194303:deadbeef");
-  const token = acquireLock(lock);
-  assert.ok(token, "dead owner's lock is broken and claimed");
-  assert.equal(verifyLockOwnership(lock, token), true);
-  releaseLock(lock, token);
-  assert.throws(() => statSync(lock));
-});
-
-test("a live transaction is not displaced after dead legacy cleanup", (t) => {
-  const root = makeRoot(t);
-  const lock = join(root, "config.json.lock");
-  // Dead owner's stale lock
-  writeFileSync(lock, "4194303:deadbeef");
-  // A breaker acquiring now should win (dead owner)…
-  const token1 = acquireLock(lock);
-  assert.ok(token1);
-  releaseLock(lock, token1);
-  // …and after release, a fresh claim by a live owner excludes every
-  // competitor until the connection is released.
-  const token2 = acquireLock(lock);
-  assert.ok(token2);
-  const competitor = acquireLock(lock); // same process, lock held by self
-  assert.equal(competitor, false, "SQLite excludes a second writer");
-  releaseLock(lock, token2);
 });

@@ -24,7 +24,7 @@ export interface DoctorInput {
     /** Root points into Codex or Claude-mem data (spec §5.1: must be rejected). */
     rootIsCodex: boolean;
   };
-  store: { state: "absent" | "current" | "legacy_layout" };
+  store: { state: "absent" | "current" | "legacy_layout" | "unavailable" };
   models: {
     extract:
       | { status: "unset" }
@@ -103,8 +103,8 @@ export function runDoctor(input: DoctorInput): DoctorReport {
     probes.push({
       id: "config",
       label: "configuration",
-      status: "warn",
-      detail: "config.json not created yet — defaults will be written on first session",
+      status: c.reason ? "fail" : "warn",
+      detail: c.reason ?? "config.json not created yet — defaults will be written on first session",
     });
   } else {
     probes.push({
@@ -126,6 +126,8 @@ export function runDoctor(input: DoctorInput): DoctorReport {
       status: "fail",
       detail: "legacy_layout_detected: unversioned generations/ layout is not supported; files preserved, generation disabled (spec §12.5)",
     });
+  } else if (s.state === "unavailable") {
+    probes.push({ id: "store", label: "state store", status: "fail", detail: "state.sqlite unavailable or corrupt; file preserved" });
   } else if (s.state === "absent") {
     probes.push({
       id: "store",

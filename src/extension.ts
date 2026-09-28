@@ -1,5 +1,6 @@
 import { accessSync, constants as fsConstants, existsSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
+import { DatabaseSync } from "node:sqlite";
 import { join, resolve } from "node:path";
 import { getAgentDir, VERSION as PI_VERSION, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
@@ -161,6 +162,8 @@ export default function (pi: ExtensionAPI) {
         `pi-memory: config.json invalid — file preserved, generation disabled:\n${state.config.problems.join("\n")}`,
         "warning",
       );
+    } else if (state.config.status === "missing" && state.config.reason && ctx.hasUI) {
+      ctx.ui.notify(`pi-memory: ${state.config.reason}; capture disabled`, "warning");
     }
   });
 
@@ -180,6 +183,23 @@ export default function (pi: ExtensionAPI) {
     state.config = loadConfig(resolveMemoryRoot(), { create: false });
   });
 
+  function storeSchemaState(root: string): "absent" | "current" | "unavailable" {
+    const path = join(root, "state.sqlite");
+    if (!existsSync(path)) return "absent";
+    let db: DatabaseSync | undefined;
+    try {
+      db = new DatabaseSync(path, { readOnly: true });
+      const rows = db.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('schema_migrations', 'source_revisions')",
+      ).all() as { name: string }[];
+      return rows.length === 2 ? "current" : "absent";
+    } catch {
+      return "unavailable";
+    } finally {
+      db?.close();
+    }
+  }
+
   function gatherDoctorInput(): DoctorInput {
     const root = resolveMemoryRoot();
     let rootWritable = false;
@@ -197,9 +217,8 @@ export default function (pi: ExtensionAPI) {
     // reported accurately; never create config.json from the doctor path.
     const config = loadConfig(root, { create: false });
     let storeState: DoctorInput["store"]["state"] = "absent";
-    if (existsSync(join(root, "state.sqlite"))) {
-      storeState = "current";
-    } else if (existsSync(join(root, "generations")) && !existsSync(join(root, "versions"))) {
+    storeState = storeSchemaState(root);
+    if (storeState === "absent" && existsSync(join(root, "generations")) && !existsSync(join(root, "versions"))) {
       storeState = "legacy_layout";
     }
     const cfg: MemoryConfig | null =
@@ -238,7 +257,7 @@ export default function (pi: ExtensionAPI) {
     const cfg = state.config;
     const { mode, source } = effectiveMode();
     if (!cfg || cfg.status === "missing") {
-      lines.push("state: no session started yet");
+      lines.push(cfg?.status === "missing" && cfg.reason ? `state: DISABLED — ${cfg.reason}` : "state: no session started yet");
     } else if (cfg.status === "invalid") {
       lines.push("state: DISABLED generation — config invalid (file preserved)", ...cfg.problems.map((p) => `  - ${p}`));
     } else {
@@ -247,9 +266,11 @@ export default function (pi: ExtensionAPI) {
         `mode: ${describeMode(mode, source)}`,
         `selected version: ${c.version}${c.dualWrite ? " + dual-write v1&v2" : ""}`,
         `models: extract=${formatModelRef(c.models.extract)}, consolidate=${formatModelRef(c.models.consolidate)}`,
-        existsSync(join(root, "state.sqlite"))
+        storeSchemaState(root) === "current"
           ? "store: present"
-          : "store: not initialized yet (capture arrives in a later milestone)",
+          : storeSchemaState(root) === "unavailable"
+            ? "store: unavailable or corrupt (preserved)"
+            : "store: not initialized yet (capture arrives in a later milestone)",
       );
     }
     return lines;

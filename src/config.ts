@@ -2,9 +2,9 @@
 // This module is pure Node — no pi imports — so it is unit-testable and
 // reusable from a future standalone CLI.
 
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 export type MemoryVersion = "v1" | "v2";
 export type CaptureMode = "tui" | "rpc" | "json" | "print";
@@ -50,6 +50,7 @@ export interface MemoryConfig {
 export type LoadConfigResult =
   | { status: "ok"; config: MemoryConfig; path: string }
   | { status: "created"; config: MemoryConfig; path: string }
+  | { status: "missing"; path: string }
   | { status: "invalid"; problems: string[]; path: string };
 
 export const CONFIG_FILE = "config.json";
@@ -89,13 +90,20 @@ export function defaultConfig(timezone: string): MemoryConfig {
   };
 }
 
-/** Load config.json from the memory root, creating it with defaults on first run. */
-export function loadConfig(root: string, opts?: { timezone?: string }): LoadConfigResult {
+/**
+ * Load config.json from the memory root, creating it with defaults on first
+ * run. Pass `create: false` from read-only paths (e.g. /memory doctor) to get
+ * "missing" instead of writing a file.
+ */
+export function loadConfig(root: string, opts?: { timezone?: string; create?: boolean }): LoadConfigResult {
   const path = join(root, CONFIG_FILE);
   let text: string;
   try {
     text = readFileSync(path, "utf8");
   } catch {
+    if (opts?.create === false) {
+      return { status: "missing", path };
+    }
     const config = defaultConfig(opts?.timezone ?? "UTC");
     writeConfigAtomic(path, config);
     return { status: "created", config, path };
@@ -158,27 +166,21 @@ export function validateConfig(raw: unknown): string[] {
   if (typeof schedule !== "object" || schedule === null) {
     problems.push(`schedule must be an object`);
   } else {
-    const ranges: Record<string, [number, number]> = {
+    validateRanges("schedule", schedule, {
       minIdleMinutes: [0, 100000],
       maxSourceAgeDays: [1, 3650],
       maxExtractionsPerPass: [1, 64],
       extractionConcurrency: [1, 16],
       maxConsolidationSources: [1, 4096],
       maxUnusedDays: [1, 3650],
-    };
-    for (const [key, [min, max]] of Object.entries(ranges)) {
-      const v = schedule[key];
-      if (typeof v !== "number" || !Number.isInteger(v) || v < min || v > max) {
-        problems.push(`schedule.${key} must be an integer in [${min}, ${max}], got ${JSON.stringify(v)}`);
-      }
-    }
+    }, problems);
   }
   const limits = c.limits as Record<string, unknown> | undefined;
   if (typeof limits !== "object" || limits === null) {
     problems.push(`limits must be an object`);
   } else {
     // Spec §14: the v2 caps cannot be raised via configuration.
-    const ranges: Record<string, [number, number]> = {
+    validateRanges("limits", limits, {
       inputBytes: [1024, 2 ** 24],
       toolResultBytes: [256, 2 ** 20],
       extractionOutputBytes: [1024, 2 ** 20],
@@ -189,13 +191,7 @@ export function validateConfig(raw: unknown): string[] {
       dailyOutputTokens: [100, 100000000],
       dailyRequests: [1, 10000],
       maxStoreBytes: [2 ** 20, 2 ** 34],
-    };
-    for (const [key, [min, max]] of Object.entries(ranges)) {
-      const v = limits[key];
-      if (typeof v !== "number" || !Number.isInteger(v) || v < min || v > max) {
-        problems.push(`limits.${key} must be an integer in [${min}, ${max}], got ${JSON.stringify(v)}`);
-      }
-    }
+    }, problems);
   }
   if (typeof c.timezone !== "string" || c.timezone.length === 0) {
     problems.push(`timezone must be a non-empty IANA timezone string`);
@@ -203,16 +199,31 @@ export function validateConfig(raw: unknown): string[] {
   return problems;
 }
 
+function validateRanges(
+  section: string,
+  obj: Record<string, unknown>,
+  ranges: Record<string, [number, number]>,
+  problems: string[],
+): void {
+  for (const [key, [min, max]] of Object.entries(ranges)) {
+    const v = obj[key];
+    if (typeof v !== "number" || !Number.isInteger(v) || v < min || v > max) {
+      problems.push(`${section}.${key} must be an integer in [${min}, ${max}], got ${JSON.stringify(v)}`);
+    }
+  }
+}
+
+/** Canonical `provider/modelId` rendering for status and diagnostics. */
+export function formatModelRef(ref: ModelRef | null): string {
+  return ref ? `${ref.provider}/${ref.modelId}` : "(resolve on first use)";
+}
+
 /** Atomically write config.json (tmp file + rename). */
 export function writeConfigAtomic(path: string, config: MemoryConfig): void {
-  mkdirSync(dirnameOf(path), { recursive: true });
+  mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.tmp-${process.pid}`;
   writeFileSync(tmp, JSON.stringify(config, null, 2) + "\n", { mode: 0o600 });
   renameSync(tmp, path);
-}
-
-function dirnameOf(path: string): string {
-  return path.slice(0, path.length - CONFIG_FILE.length - 1) || ".";
 }
 
 function contentHash(text: string): string {
@@ -220,9 +231,11 @@ function contentHash(text: string): string {
 }
 
 /**
- * Read-modify-write one config field set under a content-hash CAS so
- * concurrent /memory commands cannot clobber each other (spec §5.4).
- * Retries by re-reading and re-applying the mutation. Mutation must be pure.
+ * Read-modify-write one config field set under a short store-wide control
+ * lock with content-hash comparison (spec §5.4). The lock is an atomic
+ * mkdir; the hash is compared while holding it, so no concurrent writer can
+ * slip between check and rename. Retries by re-reading and re-applying the
+ * mutation. Mutation must be pure.
  */
 export function updateConfig(
   root: string,
@@ -230,38 +243,45 @@ export function updateConfig(
   opts?: { timezone?: string; maxAttempts?: number },
 ): { ok: true; config: MemoryConfig } | { ok: false; reason: string } {
   const attempts = opts?.maxAttempts ?? 5;
+  const lockDir = join(root, "config.json.lock");
   for (let i = 0; i < attempts; i++) {
     const loaded = loadConfig(root, opts);
     if (loaded.status === "invalid") {
       return { ok: false, reason: `config invalid: ${loaded.problems.join("; ")}` };
+    }
+    if (loaded.status === "missing") {
+      return { ok: false, reason: "config missing and could not be created" };
     }
     const next = mutate(loaded.config);
     const problems = validateConfig(next);
     if (problems.length > 0) {
       return { ok: false, reason: `mutation produced invalid config: ${problems.join("; ")}` };
     }
-    const beforeHash = contentHash(readFileSync(loaded.path, "utf8"));
-    const serialized = JSON.stringify(next, null, 2) + "\n";
-    // Write to tmp, then re-check the live file hash right before rename.
-    mkdirSync(root, { recursive: true });
-    const tmp = `${loaded.path}.tmp-${process.pid}`;
-    writeFileSync(tmp, serialized, { mode: 0o600 });
-    let currentHash: string;
+    if (!acquireLock(lockDir)) continue; // someone else is mid-write; re-read and retry
     try {
-      currentHash = contentHash(readFileSync(loaded.path, "utf8"));
-    } catch {
-      currentHash = "__missing__";
-    }
-    if (currentHash === beforeHash) {
+      const beforeHash = contentHash(readFileSync(loaded.path, "utf8"));
+      const tmp = `${loaded.path}.tmp-${process.pid}-${i}`;
+      writeFileSync(tmp, JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });
+      const currentHash = contentHash(readFileSync(loaded.path, "utf8"));
+      if (currentHash !== beforeHash) {
+        rmSync(tmp, { force: true });
+        continue; // changed while we worked; retry with fresh content
+      }
       renameSync(tmp, loaded.path);
       return { ok: true, config: next };
-    }
-    // Lost the race: discard and retry with fresh content.
-    try {
-      renameSync(tmp, `${loaded.path}.stale-${process.pid}`);
-    } catch {
-      /* best effort */
+    } finally {
+      rmSync(lockDir, { recursive: true, force: true });
     }
   }
   return { ok: false, reason: "config changed concurrently too many times" };
+}
+
+/** Atomic lock via mkdir; returns false when already held. */
+function acquireLock(lockDir: string): boolean {
+  try {
+    mkdirSync(lockDir);
+    return true;
+  } catch {
+    return false;
+  }
 }

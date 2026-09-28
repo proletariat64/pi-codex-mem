@@ -26,9 +26,15 @@ export interface DoctorInput {
   };
   store: { state: "absent" | "current" | "legacy_layout" };
   models: {
-    extract: { status: "unset" } | { status: "configured"; ref: ModelRef };
-    consolidate: { status: "unset" } | { status: "configured"; ref: ModelRef };
+    extract:
+      | { status: "unset" }
+      | { status: "configured"; ref: ModelRef; resolved: boolean };
+    consolidate:
+      | { status: "unset" }
+      | { status: "configured"; ref: ModelRef; resolved: boolean };
   };
+  /** Runtime observation of structured prompt sections (spec §2.3 probe). */
+  promptSections: "confirmed" | "unobserved" | "unavailable";
 }
 
 export interface DoctorReport {
@@ -37,7 +43,10 @@ export interface DoctorReport {
   format(): string[];
 }
 
-function modelProbe(id: string, model: DoctorInput["models"]["extract"]): DoctorProbe {
+function modelProbe(
+  id: string,
+  model: DoctorInput["models"]["extract"],
+): DoctorProbe {
   if (model.status === "unset") {
     return {
       id,
@@ -46,12 +55,10 @@ function modelProbe(id: string, model: DoctorInput["models"]["extract"]): Doctor
       detail: "not configured; the current foreground model becomes the default on first eligible use (spec §13)",
     };
   }
-  return {
-    id,
-    label: "model",
-    status: "ok",
-    detail: `${model.ref.provider}/${model.ref.modelId}`,
-  };
+  const name = `${model.ref.provider}/${model.ref.modelId}`;
+  return model.resolved
+    ? { id, label: "model", status: "ok", detail: `${name} (resolves in pi's registry)` }
+    : { id, label: "model", status: "fail", detail: `${name} does not resolve in pi's model registry` };
 }
 
 export function runDoctor(input: DoctorInput): DoctorReport {
@@ -92,6 +99,13 @@ export function runDoctor(input: DoctorInput): DoctorReport {
       status: "fail",
       detail: `config.json invalid — file preserved, generation disabled: ${c.problems.join("; ")}`,
     });
+  } else if (c.status === "missing") {
+    probes.push({
+      id: "config",
+      label: "configuration",
+      status: "warn",
+      detail: "config.json not created yet — defaults will be written on first session",
+    });
   } else {
     probes.push({
       id: "config",
@@ -125,6 +139,15 @@ export function runDoctor(input: DoctorInput): DoctorReport {
 
   probes.push(modelProbe("model:extract", input.models.extract));
   probes.push(modelProbe("model:consolidate", input.models.consolidate));
+
+  const ps = input.promptSections;
+  probes.push(
+    ps === "confirmed"
+      ? { id: "prompt-sections", label: "prompt injection", status: "ok", detail: "structured system-prompt sections observed at runtime" }
+      : ps === "unobserved"
+        ? { id: "prompt-sections", label: "prompt injection", status: "warn", detail: "structured sections not yet observed (no foreground run this session)" }
+        : { id: "prompt-sections", label: "prompt injection", status: "fail", detail: "host did not expose structured system-prompt sections — injection would fail" },
+  );
 
   const ok = probes.every((probe) => probe.status !== "fail");
   return {

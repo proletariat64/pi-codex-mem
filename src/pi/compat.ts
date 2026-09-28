@@ -35,6 +35,8 @@ export interface CompatResult {
 }
 
 export const MIN_NODE_VERSION = "22.19.0";
+/** Event support is pinned by host version (registration never throws). */
+export const MIN_PI_VERSION = "0.87.1";
 
 function parseVersion(v: string): [number, number, number] | null {
   const m = /^(\d+)\.(\d+)\.(\d+)/.exec(v);
@@ -42,7 +44,8 @@ function parseVersion(v: string): [number, number, number] | null {
   return [Number(m[1]), Number(m[2]), Number(m[3])];
 }
 
-function versionAtLeast(version: string, minimum: string): boolean {
+/** Shared semver-ish comparator used for both Node and pi host versions. */
+export function semverAtLeast(version: string, minimum: string): boolean {
   const v = parseVersion(version);
   const min = parseVersion(minimum);
   if (!v || !min) return false;
@@ -60,7 +63,7 @@ function versionAtLeast(version: string, minimum: string): boolean {
  */
 export function checkHostCompat(caps: HostCapabilities): CompatResult {
   const problems: string[] = [];
-  if (!versionAtLeast(caps.nodeVersion, MIN_NODE_VERSION)) {
+  if (!semverAtLeast(caps.nodeVersion, MIN_NODE_VERSION)) {
     problems.push(`Node ${caps.nodeVersion} is below the required >= ${MIN_NODE_VERSION}`);
   }
   if (!caps.hasNodeSqlite) {
@@ -68,7 +71,7 @@ export function checkHostCompat(caps: HostCapabilities): CompatResult {
   }
   for (const event of REQUIRED_EVENTS) {
     if (!caps.events.includes(event)) {
-      problems.push(`host does not support the "${event}" extension event (requires pi >= 0.87.1 API level)`);
+      problems.push(`host does not support the "${event}" extension event (inferred from pi version < ${MIN_PI_VERSION}; registration alone cannot detect this)`);
     }
   }
   if (!caps.hasStructuredPromptSections) {

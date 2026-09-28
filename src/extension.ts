@@ -1,20 +1,38 @@
-import { existsSync, statSync } from "node:fs";
-import { realpathSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { getAgentDir, VERSION as PI_VERSION, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { loadConfig, type LoadConfigResult, type MemoryConfig } from "./config.ts";
-import { checkHostCompat, REQUIRED_EVENTS, type CompatResult, type HostCapabilities } from "./pi/compat.ts";
+import {
+  formatModelRef,
+  loadConfig,
+  type LoadConfigResult,
+  type MemoryConfig,
+} from "./config.ts";
+import {
+  checkHostCompat,
+  MIN_PI_VERSION,
+  REQUIRED_EVENTS,
+  semverAtLeast,
+  type CompatResult,
+  type HostCapabilities,
+} from "./pi/compat.ts";
 import { runDoctor, type DoctorInput } from "./doctor.ts";
 
 const EXTENSION_VERSION = "0.1.0";
-const MIN_PI_VERSION = "0.87.1";
+
+/** Effective runtime mode (spec §6.3): flag > config-derived. */
+type MemoryMode = "off" | "read" | "read-write";
 
 /** The independent pi memory root (spec §5.1). Never Codex or Claude-mem data. */
 function resolveMemoryRoot(): string {
   return join(getAgentDir(), "memory");
 }
 
-/** spec §5.1: a memory root inside Codex/Claude-mem locations must be rejected. */
+/**
+ * spec §5.1: a memory root inside Codex/Claude-mem locations must be rejected.
+ * Computed from the home directory, not derived from the agent dir, so a
+ * relocated PI_CODING_AGENT_DIR cannot confuse the check.
+ */
 function rootPointsIntoForeignMemory(root: string): boolean {
   let real: string;
   try {
@@ -22,32 +40,65 @@ function rootPointsIntoForeignMemory(root: string): boolean {
   } catch {
     real = resolve(root);
   }
-  const home = getAgentDir();
-  const codex = resolve(join(home, "..", "..", ".codex"));
-  const forbidden = [join(codex, "memories"), join(codex, "memories_v2"), join(codex, "sessions")];
+  const home = homedir();
+  const forbidden = [
+    join(home, ".codex", "memories"),
+    join(home, ".codex", "memories_v2"),
+    join(home, ".codex", "sessions"),
+    join(home, ".claude-mem"),
+  ];
   return forbidden.some((f) => real === f || real.startsWith(f + "/"));
 }
 
-function piVersionAtLeast(version: string, minimum: string): boolean {
-  const parse = (v: string) => v.split(".").map((n) => Number.parseInt(n, 10));
-  const [a1 = 0, a2 = 0, a3 = 0] = parse(version);
-  const [b1 = 0, b2 = 0, b3 = 0] = parse(minimum);
-  return a1 !== b1 ? a1 > b1 : a2 !== b2 ? a2 > b2 : a3 >= b3;
+/** Mode derived from configuration alone (spec §14 distinctions). */
+function modeFromConfig(config: MemoryConfig): MemoryMode {
+  if (!config.enabled) return "off";
+  if (config.read && config.generate) return "read-write";
+  if (config.read) return "read";
+  return "off";
+}
+
+function describeMode(mode: MemoryMode, source: "flag" | "config"): string {
+  return `${mode} (from ${source})`;
 }
 
 interface RuntimeState {
   compat: CompatResult | null;
   config: LoadConfigResult | null;
-  sectionsSeen: boolean;
+  promptSections: "confirmed" | "unobserved" | "unavailable";
+  modelRegistry: { find?: unknown } | null;
 }
 
 export default function (pi: ExtensionAPI) {
-  const state: RuntimeState = { compat: null, config: null, sectionsSeen: false };
+  const state: RuntimeState = {
+    compat: null,
+    config: null,
+    promptSections: "unobserved",
+    modelRegistry: null,
+  };
 
-  async function probeHost(ctx: {
-    sessionManager?: unknown;
-    modelRegistry?: unknown;
-  }): Promise<HostCapabilities> {
+  pi.registerFlag("pi-memory-mode", {
+    description: "Pi Memory runtime mode: off | read | read-write (overrides config)",
+    type: "string",
+  });
+
+  function flagMode(): MemoryMode | undefined {
+    const raw = pi.getFlag("pi-memory-mode");
+    if (raw === "off" || raw === "read" || raw === "read-write") return raw;
+    return undefined;
+  }
+
+  function effectiveMode(): { mode: MemoryMode; source: "flag" | "config" } {
+    const flag = flagMode();
+    if (flag) return { mode: flag, source: "flag" };
+    const cfg = state.config;
+    if (cfg && cfg.status !== "invalid" && cfg.status !== "missing") {
+      return { mode: modeFromConfig(cfg.config), source: "config" };
+    }
+    return { mode: "off", source: "config" };
+  }
+
+  async function probeHost(ctx: { sessionManager?: unknown; modelRegistry?: unknown }): Promise<HostCapabilities> {
     let hasNodeSqlite = false;
     try {
       await import("node:sqlite");
@@ -57,20 +108,22 @@ export default function (pi: ExtensionAPI) {
     }
     const sm = ctx.sessionManager as { getBranch?: unknown } | undefined;
     const mr = ctx.modelRegistry as { find?: unknown; streamSimple?: unknown } | undefined;
-    const piOk = piVersionAtLeast(PI_VERSION, MIN_PI_VERSION);
+    const piOk = semverAtLeast(PI_VERSION, MIN_PI_VERSION);
     return {
       nodeVersion: process.versions.node,
       hasNodeSqlite,
-      // Event support is pinned by host version: registration does not throw on
-      // unknown names, so pi >= 0.87.1 is the documented proxy (spec §2.3).
+      // Event support is pinned by host version: registration does not throw
+      // on unknown names, so pi >= MIN_PI_VERSION is the documented proxy.
       events: piOk ? REQUIRED_EVENTS : [],
-      hasStructuredPromptSections: piOk, // refined by the before_agent_start probe below
+      // Refined at runtime by the before_agent_start probe below.
+      hasStructuredPromptSections: piOk,
       hasBranchAccess: typeof sm?.getBranch === "function",
       hasModelRegistryAccess: typeof mr?.find === "function" && typeof mr?.streamSimple === "function",
     };
   }
 
   pi.on("session_start", async (_event, ctx) => {
+    state.modelRegistry = (ctx as { modelRegistry?: { find?: unknown } }).modelRegistry ?? null;
     const caps = await probeHost(ctx);
     state.compat = checkHostCompat(caps);
     state.config = loadConfig(resolveMemoryRoot(), {
@@ -91,11 +144,12 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", (event) => {
-    // Probe: structured sections exist when the host supports section injection.
     const opts = event.systemPromptOptions as { sections?: unknown } | undefined;
     if (opts && typeof opts === "object" && "sections" in opts) {
-      state.sectionsSeen = true;
+      state.promptSections = "confirmed";
     }
+    // If sections are absent here the host (or another extension) cannot
+    // support section injection — surfaced via /memory doctor, not silently.
   });
 
   function gatherDoctorInput(): DoctorInput {
@@ -104,20 +158,32 @@ export default function (pi: ExtensionAPI) {
     if (existsSync(root)) {
       try {
         statSync(root);
-        rootWritable = true; // existence + stat is our cheap proxy; real writes fail loudly later
+        rootWritable = true; // cheap proxy; real writes fail loudly later
       } catch {
         rootWritable = false;
       }
     }
-    const compat = state.compat ?? { supported: false, problems: ["no session has started yet — capabilities not probed"] };
-    const config = state.config ?? loadConfig(root);
+    const compat =
+      state.compat ?? { supported: false, problems: ["no session has started yet — capabilities not probed"] };
+    // Read-only: never create config.json from the doctor path.
+    const config = state.config ?? loadConfig(root, { create: false });
     let storeState: DoctorInput["store"]["state"] = "absent";
     if (existsSync(join(root, "state.sqlite"))) {
       storeState = "current";
     } else if (existsSync(join(root, "generations")) && !existsSync(join(root, "versions"))) {
       storeState = "legacy_layout";
     }
-    const cfg: MemoryConfig | null = config.status === "invalid" ? null : config.config;
+    const cfg: MemoryConfig | null =
+      config.status === "ok" || config.status === "created" ? config.config : null;
+    const resolveRef = (ref: { provider: string; modelId: string } | null) => {
+      if (!ref) return { status: "unset" } as const;
+      const find = state.modelRegistry?.find;
+      const resolved =
+        typeof find === "function"
+          ? Boolean((find as (p: string, m: string) => unknown).call(state.modelRegistry, ref.provider, ref.modelId))
+          : false;
+      return { status: "configured", ref, resolved } as const;
+    };
     return {
       compat,
       config,
@@ -128,12 +194,8 @@ export default function (pi: ExtensionAPI) {
         rootIsCodex: rootPointsIntoForeignMemory(root),
       },
       store: { state: storeState },
-      models: {
-        extract: cfg?.models.extract ? { status: "configured", ref: cfg.models.extract } : { status: "unset" },
-        consolidate: cfg?.models.consolidate
-          ? { status: "configured", ref: cfg.models.consolidate }
-          : { status: "unset" },
-      },
+      models: { extract: resolveRef(cfg?.models.extract ?? null), consolidate: resolveRef(cfg?.models.consolidate ?? null) },
+      promptSections: state.promptSections,
     };
   }
 
@@ -145,16 +207,17 @@ export default function (pi: ExtensionAPI) {
       return lines;
     }
     const cfg = state.config;
-    if (!cfg) {
+    const { mode, source } = effectiveMode();
+    if (!cfg || cfg.status === "missing") {
       lines.push("state: no session started yet");
     } else if (cfg.status === "invalid") {
       lines.push("state: DISABLED generation — config invalid (file preserved)", ...cfg.problems.map((p) => `  - ${p}`));
     } else {
       const c = cfg.config;
       lines.push(
-        `state: ${c.enabled ? "enabled" : "disabled"} (read=${c.read}, generate=${c.generate})`,
+        `mode: ${describeMode(mode, source)}`,
         `selected version: ${c.version}${c.dualWrite ? " + dual-write v1&v2" : ""}`,
-        `models: extract=${c.models.extract ? `${c.models.extract.provider}/${c.models.extract.modelId}` : "(resolve on first use)"}, consolidate=${c.models.consolidate ? `${c.models.consolidate.provider}/${c.models.consolidate.modelId}` : "(resolve on first use)"}`,
+        `models: extract=${formatModelRef(c.models.extract)}, consolidate=${formatModelRef(c.models.consolidate)}`,
         existsSync(join(root, "state.sqlite"))
           ? "store: present"
           : "store: not initialized yet (capture arrives in a later milestone)",

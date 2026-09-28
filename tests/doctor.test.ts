@@ -15,9 +15,10 @@ function goodInput(): DoctorInput {
     },
     store: { state: "absent" },
     models: {
-      extract: { status: "configured", ref: { provider: "deepseek", modelId: "deepseek-chat" } },
-      consolidate: { status: "configured", ref: { provider: "deepseek", modelId: "deepseek-chat" } },
+      extract: { status: "configured", ref: { provider: "deepseek", modelId: "deepseek-chat" }, resolved: true },
+      consolidate: { status: "configured", ref: { provider: "deepseek", modelId: "deepseek-chat" }, resolved: true },
     },
+    promptSections: "confirmed",
   };
 }
 
@@ -25,7 +26,7 @@ test("healthy input produces an ok report covering all sections", () => {
   const report = runDoctor(goodInput());
   assert.equal(report.ok, true);
   const ids = report.probes.map((p) => p.id);
-  for (const id of ["host", "paths", "config", "store", "model:extract", "model:consolidate"]) {
+  for (const id of ["host", "paths", "config", "store", "model:extract", "model:consolidate", "prompt-sections"]) {
     assert.ok(ids.includes(id), `missing probe ${id}`);
   }
   assert.ok(report.probes.every((p) => p.status !== "fail"));
@@ -90,4 +91,31 @@ test("a formatted report renders one line per probe", () => {
   const lines = report.format();
   assert.equal(lines.length, report.probes.length + 1); // header + probes
   assert.match(lines[0]!, /pi-memory doctor/);
+});
+
+test("a configured model that does not resolve in the registry fails", () => {
+  const input = goodInput();
+  input.models = {
+    extract: { status: "configured", ref: { provider: "gone", modelId: "nope" }, resolved: false },
+    consolidate: { status: "unset" },
+  };
+  const report = runDoctor(input);
+  assert.equal(report.probes.find((p) => p.id === "model:extract")?.status, "fail");
+  assert.equal(report.ok, false);
+});
+
+test("unobserved prompt sections warn; unavailable fails", () => {
+  const input = goodInput();
+  input.promptSections = "unobserved";
+  assert.equal(runDoctor(input).probes.find((p) => p.id === "prompt-sections")?.status, "warn");
+  input.promptSections = "unavailable";
+  assert.equal(runDoctor(input).probes.find((p) => p.id === "prompt-sections")?.status, "fail");
+});
+
+test("missing config warns instead of failing or creating", () => {
+  const input = goodInput();
+  input.config = { status: "missing", path: "/mem/config.json" };
+  const report = runDoctor(input);
+  assert.equal(report.probes.find((p) => p.id === "config")?.status, "warn");
+  assert.equal(report.ok, true);
 });

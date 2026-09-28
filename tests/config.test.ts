@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defaultConfig, loadConfig, updateConfig, validateConfig } from "../src/config.ts";
@@ -122,4 +122,26 @@ test("updateConfig refuses a mutation that would violate ranges", (t) => {
   // File still holds the previous valid config
   const reloaded = loadConfig(root);
   assert.equal(reloaded.status, "ok");
+});
+
+test("loadConfig with create:false reports missing without writing", (t) => {
+  const root = makeRoot(t);
+  const result = loadConfig(root, { create: false });
+  assert.equal(result.status, "missing");
+  assert.throws(() => readFileSync(join(root, "config.json")));
+});
+
+test("sequential updates both apply and leave no tmp or lock litter", (t) => {
+  const root = makeRoot(t);
+  loadConfig(root, { timezone: "UTC" });
+  assert.equal(updateConfig(root, (c) => ({ ...c, version: "v2" as const })).ok, true);
+  assert.equal(updateConfig(root, (c) => ({ ...c, dualWrite: true })).ok, true);
+  const reloaded = loadConfig(root);
+  assert.equal(reloaded.status, "ok");
+  if (reloaded.status === "ok") {
+    assert.equal(reloaded.config.version, "v2");
+    assert.equal(reloaded.config.dualWrite, true);
+  }
+  const leftovers = readdirSync(root).filter((f) => f.includes(".tmp") || f.includes(".lock") || f.includes(".stale"));
+  assert.deepEqual(leftovers, []);
 });

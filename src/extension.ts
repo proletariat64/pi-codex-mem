@@ -5,7 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import { join, resolve } from "node:path";
 import { getAgentDir, VERSION as PI_VERSION, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type SessionHeader } from "@earendil-works/pi-coding-agent";
 import { captureSettledSession, type CaptureResult } from "./capture.ts";
-import { blockUncapturedLeaf, openStateDb, retireOtherHeads } from "./store/db.ts";
+import { blockUncapturedLeaf, openStateDb, prunePrivacyRevoked, retireOtherHeads } from "./store/db.ts";
 import { computeSessionKey } from "./identity.ts";
 import { isExcludedWorkspace } from "./workspace-policy.ts";
 import { enrollHistoricalImport, planHistoricalImport } from "./historical-import.ts";
@@ -122,7 +122,10 @@ export default function (pi: ExtensionAPI) {
   };
   const activityOwner = randomUUID();
   let scheduler: ExtractionScheduler | null = null;
+  let runtimePort: ReturnType<typeof createRegistryModelPort> | null = null;
   let heartbeat: NodeJS.Timeout | null = null;
+  let privacyRetryTimer: NodeJS.Timeout | null = null;
+  let privacyRetryCount = 0;
   let foregroundIdle = true;
   let activeCwd = "";
   let activeMode = "";
@@ -148,26 +151,65 @@ export default function (pi: ExtensionAPI) {
     return { mode: "off", source: "config" };
   }
 
-  function ensureScheduler(ctx: ExtensionContext): void {
-    if (scheduler || !state.db || !state.compat?.supported || !ctx.modelRegistry) return;
+  function eligibleExtractionConfig(root: string): MemoryConfig | null {
+    const loaded = loadConfig(root, { create: false });
+    if (loaded.status !== "ok") return null;
+    const config = loaded.config;
+    if (!config.enabled || !config.generate || flagMode() === "off" || flagMode() === "read" ||
+        !config.captureModes.includes(activeMode as MemoryConfig["captureModes"][number]) ||
+        isExcludedWorkspace(activeCwd, config.excludedWorkspaces)) return null;
+    return config;
+  }
+
+  function ensureScheduler(ctx?: ExtensionContext): void {
+    if (ctx?.modelRegistry && !runtimePort) runtimePort = createRegistryModelPort(ctx.modelRegistry);
+    if (scheduler || !state.db || !state.compat?.supported || !runtimePort) return;
     const root = resolveMemoryRoot();
     if (rootPointsIntoForeignMemory(root) || legacyLockPath(root)) return;
-    const port = createRegistryModelPort(ctx.modelRegistry);
+    const port = runtimePort;
     scheduler = new ExtractionScheduler({ db: state.db, root, modelPort: () => port,
       now: Date.now, isForegroundIdle: () => foregroundIdle,
       onError: (err) => { state.captureError = `scheduler failed: ${(err as Error).message}`; },
-      config: () => {
-        const loaded = loadConfig(root, { create: false });
-        if (loaded.status !== "ok" || !loaded.config.enabled || !loaded.config.generate ||
-            flagMode() === "off" || flagMode() === "read" ||
-            !loaded.config.captureModes.includes(activeMode as typeof ctx.mode) ||
-            isExcludedWorkspace(activeCwd, loaded.config.excludedWorkspaces)) return null;
-        return loaded.config;
-      },
+      config: () => eligibleExtractionConfig(root),
     });
   }
 
   function triggerScheduler(): void { scheduler?.trigger(); }
+
+  /** One-shot, bounded-backoff retry when another SQLite reader holds WAL frames. */
+  function schedulePrivacyCleanup(root: string): void {
+    if (privacyRetryTimer) return;
+    const delay = Math.min(30_000, 1_000 * 2 ** Math.min(privacyRetryCount++, 5));
+    privacyRetryTimer = setTimeout(() => {
+      privacyRetryTimer = null;
+      if (resolveMemoryRoot() !== root) return;
+      try {
+        if (state.db) prunePrivacyRevoked(state.db, root);
+        else state.db = openStateDb(root);
+        ensureScheduler();
+        triggerScheduler();
+        privacyRetryCount = 0;
+        if (state.captureError?.startsWith("privacy cleanup deferred:")) state.captureError = null;
+      } catch (err) {
+        notePrivacyCleanupFailure(err, root);
+      }
+    }, delay);
+    privacyRetryTimer.unref();
+  }
+
+  function notePrivacyCleanupFailure(error: unknown, root: string): boolean {
+    const message = (error as Error).message;
+    if (!message.startsWith("privacy WAL cleanup deferred")) return false;
+    state.captureError = `privacy cleanup deferred: ${message}`;
+    schedulePrivacyCleanup(root);
+    return true;
+  }
+
+  function cancelPrivacyCleanup(): void {
+    if (privacyRetryTimer) clearTimeout(privacyRetryTimer);
+    privacyRetryTimer = null;
+    privacyRetryCount = 0;
+  }
 
   function markForegroundActive(ctx: ExtensionContext): void {
     foregroundIdle = false;
@@ -232,10 +274,12 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.on("session_start", async (_event, ctx) => {
+    cancelPrivacyCleanup();
     if (heartbeat) clearInterval(heartbeat);
     heartbeat = null;
     await scheduler?.stop();
     scheduler = null;
+    runtimePort = null;
     if (state.db) clearProcessActivity(state.db, activityOwner);
     state.db?.close();
     state.db = null;
@@ -284,7 +328,9 @@ export default function (pi: ExtensionAPI) {
             }
           }
         } catch (err) {
-          state.captureError = `resume reconciliation failed: ${(err as Error).message}`;
+          if (!notePrivacyCleanupFailure(err, root)) {
+            state.captureError = `resume reconciliation failed: ${(err as Error).message}`;
+          }
         }
       }
     }
@@ -354,7 +400,9 @@ export default function (pi: ExtensionAPI) {
           configEpoch: extractionConfigEpoch(config.config), now: Date.now() });
       }
     } catch (err) {
-      state.captureError = `capture failed: ${(err as Error).message}`;
+      if (!notePrivacyCleanupFailure(err, root)) {
+        state.captureError = `capture failed: ${(err as Error).message}`;
+      }
       if (ctx.hasUI) ctx.ui.notify(`pi-memory: ${state.captureError}`, "warning");
     }
   }
@@ -388,11 +436,14 @@ export default function (pi: ExtensionAPI) {
       state.capture = null;
       scheduler?.trigger();
     } catch (err) {
-      state.captureError = `tree reconciliation failed: ${(err as Error).message}`;
+      if (!notePrivacyCleanupFailure(err, root)) {
+        state.captureError = `tree reconciliation failed: ${(err as Error).message}`;
+      }
     }
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
+    cancelPrivacyCleanup();
     if (heartbeat) clearInterval(heartbeat);
     heartbeat = null;
     await scheduler?.stop();
@@ -401,6 +452,8 @@ export default function (pi: ExtensionAPI) {
       if (state.db) clearProcessActivity(state.db, activityOwner);
       captureNow(ctx);
     } finally {
+      cancelPrivacyCleanup();
+      runtimePort = null;
       state.db?.close();
       state.db = null;
     }
@@ -621,6 +674,7 @@ export default function (pi: ExtensionAPI) {
       }
       report(message, message.startsWith("scheduler failed:") ? "warning" : "info");
     } catch (err) {
+      notePrivacyCleanupFailure(err, root);
       report(`failed: ${(err as Error).message}`, "warning");
     }
   }
@@ -698,6 +752,7 @@ export default function (pi: ExtensionAPI) {
           }
           ctx.ui.notify(lines.join("\n"), "info");
         } catch (err) {
+          notePrivacyCleanupFailure(err, resolveMemoryRoot());
           ctx.ui.notify(`pi-memory import failed: ${(err as Error).message}`, "warning");
         }
       } else {

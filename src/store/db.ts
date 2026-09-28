@@ -36,7 +36,7 @@ export interface SnapshotRecord {
   evidenceRemoved?: boolean;
 }
 
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 7;
 
 const MIGRATION_1 = `
 CREATE TABLE schema_migrations (
@@ -195,6 +195,17 @@ CREATE TABLE budget_reservations (
 
 const MIGRATION_6 = `ALTER TABLE jobs ADD COLUMN config_epoch TEXT NOT NULL DEFAULT '';`;
 
+// Earlier releases may have deleted a revoked row while secure_delete was
+// disabled. Its bytes can survive on a SQLite free page after the row is gone.
+// A one-time upgrade VACUUM rebuilds from live rows to scrub that free space.
+const MIGRATION_7 = `
+CREATE TABLE privacy_scrub_state (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  legacy_vacuum_pending INTEGER NOT NULL CHECK (legacy_vacuum_pending IN (0, 1))
+);
+INSERT INTO privacy_scrub_state (singleton, legacy_vacuum_pending) VALUES (1, 1);
+`;
+
 export function openStateDb(root: string): DatabaseSync {
   mkdirSync(root, { recursive: true, mode: 0o700 });
   chmodSync(root, 0o700);
@@ -250,6 +261,10 @@ export function openStateDb(root: string): DatabaseSync {
       if (current < 6) {
         db.exec(MIGRATION_6);
         db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(6, Date.now());
+      }
+      if (current < 7) {
+        db.exec(MIGRATION_7);
+        db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(7, Date.now());
       }
       db.exec("COMMIT");
     } catch (err) {
@@ -322,7 +337,14 @@ export function prunePrivacyRevoked(db: DatabaseSync, root: string): void {
   }
   const rows = db.prepare("SELECT snapshot_path FROM source_revisions WHERE status = 'privacy_revoked'")
     .all() as { snapshot_path: string }[];
-  if (rows.length === 0) return;
+  const legacy = db.prepare("SELECT legacy_vacuum_pending FROM privacy_scrub_state WHERE singleton = 1")
+    .get() as { legacy_vacuum_pending: number };
+  if (rows.length === 0) {
+    if (legacy.legacy_vacuum_pending) {
+      db.prepare("UPDATE privacy_scrub_state SET legacy_vacuum_pending = 0 WHERE singleton = 1").run();
+    }
+    return;
+  }
   const sourceDir = join(root, "sources");
   if (existsSync(sourceDir)) {
     if (lstatSync(sourceDir).isSymbolicLink()) throw new Error("sources symlink rejected during privacy cleanup");
@@ -340,6 +362,20 @@ export function prunePrivacyRevoked(db: DatabaseSync, root: string): void {
         if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
       }
     }
+  }
+  if (legacy.legacy_vacuum_pending) {
+    // secure_delete cannot erase already-freed cells from a previous release.
+    // VACUUM copies only live rows into a new database image. Keep the marker
+    // set on failure so a later startup retries before reporting cleanup.
+    try {
+      db.exec("VACUUM");
+    } catch (err) {
+      if (/locked|busy/i.test((err as Error).message)) {
+        throw new Error("privacy WAL cleanup deferred: active SQLite reader", { cause: err });
+      }
+      throw err;
+    }
+    db.prepare("UPDATE privacy_scrub_state SET legacy_vacuum_pending = 0 WHERE singleton = 1").run();
   }
   // Secure-delete rewrites live database pages; old WAL frames may still
   // contain the superseded extraction. Do not report privacy cleanup as

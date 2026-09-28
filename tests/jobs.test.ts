@@ -82,19 +82,27 @@ test("privacy revocation deletes derived extraction text in the same transaction
   assert.equal(containsDeletedText(), false, "privacy removal must purge SQLite and WAL bytes");
 });
 
-test("startup scrubs legacy privacy-revoked extraction bytes from a pre-secure-delete DB", (t) => {
+test("startup vacuums legacy bytes already deleted with secure_delete off", (t) => {
   const { root, db } = fixture(t);
-  db.exec("PRAGMA secure_delete = OFF"); // simulate the previous on-disk policy
+  // Simulate a pre-upgrade store that already deleted a revoked SQL row but
+  // retained its bytes in SQLite free space before secure_delete was enabled.
+  if (db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'privacy_scrub_state'").get()) {
+    db.exec("DROP TABLE privacy_scrub_state");
+    db.prepare("DELETE FROM schema_migrations WHERE version = 7").run();
+  }
+  db.exec("PRAGMA secure_delete = OFF");
   enqueueExtraction(db, { sourceId: SOURCE_ID, memoryVersion: "v1", promptHash: PROMPT_HASH, now: NOW });
   const [job] = claimDueExtractions(db, { owner: "old", now: NOW, limit: 1 });
   assert.ok(job);
   const marker = "PRIVATE_LEGACY_EXTRACTION_b53d87_UNIQUE";
   assert.equal(commitExtraction(db, job, { ...accepted(), rawMemory: marker }, NOW + 1), true);
-  db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
-  const databasePath = join(root, "state.sqlite");
-  assert.equal(readFileSync(databasePath).includes(Buffer.from(marker)), true);
   db.prepare("UPDATE source_revisions SET status = 'privacy_revoked' WHERE source_id = ?").run(SOURCE_ID);
+  db.prepare("DELETE FROM extractions WHERE source_id = ?").run(SOURCE_ID);
+  db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
   db.close();
+  const databasePath = join(root, "state.sqlite");
+  assert.equal(readFileSync(databasePath).includes(Buffer.from(marker)), true,
+    "fixture must retain already-deleted plaintext in the main DB");
   const reopened = openStateDb(root);
   t.after(() => reopened.close());
   assert.equal((reopened.prepare("SELECT COUNT(*) AS n FROM extractions").get() as { n: number }).n, 0);
@@ -109,13 +117,14 @@ test("schema 5 jobs upgrade to configuration epochs without losing durable work"
   db.close();
   const legacy = new DatabaseSync(join(root, "state.sqlite"));
   legacy.exec("ALTER TABLE jobs DROP COLUMN config_epoch");
-  legacy.prepare("DELETE FROM schema_migrations WHERE version = 6").run();
+  legacy.exec("DROP TABLE privacy_scrub_state");
+  legacy.prepare("DELETE FROM schema_migrations WHERE version >= 6").run();
   legacy.close();
   const upgraded = openStateDb(root);
   t.after(() => upgraded.close());
   assert.deepEqual({ ...upgraded.prepare("SELECT status, config_epoch FROM jobs").get() },
     { status: "queued", config_epoch: "" });
-  assert.equal((upgraded.prepare("SELECT MAX(version) AS v FROM schema_migrations").get() as { v: number }).v, 6);
+  assert.equal((upgraded.prepare("SELECT MAX(version) AS v FROM schema_migrations").get() as { v: number }).v, 7);
 });
 
 test("a conflicting extraction is never reported as a successful commit", (t) => {

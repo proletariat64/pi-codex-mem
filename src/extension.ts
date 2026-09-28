@@ -3,6 +3,9 @@ import { homedir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { join, resolve } from "node:path";
 import { getAgentDir, VERSION as PI_VERSION, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { captureSettledSession, type CaptureResult } from "./capture.ts";
+import { openStateDb, retireOtherHeads } from "./store/db.ts";
+import { computeSessionKey } from "./identity.ts";
 import {
   formatModelRef,
   legacyLockRecovery,
@@ -74,6 +77,9 @@ interface RuntimeState {
   config: LoadConfigResult | null;
   promptSections: "confirmed" | "unobserved" | "unavailable";
   modelRegistry: { find?: unknown } | null;
+  db: DatabaseSync | null;
+  capture: CaptureResult | null;
+  captureError: string | null;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -82,6 +88,9 @@ export default function (pi: ExtensionAPI) {
     config: null,
     promptSections: "unobserved",
     modelRegistry: null,
+    db: null,
+    capture: null,
+    captureError: null,
   };
 
   pi.registerFlag("pi-memory-mode", {
@@ -130,6 +139,10 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.on("session_start", async (_event, ctx) => {
+    state.db?.close();
+    state.db = null;
+    state.capture = null;
+    state.captureError = null;
     state.modelRegistry = (ctx as { modelRegistry?: { find?: unknown } }).modelRegistry ?? null;
     // Per-session observations reset: a previous session's missing-sections
     // run must not poison this session's diagnostics.
@@ -175,6 +188,64 @@ export default function (pi: ExtensionAPI) {
     if (legacy && ctx.hasUI && state.config.status !== "missing") {
       ctx.ui.notify(`pi-memory: ${legacyLockRecovery(legacy)}; configuration updates blocked`, "warning");
     }
+  });
+
+  pi.on("agent_settled", (_event, ctx) => {
+    const root = resolveMemoryRoot();
+    if (!state.compat?.supported || rootPointsIntoForeignMemory(root)) return;
+    // §6.3: captureModes is independent of generate (which only controls
+    // model calls). Explicit read/off flags must not write new evidence.
+    const config = loadConfig(root, { create: false });
+    if (config.status !== "ok" || !config.config.enabled ||
+        !config.config.captureModes.includes(ctx.mode) ||
+        config.config.excludedWorkspaces.includes(ctx.cwd) ||
+        flagMode() === "off" || flagMode() === "read") return;
+    try {
+      if (!ctx.sessionManager.getSessionFile() || !ctx.sessionManager.getHeader() || !ctx.sessionManager.getLeafId()) {
+        state.capture = { status: "ephemeral", reason: "persistent session header/path/leaf unavailable" };
+        return;
+      }
+      state.db ??= openStateDb(root);
+      state.capture = captureSettledSession({
+        root, agentDir: getAgentDir(), cwd: ctx.cwd, mode: ctx.mode,
+        reader: ctx.sessionManager, db: state.db,
+        limits: {
+          itemBytes: 64 * 1024,
+          toolResultBytes: config.config.limits.toolResultBytes,
+          totalBytes: config.config.limits.inputBytes,
+        },
+      });
+      state.captureError = null;
+    } catch (err) {
+      state.captureError = `capture failed: ${(err as Error).message}`;
+      if (ctx.hasUI) ctx.ui.notify(`pi-memory: ${state.captureError}`, "warning");
+    }
+  });
+
+  pi.on("session_tree", (_event, ctx) => {
+    const root = resolveMemoryRoot();
+    if (!state.compat?.supported || rootPointsIntoForeignMemory(root)) return;
+    try {
+      // A resumed session can navigate before its first settlement. Reopen
+      // an existing store rather than leaving the old head eligible.
+      if (!state.db && existsSync(join(root, "state.sqlite"))) state.db = openStateDb(root);
+      if (!state.db) return;
+      const header = ctx.sessionManager.getHeader();
+      const file = ctx.sessionManager.getSessionFile();
+      if (!header || !file) return;
+      const key = computeSessionKey(getAgentDir(), file, header.id);
+      // All previous selected heads are conservatively retired until the
+      // new branch is captured and validated (§5.3, T08).
+      retireOtherHeads(state.db, key, "");
+      state.capture = null;
+    } catch (err) {
+      state.captureError = `tree reconciliation failed: ${(err as Error).message}`;
+    }
+  });
+
+  pi.on("session_shutdown", () => {
+    state.db?.close();
+    state.db = null;
   });
 
   pi.on("before_agent_start", (event) => {
@@ -283,7 +354,13 @@ export default function (pi: ExtensionAPI) {
           ? "store: present"
           : storeSchemaState(root) === "unavailable"
             ? "store: unavailable or corrupt (preserved)"
-            : "store: not initialized yet (capture arrives in a later milestone)",
+            : "store: not initialized yet",
+        state.capture?.status === "captured"
+          ? `capture: captured (${state.capture.sourceId}), pending idle window`
+          : state.capture?.status === "ephemeral"
+            ? "capture: ephemeral (no persistent session)"
+            : "capture: pending settlement",
+        ...(state.captureError ? [`capture error: ${state.captureError}`] : []),
       );
     }
     return lines;

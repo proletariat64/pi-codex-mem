@@ -1,0 +1,228 @@
+import { DatabaseSync } from "node:sqlite";
+import { chmodSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
+import type { WorkspaceIdentity } from "../identity.ts";
+
+/**
+ * State store (spec §12.2 — ticket #3 subset: schema_migrations, workspaces,
+ * sessions, branch_heads, source_revisions). WAL + foreign keys + bounded
+ * busy timeout + short transactions (§11.3). All timestamps are integer
+ * UTC milliseconds.
+ */
+
+export interface SnapshotRecord {
+  workspace: WorkspaceIdentity;
+  session: {
+    sessionKey: string;
+    path: string;
+    headerId: string;
+    parentKey: string | null;
+    branchId: string;
+    mode: string;
+  };
+  revision: {
+    sourceId: string;
+    lineageKey: string;
+    revisionHash: string;
+    leafId: string;
+    snapshotPath: string;
+    snapshotHash: string;
+    sourceTime: number;
+  };
+  capturedAt: number;
+}
+
+const SCHEMA_VERSION = 1;
+
+const MIGRATION_1 = `
+CREATE TABLE schema_migrations (
+  version INTEGER PRIMARY KEY,
+  applied_at INTEGER NOT NULL
+);
+CREATE TABLE workspaces (
+  workspace_key TEXT PRIMARY KEY,
+  repo_key TEXT,
+  checkout_key TEXT,
+  cwd TEXT NOT NULL,
+  git_branch TEXT,
+  git_head TEXT,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE sessions (
+  session_key TEXT PRIMARY KEY,
+  path TEXT NOT NULL,
+  header_id TEXT NOT NULL,
+  parent_key TEXT,
+  workspace_key TEXT NOT NULL,
+  enrolled_at INTEGER NOT NULL,
+  active_branch_id TEXT NOT NULL,
+  mode TEXT NOT NULL,
+  last_activity_at INTEGER NOT NULL,
+  FOREIGN KEY (workspace_key) REFERENCES workspaces(workspace_key)
+);
+CREATE TABLE branch_heads (
+  session_key TEXT NOT NULL,
+  branch_id TEXT NOT NULL,
+  selected_leaf TEXT NOT NULL,
+  latest_revision TEXT,
+  state TEXT NOT NULL CHECK (state IN ('active', 'retired', 'suppressed')),
+  PRIMARY KEY (session_key, branch_id),
+  FOREIGN KEY (session_key) REFERENCES sessions(session_key)
+);
+CREATE TABLE source_revisions (
+  source_id TEXT PRIMARY KEY,
+  lineage_key TEXT NOT NULL,
+  session_key TEXT NOT NULL,
+  branch_id TEXT NOT NULL,
+  revision_hash TEXT NOT NULL,
+  snapshot_path TEXT NOT NULL,
+  snapshot_hash TEXT NOT NULL,
+  leaf_id TEXT NOT NULL,
+  source_time INTEGER NOT NULL,
+  status TEXT NOT NULL,
+  policy_version TEXT NOT NULL,
+  captured_at INTEGER NOT NULL,
+  UNIQUE (session_key, branch_id, revision_hash),
+  FOREIGN KEY (session_key, branch_id) REFERENCES branch_heads(session_key, branch_id)
+);
+`;
+
+export function openStateDb(root: string): DatabaseSync {
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  chmodSync(root, 0o700);
+  const path = join(root, "state.sqlite");
+  const db = new DatabaseSync(path);
+  chmodSync(path, 0o600);
+  db.exec("PRAGMA journal_mode = WAL");
+  db.exec("PRAGMA foreign_keys = ON");
+  db.exec("PRAGMA busy_timeout = 5000");
+  const hasMigrations = db
+    .prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'")
+    .get() as { n: number };
+  let current = 0;
+  if (hasMigrations.n > 0) {
+    const row = db.prepare("SELECT MAX(version) AS v FROM schema_migrations").get() as { v: number | null };
+    current = row.v ?? 0;
+  }
+  if (current > SCHEMA_VERSION) {
+    db.close();
+    throw new Error(`state.sqlite schema ${current} is newer than supported ${SCHEMA_VERSION}`);
+  }
+  if (current < SCHEMA_VERSION) {
+    db.exec("BEGIN");
+    try {
+      db.exec(MIGRATION_1);
+      db.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(SCHEMA_VERSION, Date.now());
+      db.exec("COMMIT");
+    } catch (err) {
+      db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+  return db;
+}
+
+/** Transactionally record a captured snapshot (R01). Idempotent per revision. */
+export function recordSnapshot(db: DatabaseSync, rec: SnapshotRecord): void {
+  db.exec("BEGIN");
+  try {
+    db.prepare(
+      `INSERT INTO workspaces (workspace_key, repo_key, checkout_key, cwd, git_branch, git_head, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT (workspace_key) DO UPDATE SET
+         repo_key = excluded.repo_key, checkout_key = excluded.checkout_key,
+         cwd = excluded.cwd, git_branch = excluded.git_branch,
+         git_head = excluded.git_head, updated_at = excluded.updated_at`,
+    ).run(
+      rec.workspace.workspaceKey,
+      rec.workspace.repoKey,
+      rec.workspace.checkoutKey,
+      rec.workspace.cwdReal,
+      rec.workspace.gitBranch,
+      rec.workspace.gitHead,
+      rec.capturedAt,
+    );
+
+    db.prepare(
+      `INSERT INTO sessions (session_key, path, header_id, parent_key, workspace_key, enrolled_at, active_branch_id, mode, last_activity_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT (session_key) DO UPDATE SET
+         active_branch_id = excluded.active_branch_id,
+         mode = excluded.mode,
+         last_activity_at = excluded.last_activity_at`,
+    ).run(
+      rec.session.sessionKey,
+      rec.session.path,
+      rec.session.headerId,
+      rec.session.parentKey,
+      rec.workspace.workspaceKey,
+      rec.capturedAt,
+      rec.session.branchId,
+      rec.session.mode,
+      rec.capturedAt,
+    );
+
+    db.prepare(
+      `INSERT INTO branch_heads (session_key, branch_id, selected_leaf, latest_revision, state)
+       VALUES (?, ?, ?, ?, 'active')
+       ON CONFLICT (session_key, branch_id) DO UPDATE SET
+         selected_leaf = excluded.selected_leaf,
+         latest_revision = excluded.latest_revision,
+         state = 'active'`,
+    ).run(rec.session.sessionKey, rec.session.branchId, rec.revision.leafId, rec.revision.sourceId);
+
+    db.prepare(
+      `INSERT OR IGNORE INTO source_revisions
+         (source_id, lineage_key, session_key, branch_id, revision_hash, snapshot_path,
+          snapshot_hash, leaf_id, source_time, status, policy_version, captured_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'captured', ?, ?)`,
+    ).run(
+      rec.revision.sourceId,
+      rec.revision.lineageKey,
+      rec.session.sessionKey,
+      rec.session.branchId,
+      rec.revision.revisionHash,
+      rec.revision.snapshotPath,
+      rec.revision.snapshotHash,
+      rec.revision.leafId,
+      rec.revision.sourceTime,
+      "norm-1",
+      rec.capturedAt,
+    );
+    // Only the selected branch and its latest projection remain eligible.
+    // Context-edit removals must revoke earlier revisions immediately (T10).
+    db.prepare(
+      "UPDATE branch_heads SET state = 'retired' WHERE session_key = ? AND branch_id != ? AND state = 'active'",
+    ).run(rec.session.sessionKey, rec.session.branchId);
+    db.prepare(
+      "UPDATE source_revisions SET status = 'superseded' WHERE session_key = ? AND source_id != ? AND status = 'captured'",
+    ).run(rec.session.sessionKey, rec.revision.sourceId);
+    // Re-selecting an identical historic leaf must restore its eligibility.
+    db.prepare("UPDATE source_revisions SET status = 'captured' WHERE source_id = ?")
+      .run(rec.revision.sourceId);
+
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
+}
+
+/** §5.3: on session_tree, retire every head except the active one. */
+export function retireOtherHeads(db: DatabaseSync, sessionKey: string, activeBranchId: string): void {
+  db.exec("BEGIN");
+  try {
+    db.prepare(
+      "UPDATE branch_heads SET state = 'retired' WHERE session_key = ? AND branch_id != ? AND state = 'active'",
+    ).run(sessionKey, activeBranchId);
+    // Retired heads must not supply current decisions to either pipeline.
+    db.prepare(
+      `UPDATE source_revisions SET status = 'superseded'
+       WHERE session_key = ? AND branch_id != ? AND status = 'captured'`,
+    ).run(sessionKey, activeBranchId);
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
+}

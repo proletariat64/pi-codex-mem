@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defaultConfig, loadConfig, updateConfig, validateConfig } from "../src/config.ts";
@@ -144,4 +144,38 @@ test("sequential updates both apply and leave no tmp or lock litter", (t) => {
   }
   const leftovers = readdirSync(root).filter((f) => f.includes(".tmp") || f.includes(".lock") || f.includes(".stale"));
   assert.deepEqual(leftovers, []);
+});
+
+test("unreadable config.json is preserved, never replaced by defaults", (t) => {
+  const root = makeRoot(t);
+  // A directory named config.json makes readFileSync fail with EISDIR while
+  // the parent stays writable — the exact case that must not be overwritten.
+  mkdirSync(join(root, "config.json"));
+  const result = loadConfig(root);
+  assert.equal(result.status, "invalid");
+  if (result.status === "invalid") {
+    assert.ok(result.problems.some((p) => /cannot be read|unreadable/i.test(p)));
+  }
+  // Still a directory — nothing was renamed over it
+  assert.ok(statSync(join(root, "config.json")).isDirectory());
+});
+
+test("updateConfig fails cleanly when the control lock is held by another process", (t) => {
+  const root = makeRoot(t);
+  loadConfig(root, { timezone: "UTC" });
+  mkdirSync(join(root, "config.json.lock")); // simulate a live foreign lock
+  const result = updateConfig(root, (c) => ({ ...c, dualWrite: true }), { maxAttempts: 2 });
+  assert.equal(result.ok, false);
+  // The foreign lock is untouched and the config is unchanged
+  assert.ok(statSync(join(root, "config.json.lock")).isDirectory());
+  const reloaded = loadConfig(root);
+  if (reloaded.status === "ok") assert.equal(reloaded.config.dualWrite, false);
+});
+
+test("invalid IANA timezones are rejected; valid ones accepted", () => {
+  const bad = { ...defaultConfig("UTC"), timezone: "Foo/Bar" };
+  assert.ok(validateConfig(bad).some((p) => p.includes("timezone")));
+  for (const tz of ["UTC", "Asia/Shanghai", "America/New_York", "Europe/Berlin"]) {
+    assert.deepEqual(validateConfig({ ...defaultConfig("UTC"), timezone: tz }), []);
+  }
 });

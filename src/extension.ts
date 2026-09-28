@@ -1,4 +1,4 @@
-import { existsSync, realpathSync, statSync } from "node:fs";
+import { accessSync, constants as fsConstants, existsSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { getAgentDir, VERSION as PI_VERSION, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -126,9 +126,27 @@ export default function (pi: ExtensionAPI) {
     state.modelRegistry = (ctx as { modelRegistry?: { find?: unknown } }).modelRegistry ?? null;
     const caps = await probeHost(ctx);
     state.compat = checkHostCompat(caps);
-    state.config = loadConfig(resolveMemoryRoot(), {
-      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
-    });
+    const root = resolveMemoryRoot();
+    // Reject foreign roots BEFORE any write: creating config.json inside
+    // Codex/Claude-mem locations is exactly what spec §5.1 forbids.
+    if (rootPointsIntoForeignMemory(root)) {
+      state.compat = {
+        supported: false,
+        problems: [`memory root ${root} points into Codex/Claude-mem data — rejected (spec §5.1)`],
+      };
+      state.config = { status: "missing", path: join(root, "config.json") };
+    } else {
+      state.config = loadConfig(root, {
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
+      });
+    }
+    const badFlag = pi.getFlag("pi-memory-mode");
+    if (badFlag !== undefined && flagMode() === undefined && ctx.hasUI) {
+      ctx.ui.notify(
+        `pi-memory: ignoring invalid --pi-memory-mode "${String(badFlag)}" (expected off|read|read-write); using configured mode`,
+        "warning",
+      );
+    }
     if (!state.compat.supported && ctx.hasUI) {
       // One diagnostic, then memory behavior stays disabled (spec §2.3).
       ctx.ui.notify(
@@ -147,9 +165,12 @@ export default function (pi: ExtensionAPI) {
     const opts = event.systemPromptOptions as { sections?: unknown } | undefined;
     if (opts && typeof opts === "object" && "sections" in opts) {
       state.promptSections = "confirmed";
+    } else {
+      // A real foreground run without structured sections: injection cannot
+      // work here. Diagnose it (doctor reports this as unavailable) instead
+      // of leaving the capability looking merely unobserved.
+      state.promptSections = "unavailable";
     }
-    // If sections are absent here the host (or another extension) cannot
-    // support section injection — surfaced via /memory doctor, not silently.
   });
 
   function gatherDoctorInput(): DoctorInput {
@@ -157,16 +178,17 @@ export default function (pi: ExtensionAPI) {
     let rootWritable = false;
     if (existsSync(root)) {
       try {
-        statSync(root);
-        rootWritable = true; // cheap proxy; real writes fail loudly later
+        accessSync(root, fsConstants.W_OK);
+        rootWritable = true;
       } catch {
         rootWritable = false;
       }
     }
     const compat =
       state.compat ?? { supported: false, problems: ["no session has started yet — capabilities not probed"] };
-    // Read-only: never create config.json from the doctor path.
-    const config = state.config ?? loadConfig(root, { create: false });
+    // Read-only and fresh: always re-read the file so mid-session edits are
+    // reported accurately; never create config.json from the doctor path.
+    const config = loadConfig(root, { create: false });
     let storeState: DoctorInput["store"]["state"] = "absent";
     if (existsSync(join(root, "state.sqlite"))) {
       storeState = "current";

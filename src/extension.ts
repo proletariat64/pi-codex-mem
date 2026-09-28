@@ -1,12 +1,13 @@
-import { accessSync, constants as fsConstants, existsSync, realpathSync } from "node:fs";
+import { accessSync, constants as fsConstants, existsSync, lstatSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { join, resolve } from "node:path";
-import { getAgentDir, VERSION as PI_VERSION, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, VERSION as PI_VERSION, type ExtensionAPI, type ExtensionContext, type SessionHeader } from "@earendil-works/pi-coding-agent";
 import { captureSettledSession, type CaptureResult } from "./capture.ts";
 import { blockUncapturedLeaf, openStateDb, retireOtherHeads } from "./store/db.ts";
 import { computeSessionKey } from "./identity.ts";
 import { isExcludedWorkspace } from "./workspace-policy.ts";
+import { enrollHistoricalImport, planHistoricalImport } from "./historical-import.ts";
 import {
   formatModelRef,
   legacyLockRecovery,
@@ -25,6 +26,26 @@ import {
 import { runDoctor, type DoctorInput } from "./doctor.ts";
 
 const EXTENSION_VERSION = "0.1.0";
+
+/** Parse command words without invoking a shell or splitting quoted paths. */
+function importWords(text: string): string[] | null {
+  const words: string[] = [];
+  let word = "";
+  let quote: "'" | '"' | null = null;
+  let escaping = false;
+  let started = false;
+  for (const char of text) {
+    if (escaping) { word += char; escaping = false; started = true; }
+    else if (char === "\\") { escaping = true; }
+    else if (quote) { if (char === quote) quote = null; else word += char; }
+    else if (char === "'" || char === '"') { quote = char; started = true; }
+    else if (/\s/u.test(char)) { if (started) words.push(word); word = ""; started = false; }
+    else { word += char; started = true; }
+  }
+  if (quote || escaping) return null;
+  if (started) words.push(word);
+  return words;
+}
 
 /** Effective runtime mode (spec §6.3): flag > config-derived. */
 type MemoryMode = "off" | "read" | "read-write";
@@ -398,8 +419,27 @@ export default function (pi: ExtensionAPI) {
     return lines;
   }
 
+  function selectedImportLeaf(file: string, header: SessionHeader): string | undefined {
+    const root = resolveMemoryRoot();
+    const storePath = join(root, "state.sqlite");
+    if (!state.db) {
+      if (storeSchemaState(root) !== "current" || lstatSync(storePath).isSymbolicLink()) return undefined;
+    }
+    const db = state.db ?? new DatabaseSync(storePath, { readOnly: true });
+    try {
+      const row = db.prepare(
+        `SELECT h.selected_leaf FROM sessions s JOIN branch_heads h ON h.session_key = s.session_key
+         WHERE s.path = ? AND s.header_id = ? AND h.state = 'active'
+         ORDER BY s.last_activity_at DESC LIMIT 1`,
+      ).get(file, header.id) as { selected_leaf: string } | undefined;
+      return row?.selected_leaf;
+    } finally {
+      if (!state.db) db.close();
+    }
+  }
+
   pi.registerCommand("memory", {
-    description: "Pi Memory — persistent cross-session memory (status, doctor)",
+    description: "Pi Memory — persistent cross-session memory (status, doctor, import)",
     handler: async (args, ctx) => {
       const sub = args.trim().split(/\s+/).filter(Boolean)[0] ?? "status";
       if (!ctx.hasUI) return; // No status text on protocol stdout (spec §6.3).
@@ -408,8 +448,65 @@ export default function (pi: ExtensionAPI) {
       } else if (sub === "doctor") {
         const report = runDoctor(gatherDoctorInput());
         ctx.ui.notify(report.format().join("\n"), report.ok ? "info" : "warning");
+      } else if (sub === "import") {
+        const parts = importWords(args);
+        const file = parts?.[1];
+        const dryRun = parts?.includes("--dry-run") ?? false;
+        const run = parts?.includes("--run") ?? false;
+        if (!parts || !file || dryRun === run) {
+          ctx.ui.notify("usage: /memory import <path> --dry-run|--run [--leaf ID]", "warning");
+          return;
+        }
+        const leafIndex = parts.indexOf("--leaf");
+        const leaf = leafIndex < 0 ? undefined : parts[leafIndex + 1];
+        if (leafIndex >= 0 && (!leaf || leaf.startsWith("--"))) {
+          ctx.ui.notify("--leaf requires an entry ID", "warning");
+          return;
+        }
+        try {
+          const report = planHistoricalImport(resolve(ctx.cwd, file), {
+            leaf,
+            resolveSelectedLeaf: selectedImportLeaf,
+          });
+          const lines = [`candidates: ${report.candidates.length}`, `bytes: ${report.totalBytes}`];
+          for (const item of report.candidates) {
+            lines.push(`${item.path}: leaf ${item.leafId}; scope: ${item.workspace.repoKey ? `repo ${item.workspace.repoKey}` : `cwd ${item.workspace.cwdReal}`}; bytes: ${item.bytes}`);
+          }
+          for (const item of report.ambiguous) lines.push(`${item.path}: ambiguous leaves ${item.leaves.join(", ")}; use --leaf`);
+          for (const item of report.unsupported) lines.push(`${item.path}: unsupported — ${item.reason}`);
+          for (const item of report.deferred) lines.push(`${item.path}: deferred — ${item.reason}`);
+          if (run) {
+            const root = resolveMemoryRoot();
+            const cfg = loadConfig(root, { create: false });
+            if (rootPointsIntoForeignMemory(root) || legacyLockPath(root) || cfg.status !== "ok" ||
+                !cfg.config.enabled || flagMode() === "off" || flagMode() === "read") {
+              ctx.ui.notify("pi-memory: import blocked by memory root, legacy lock, configuration, or runtime mode", "warning");
+              return;
+            }
+            const eligible = report.candidates.filter((candidate) => {
+              if (!isExcludedWorkspace(candidate.header.cwd, cfg.config.excludedWorkspaces)) return true;
+              lines.push(`${candidate.path}: skipped — excluded workspace`);
+              return false;
+            });
+            if (eligible.length > 0) {
+              state.db ??= openStateDb(root);
+              const result = enrollHistoricalImport({ ...report, candidates: eligible }, {
+                root, agentDir: getAgentDir(), db: state.db,
+                limits: { itemBytes: 64 * 1024, toolResultBytes: cfg.config.limits.toolResultBytes,
+                  totalBytes: cfg.config.limits.inputBytes },
+              });
+              lines.push(`imported: ${result.imported}`);
+              for (const item of result.skipped) lines.push(`${item.path}: skipped — ${item.reason}`);
+            } else {
+              lines.push("imported: 0");
+            }
+          }
+          ctx.ui.notify(lines.join("\n"), "info");
+        } catch (err) {
+          ctx.ui.notify(`pi-memory import failed: ${(err as Error).message}`, "warning");
+        }
       } else {
-        ctx.ui.notify(`pi-memory: unknown subcommand "${sub}". Available: status, doctor`, "warning");
+        ctx.ui.notify(`pi-memory: unknown subcommand "${sub}". Available: status, doctor, import`, "warning");
       }
     },
   });

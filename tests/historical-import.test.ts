@@ -102,6 +102,9 @@ test("explicit import respects excluded workspace configuration", async (t) => {
   const cfg = JSON.parse(readFileSync(configPath, "utf8"));
   writeFileSync(configPath, JSON.stringify({ ...cfg, excludedWorkspaces: [cwd] }));
 
+  await mock.commands.get("memory")!.handler(`import ${file} --dry-run`, ctx);
+  assert.match(notifications.at(-1) ?? "", /candidates:\s*0/);
+  assert.match(notifications.at(-1) ?? "", /excluded workspace/i);
   await mock.commands.get("memory")!.handler(`import ${file} --run`, ctx);
 
   assert.match(notifications.at(-1) ?? "", /excluded workspace/i);

@@ -468,26 +468,26 @@ export default function (pi: ExtensionAPI) {
             leaf,
             resolveSelectedLeaf: selectedImportLeaf,
           });
-          const lines = [`candidates: ${report.candidates.length}`, `bytes: ${report.totalBytes}`];
-          for (const item of report.candidates) {
+          const root = resolveMemoryRoot();
+          const cfg = loadConfig(root, { create: false });
+          const excluded = cfg.status === "ok" ? report.candidates.filter((candidate) =>
+            isExcludedWorkspace(candidate.header.cwd, cfg.config.excludedWorkspaces)) : [];
+          const eligible = report.candidates.filter((candidate) => !excluded.includes(candidate));
+          const lines = [`candidates: ${eligible.length}`, `bytes: ${report.totalBytes}`];
+          if (cfg.status !== "ok") lines.push(`eligibility not confirmed: configuration ${cfg.status}`);
+          for (const item of eligible) {
             lines.push(`${item.path}: leaf ${item.leafId}; scope: ${item.workspace.repoKey ? `repo ${item.workspace.repoKey}` : `cwd ${item.workspace.cwdReal}`}; bytes: ${item.bytes}`);
           }
+          for (const item of excluded) lines.push(`${item.path}: excluded workspace — not eligible`);
           for (const item of report.ambiguous) lines.push(`${item.path}: ambiguous leaves ${item.leaves.join(", ")}; use --leaf`);
           for (const item of report.unsupported) lines.push(`${item.path}: unsupported — ${item.reason}`);
           for (const item of report.deferred) lines.push(`${item.path}: deferred — ${item.reason}`);
           if (run) {
-            const root = resolveMemoryRoot();
-            const cfg = loadConfig(root, { create: false });
             if (rootPointsIntoForeignMemory(root) || legacyLockPath(root) || cfg.status !== "ok" ||
                 !cfg.config.enabled || flagMode() === "off" || flagMode() === "read") {
               ctx.ui.notify("pi-memory: import blocked by memory root, legacy lock, configuration, or runtime mode", "warning");
               return;
             }
-            const eligible = report.candidates.filter((candidate) => {
-              if (!isExcludedWorkspace(candidate.header.cwd, cfg.config.excludedWorkspaces)) return true;
-              lines.push(`${candidate.path}: skipped — excluded workspace`);
-              return false;
-            });
             if (eligible.length > 0) {
               state.db ??= openStateDb(root);
               const result = enrollHistoricalImport({ ...report, candidates: eligible }, {

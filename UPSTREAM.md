@@ -22,7 +22,14 @@ All files below come from `openai/codex` at commit `1cc7e2361237ce7244430ee1d581
 
 ## Adaptation log
 
-_None yet._ All vendored files are byte-identical to upstream (verify with the script). When adapted prompts are created under `prompts/pi/`, record each adaptation here: source file, adapted destination, and a description of every change.
+All vendored files remain byte-identical to upstream (verify with the script).
+
+| Source | Adaptation | Changes |
+|---|---|---|
+| `prompts/upstream/v1/consolidation.md` | Runtime renderer in `src/pipeline/consolidate.ts` plus `prompts/pi/v1/consolidation-boundaries.md` | Private workspace/diff placeholders; read-only shared notes; five custom workspace tools in place of shell/original-rollout access; Pi source/session identifiers; task applicability; literal summary marker, headings and byte cap; ordinary citations; prose-only procedures; one bounded host-validation repair. |
+| `prompts/upstream/v1/read_path.md` | `prompts/pi/v1/read_path.md` | Concise Pi guidance with version/generation/workspace/applicability and bounded summary; historical evidence label; handbook-first progressive reading; no original JSONL browsing, proprietary citation wrapper, or automatic note writing. |
+
+Detailed adaptation notes live in `prompts/pi/v1/CHANGELOG.md`.
 
 ## License
 

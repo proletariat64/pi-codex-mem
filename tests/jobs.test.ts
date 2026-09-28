@@ -8,12 +8,27 @@ import { openStateDb, recordSnapshot, type SnapshotRecord } from "../src/store/d
 import {
   claimDueExtractions, commitExtraction, enqueueExtraction, failExtraction,
   recordProcessActivity, reconcileModelCall, renewExtractionLease, reserveModelCall,
+  recoverExpiredExtractions,
   type LeasedJob,
 } from "../src/store/jobs.ts";
 
 const NOW = Date.UTC(2024, 0, 2, 12);
 const SOURCE_ID = "source-1";
 const PROMPT_HASH = "a".repeat(64);
+
+test("extraction recovery leaves consolidation leases and cancellations to their own scheduler", (t) => {
+  const { db } = fixture(t);
+  db.prepare(`INSERT INTO jobs (job_id, memory_version, kind, work_key, prompt_hash, status,
+    due_at, owner, fence, lease_expires_at, attempt_count, created_at, updated_at)
+    VALUES ('writer', 'v1', 'consolidate', 'writer', ?, 'leased', ?, 'writer-owner', 7, ?, 1, ?, ?)`)
+    .run(PROMPT_HASH, NOW, NOW - 1, NOW, NOW);
+  recoverExpiredExtractions(db, NOW);
+  assert.deepEqual({ ...db.prepare("SELECT status, owner, fence FROM jobs WHERE job_id = 'writer'").get() },
+    { status: "leased", owner: "writer-owner", fence: 7 });
+  db.prepare("UPDATE jobs SET status = 'cancelled' WHERE job_id = 'writer'").run();
+  recoverExpiredExtractions(db, NOW + 1);
+  assert.equal(db.prepare("SELECT status FROM jobs WHERE job_id = 'writer'").get()?.status, "cancelled");
+});
 
 function fixture(t: test.TestContext) {
   const root = mkdtempSync(join(tmpdir(), "pi-memory-jobs-"));
@@ -215,7 +230,7 @@ test("schema 5 jobs upgrade to configuration epochs without losing durable work"
   t.after(() => upgraded.close());
   assert.deepEqual({ ...upgraded.prepare("SELECT status, config_epoch FROM jobs").get() },
     { status: "queued", config_epoch: "" });
-  assert.equal((upgraded.prepare("SELECT MAX(version) AS v FROM schema_migrations").get() as { v: number }).v, 8);
+  assert.equal((upgraded.prepare("SELECT MAX(version) AS v FROM schema_migrations").get() as { v: number }).v, 9);
 });
 
 test("schema 7 migration preserves existing v1 output while adding v2 truncation metadata", (t) => {
@@ -229,14 +244,14 @@ test("schema 7 migration preserves existing v1 output while adding v2 truncation
   legacy.exec("ALTER TABLE extractions DROP COLUMN accepted_bytes");
   legacy.exec("ALTER TABLE extractions DROP COLUMN original_bytes");
   legacy.exec("ALTER TABLE extractions DROP COLUMN truncated");
-  legacy.prepare("DELETE FROM schema_migrations WHERE version = 8").run();
+  legacy.prepare("DELETE FROM schema_migrations WHERE version >= 8").run();
   legacy.close();
   const migrated = openStateDb(root);
   t.after(() => migrated.close());
   const row = migrated.prepare("SELECT raw_memory, truncated, original_bytes, accepted_bytes FROM extractions")
     .get() as { raw_memory: string; truncated: number; original_bytes: number; accepted_bytes: number };
   assert.deepEqual({ ...row }, { raw_memory: "decision", truncated: 0, original_bytes: 0, accepted_bytes: 0 });
-  assert.equal((migrated.prepare("SELECT MAX(version) AS v FROM schema_migrations").get() as { v: number }).v, 8);
+  assert.equal((migrated.prepare("SELECT MAX(version) AS v FROM schema_migrations").get() as { v: number }).v, 9);
 });
 
 test("a conflicting extraction is never reported as a successful commit", (t) => {

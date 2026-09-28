@@ -75,16 +75,16 @@ export function enqueueExtraction(db: DatabaseSync, item: {
 function recoverExpired(db: DatabaseSync, now: number): void {
   db.prepare(
     `UPDATE jobs SET status = 'blocked', error_code = 'max_attempts', owner = NULL, lease_expires_at = NULL
-     WHERE status = 'leased' AND lease_expires_at <= ? AND attempt_count >= ?`,
+     WHERE kind = 'extract' AND status = 'leased' AND lease_expires_at <= ? AND attempt_count >= ?`,
   ).run(now, MAX_NETWORK_ATTEMPTS);
   db.prepare(
     `UPDATE jobs SET status = 'queued', owner = NULL, lease_expires_at = NULL
-     WHERE status = 'leased' AND lease_expires_at <= ? AND attempt_count < ?`,
+     WHERE kind = 'extract' AND status = 'leased' AND lease_expires_at <= ? AND attempt_count < ?`,
   ).run(now, MAX_NETWORK_ATTEMPTS);
   // A graceful shutdown cancels the live request, but not the durable work.
   db.prepare(
     `UPDATE jobs SET status = 'queued', due_at = ?, error_code = NULL
-     WHERE status = 'cancelled' AND attempt_count < ?`,
+     WHERE kind = 'extract' AND status = 'cancelled' AND attempt_count < ?`,
   ).run(now, MAX_NETWORK_ATTEMPTS);
 }
 
@@ -112,7 +112,7 @@ export function claimDueExtractions(db: DatabaseSync, opts: {
   db.exec("BEGIN IMMEDIATE");
   try {
     recoverExpired(db, opts.now);
-    const active = (db.prepare("SELECT COUNT(*) AS n FROM jobs WHERE status = 'leased' AND lease_expires_at > ?")
+    const active = (db.prepare("SELECT COUNT(*) AS n FROM jobs WHERE kind = 'extract' AND status = 'leased' AND lease_expires_at > ?")
       .get(opts.now) as { n: number }).n;
     const capacity = Math.max(0, Math.min(opts.limit, (opts.slots ?? 2) - active));
     const candidates = db.prepare(

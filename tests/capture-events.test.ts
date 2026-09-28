@@ -126,6 +126,27 @@ test("session_tree retires the abandoned head (T08)", async (t) => {
   assert.deepEqual(blocked.map((r) => r.read_blocked), [1, 1]);
 });
 
+test("resume blocks old captured evidence when a new context edit is present before settlement", async (t) => {
+  const { cwd, memoryRoot } = makeSandbox(t);
+  const mock = makeMockPi(); memoryExtension(mock.pi);
+  const entries: unknown[] = [userEntry("u1", "stale private decision")];
+  const ctx = { cwd, hasUI: false, mode: "tui", sessionManager: fakeSessionManager(cwd, entries),
+    modelRegistry: { find: () => ({}), streamSimple: () => ({}) }, ui: { notify: () => {} } };
+  await mock.fire("session_start", { type: "session_start" }, ctx);
+  await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
+  entries.push({ type: "context_edit", id: "e1", parentId: "u1", targetId: "u1", replacement: null,
+    timestamp: "2024-01-02T00:00:00.000Z" });
+  await mock.fire("session_start", { type: "session_start" }, ctx); // restart, no settlement yet
+  const { DatabaseSync } = await import("node:sqlite");
+  const db = new DatabaseSync(join(memoryRoot, "state.sqlite"));
+  assert.equal((db.prepare("SELECT control_epoch FROM store_state").get() as { control_epoch: number }).control_epoch, 1);
+  assert.deepEqual((db.prepare("SELECT read_blocked FROM pipeline_state").all() as { read_blocked: number }[]).map((r) => r.read_blocked), [1, 1]);
+  assert.equal((db.prepare("SELECT status FROM source_revisions").get() as { status: string }).status, "superseded");
+  db.close();
+  await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
+  assert.equal(snapshotFiles(memoryRoot).length, 1, "the old at-rest snapshot is removed on settlement");
+});
+
 test("context edit removes sensitive evidence, supersedes old revision, and never touches source session (T10/R07)", async (t) => {
   const { cwd, memoryRoot } = makeSandbox(t);
   const sourceFile = join(cwd, "session.jsonl");
@@ -306,6 +327,29 @@ test("forked session receives a distinct session identity (T09)", async (t) => {
   const child = db.prepare("SELECT parent_key FROM sessions WHERE path = ?").get(fork.getSessionFile()) as { parent_key: string };
   assert.equal(child.parent_key, parent.session_key);
   db.close();
+});
+
+test("fork retains the evidence key of a copied ancestor from a retired parent branch", async (t) => {
+  const { cwd, memoryRoot } = makeSandbox(t);
+  const mock = makeMockPi(); memoryExtension(mock.pi);
+  const original = fakeSessionManager(cwd, [userEntry("u1", "shared retired decision")]);
+  const ctx = { cwd, hasUI: false, mode: "tui", sessionManager: original,
+    modelRegistry: { find: () => ({}), streamSimple: () => ({}) }, ui: { notify: () => {} } };
+  await mock.fire("session_start", { type: "session_start" }, ctx);
+  await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
+  const alternate = fakeSessionManager(cwd, [userEntry("u2", "alternate branch")]);
+  await mock.fire("session_tree", { type: "session_tree", oldLeafId: "u1", newLeafId: "u2" }, { ...ctx, sessionManager: alternate });
+  await mock.fire("agent_settled", { type: "agent_settled" }, { ...ctx, sessionManager: alternate });
+  const fork = { ...fakeSessionManager(cwd, [userEntry("u1", "shared retired decision")], "fork"),
+    getSessionFile: () => join(cwd, "fork.jsonl"),
+    getHeader: () => ({ type: "session", id: "fork", parentSession: original.getSessionFile(), timestamp: new Date(0).toISOString(), cwd }) };
+  await mock.fire("session_start", { type: "session_start" }, { ...ctx, sessionManager: fork });
+  await mock.fire("agent_settled", { type: "agent_settled" }, { ...ctx, sessionManager: fork });
+  const snapshots = snapshotFiles(memoryRoot).map((file) => JSON.parse(readFileSync(file, "utf8")));
+  const source = snapshots.find((s) => s.sessionPath === original.getSessionFile() && s.leafId === "u1");
+  const copied = snapshots.find((s) => s.sessionPath === fork.getSessionFile());
+  assert.ok(source && copied);
+  assert.equal(copied.items[0].evidenceKey, source.items[0].evidenceKey);
 });
 
 test("capture skipped in non-enrolled modes (§6.3: TUI-only by default)", async (t) => {

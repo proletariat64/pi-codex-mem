@@ -142,8 +142,9 @@ function captureBranch(
   const parentRevisions = parent ? input.db.prepare(
     `SELECT r.snapshot_path FROM source_revisions r
      JOIN branch_heads h ON h.session_key = r.session_key AND h.branch_id = r.branch_id
-     WHERE r.session_key = ? AND h.state = 'active' AND r.status IN ('captured', 'superseded')
-     ORDER BY r.captured_at DESC`,
+     WHERE r.session_key = ? AND h.state IN ('active', 'retired')
+       AND r.status IN ('captured', 'superseded')
+     ORDER BY CASE h.state WHEN 'active' THEN 0 ELSE 1 END, r.captured_at DESC`,
   ).all(parent.session_key) as { snapshot_path: string }[] : [];
   const needed = new Set(normalized.items.map((item) => `${item.entryId}:${item.role}:${item.toolCallId ?? ""}`));
   const ancestorKeys = new Map<string, string>();

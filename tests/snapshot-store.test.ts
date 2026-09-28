@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openStateDb, recordSnapshot, retireOtherHeads, type SnapshotRecord } from "../src/store/db.ts";
@@ -59,6 +59,17 @@ test("writeSnapshotFile writes sources/<lineage>/<revision>.json with mode 0600"
   assert.match(hash, /^[0-9a-f]{64}$/);
   assert.equal(statSync(path).mode & 0o777, 0o600);
   assert.equal(statSync(join(root, "sources", "l".repeat(64))).mode & 0o777, 0o700);
+});
+
+test("state.sqlite symlink is rejected before opening or changing the target", (t) => {
+  const root = makeRoot(t);
+  const outside = makeRoot(t);
+  const target = join(outside, "foreign.sqlite");
+  writeFileSync(target, "foreign bytes", { mode: 0o644 });
+  symlinkSync(target, join(root, "state.sqlite"));
+  assert.throws(() => openStateDb(root), /state\.sqlite symlink/);
+  assert.equal(readFileSync(target, "utf8"), "foreign bytes");
+  assert.equal(statSync(target).mode & 0o777, 0o644);
 });
 
 test("a pre-existing sources symlink is rejected before any snapshot bytes escape", (t) => {

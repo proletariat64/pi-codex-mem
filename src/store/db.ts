@@ -123,6 +123,11 @@ export function openStateDb(root: string): DatabaseSync {
   mkdirSync(root, { recursive: true, mode: 0o700 });
   chmodSync(root, 0o700);
   const path = join(root, "state.sqlite");
+  try {
+    if (lstatSync(path).isSymbolicLink()) throw new Error("state.sqlite symlink rejected");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+  }
   const db = new DatabaseSync(path);
   chmodSync(path, 0o600);
   db.exec("PRAGMA journal_mode = WAL");
@@ -238,6 +243,27 @@ function blockBothViews(db: DatabaseSync, reason: string): void {
   db.exec("UPDATE store_state SET control_epoch = control_epoch + 1 WHERE singleton = 1");
   db.prepare("UPDATE pipeline_state SET read_blocked = 1, block_reason = ?")
     .run(reason);
+}
+
+/** On resume, an active branch whose leaf advanced has not been recaptured. */
+export function blockUncapturedLeaf(db: DatabaseSync, sessionKey: string, leafId: string | null): void {
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const heads = db.prepare(
+      "SELECT latest_revision FROM branch_heads WHERE session_key = ? AND state = 'active' AND selected_leaf != ?",
+    ).all(sessionKey, leafId ?? "") as { latest_revision: string | null }[];
+    let changed = 0;
+    for (const head of heads) {
+      if (!head.latest_revision) continue;
+      changed += Number(db.prepare("UPDATE source_revisions SET status = 'superseded' WHERE source_id = ? AND status = 'captured'")
+        .run(head.latest_revision).changes);
+    }
+    if (changed > 0) blockBothViews(db, "uncaptured_branch_leaf");
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
 }
 
 /** Transactionally record a captured snapshot (R01). Idempotent per revision. */

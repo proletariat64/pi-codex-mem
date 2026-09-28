@@ -4,7 +4,7 @@ import { DatabaseSync } from "node:sqlite";
 import { join, resolve } from "node:path";
 import { getAgentDir, VERSION as PI_VERSION, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { captureSettledSession, type CaptureResult } from "./capture.ts";
-import { openStateDb, retireOtherHeads } from "./store/db.ts";
+import { blockUncapturedLeaf, openStateDb, retireOtherHeads } from "./store/db.ts";
 import { computeSessionKey } from "./identity.ts";
 import { isExcludedWorkspace } from "./workspace-policy.ts";
 import {
@@ -175,7 +175,13 @@ export default function (pi: ExtensionAPI) {
             const heads = state.db.prepare("SELECT selected_leaf FROM branch_heads WHERE session_key = ? AND state = 'active'")
               .all(key) as { selected_leaf: string }[];
             const ancestry = new Set(ctx.sessionManager.getBranch().map((entry) => entry.id));
-            if (heads.some((head) => !ancestry.has(head.selected_leaf))) retireOtherHeads(state.db, key, "");
+            if (heads.some((head) => !ancestry.has(head.selected_leaf))) {
+              retireOtherHeads(state.db, key, "");
+            } else if (heads.some((head) => head.selected_leaf !== ctx.sessionManager.getLeafId())) {
+              // The old leaf is still an ancestor, but appended edits or
+              // decisions are not yet reflected in its captured projection.
+              blockUncapturedLeaf(state.db, key, ctx.sessionManager.getLeafId());
+            }
           }
         } catch (err) {
           state.captureError = `resume reconciliation failed: ${(err as Error).message}`;

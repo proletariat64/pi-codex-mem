@@ -1,8 +1,9 @@
+import { randomUUID } from "node:crypto";
 import { accessSync, constants as fsConstants, existsSync, lstatSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { join, resolve } from "node:path";
-import { getAgentDir, VERSION as PI_VERSION, type ExtensionAPI, type ExtensionContext, type SessionHeader } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, VERSION as PI_VERSION, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type SessionHeader } from "@earendil-works/pi-coding-agent";
 import { captureSettledSession, type CaptureResult } from "./capture.ts";
 import { blockUncapturedLeaf, openStateDb, retireOtherHeads } from "./store/db.ts";
 import { computeSessionKey } from "./identity.ts";
@@ -12,6 +13,7 @@ import {
   formatModelRef,
   legacyLockRecovery,
   loadConfig,
+  updateConfig,
   type LoadConfigResult,
   type MemoryConfig,
 } from "./config.ts";
@@ -24,6 +26,10 @@ import {
   type HostCapabilities,
 } from "./pi/compat.ts";
 import { runDoctor, type DoctorInput } from "./doctor.ts";
+import { claimDueExtractions, enqueueExtraction } from "./store/jobs.ts";
+import { createRegistryModelPort } from "./extraction/model-port.ts";
+import { runV1Extraction } from "./extraction/runner.ts";
+import { v1PromptHash } from "./extraction/v1.ts";
 
 const EXTENSION_VERSION = "0.1.0";
 
@@ -262,6 +268,10 @@ export default function (pi: ExtensionAPI) {
         },
       });
       state.captureError = null;
+      if (state.capture.status === "captured" && config.config.generate) {
+        enqueueExtraction(state.db, { sourceId: state.capture.sourceId,
+          memoryVersion: "v1", promptHash: v1PromptHash(), now: Date.now() });
+      }
     } catch (err) {
       state.captureError = `capture failed: ${(err as Error).message}`;
       if (ctx.hasUI) ctx.ui.notify(`pi-memory: ${state.captureError}`, "warning");
@@ -301,7 +311,7 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  pi.on("before_agent_start", (event) => {
+  pi.on("before_agent_start", (event, ctx) => {
     const opts = event.systemPromptOptions as { sections?: unknown } | undefined;
     if (opts && typeof opts === "object" && "sections" in opts) {
       state.promptSections = "confirmed";
@@ -314,7 +324,19 @@ export default function (pi: ExtensionAPI) {
     // spec §5.4: sample configuration before each foreground run, so
     // mid-session edits take effect here rather than only at restart.
     // Read-only: never creates the file.
-    state.config = loadConfig(resolveMemoryRoot(), { create: false });
+    const root = resolveMemoryRoot();
+    state.config = loadConfig(root, { create: false });
+    const cfg = state.config;
+    if (state.compat?.supported && cfg.status === "ok" && cfg.config.enabled && cfg.config.generate &&
+        ctx.model && !rootPointsIntoForeignMemory(root) && !legacyLockPath(root) &&
+        !isExcludedWorkspace(ctx.cwd, cfg.config.excludedWorkspaces) &&
+        (cfg.config.models.extract === null || cfg.config.models.consolidate === null)) {
+      const ref = { provider: ctx.model.provider, modelId: ctx.model.id };
+      const saved = updateConfig(root, (current) => ({ ...current,
+        models: { extract: current.models.extract ?? ref, consolidate: current.models.consolidate ?? ref } }));
+      if (saved.ok) state.config = { status: "ok", config: saved.config, path: join(root, "config.json") };
+      else if (ctx.hasUI) ctx.ui.notify(`pi-memory: model default not saved — ${saved.reason}`, "warning");
+    }
   });
 
   function storeSchemaState(root: string): "absent" | "current" | "unavailable" {
@@ -438,10 +460,67 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  async function runNow(ctx: ExtensionCommandContext): Promise<void> {
+    const report = (text: string, level: "info" | "warning" = "info") => {
+      if (ctx.hasUI) ctx.ui.notify(`pi-memory run: ${text}`, level);
+    };
+    const root = resolveMemoryRoot();
+    const cfg = loadConfig(root, { create: false });
+    if (!state.compat?.supported || rootPointsIntoForeignMemory(root) || legacyLockPath(root) ||
+        cfg.status !== "ok" || !cfg.config.enabled || !cfg.config.generate ||
+        flagMode() === "off" || flagMode() === "read" ||
+        isExcludedWorkspace(ctx.cwd, cfg.config.excludedWorkspaces)) {
+      report("blocked by host, configuration, mode, or workspace policy", "warning");
+      return;
+    }
+    if (!ctx.isIdle()) { report("foreground session is busy", "warning"); return; }
+    const ref = cfg.config.models.extract;
+    if (!ref) { report("blocked: no extraction model configured", "warning"); return; }
+    try {
+      state.db ??= openStateDb(root);
+      const active = state.db.prepare(
+        `SELECT r.source_id FROM source_revisions r JOIN branch_heads h
+         ON h.session_key = r.session_key AND h.branch_id = r.branch_id
+         WHERE r.status = 'captured' AND h.state = 'active' AND h.latest_revision = r.source_id`,
+      ).all() as { source_id: string }[];
+      const now = Date.now();
+      for (const row of active) enqueueExtraction(state.db, {
+        sourceId: row.source_id, memoryVersion: "v1", promptHash: v1PromptHash(), now,
+      });
+      const jobs = claimDueExtractions(state.db, { owner: randomUUID(), now,
+        limit: cfg.config.schedule.maxExtractionsPerPass, slots: cfg.config.schedule.extractionConcurrency,
+        minIdleMs: 0, maxAgeMs: cfg.config.schedule.maxSourceAgeDays * 86_400_000 });
+      if (!jobs.length) { report("no eligible settled sources"); return; }
+      const port = createRegistryModelPort(ctx.modelRegistry);
+      const results = await Promise.all(jobs.map(async (job) => {
+        const controller = new AbortController();
+        try {
+          return await runV1Extraction({ db: state.db!, root, job, modelRef: ref, port,
+            now, clock: Date.now, timezone: cfg.config.timezone,
+            limits: { outputBytes: cfg.config.limits.extractionOutputBytes,
+              dailyInputTokens: cfg.config.limits.dailyInputTokens,
+              dailyOutputTokens: cfg.config.limits.dailyOutputTokens,
+              dailyRequests: cfg.config.limits.dailyRequests }, signal: controller.signal });
+        } finally {
+          controller.abort();
+        }
+      }));
+      report(results.map((result) => result.status === "budget_deferred"
+        ? `${result.status} (${result.reason})` : result.status).join(", "));
+    } catch (err) {
+      report(`failed: ${(err as Error).message}`, "warning");
+    }
+  }
+
   pi.registerCommand("memory", {
-    description: "Pi Memory — persistent cross-session memory (status, doctor, import)",
+    description: "Pi Memory — persistent cross-session memory (status, doctor, import, run)",
     handler: async (args, ctx) => {
       const sub = args.trim().split(/\s+/).filter(Boolean)[0] ?? "status";
+      if (sub === "run") {
+        if (args.trim() === "run --now") await runNow(ctx);
+        else if (ctx.hasUI) ctx.ui.notify("usage: /memory run --now", "warning");
+        return;
+      }
       if (!ctx.hasUI) return; // No status text on protocol stdout (spec §6.3).
       if (sub === "status") {
         ctx.ui.notify(statusLines().join("\n"), "info");
@@ -509,7 +588,7 @@ export default function (pi: ExtensionAPI) {
           ctx.ui.notify(`pi-memory import failed: ${(err as Error).message}`, "warning");
         }
       } else {
-        ctx.ui.notify(`pi-memory: unknown subcommand "${sub}". Available: status, doctor, import`, "warning");
+        ctx.ui.notify(`pi-memory: unknown subcommand "${sub}". Available: status, doctor, import, run`, "warning");
       }
     },
   });

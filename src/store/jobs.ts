@@ -118,6 +118,25 @@ export function renewExtractionLease(db: DatabaseSync, job: LeasedJob, now: numb
   ).run(now + LEASE_MS, now, job.jobId, job.owner, job.fence, now).changes === 1;
 }
 
+/** Account for the one optional repair request within the same leased job. */
+export function reserveRepairAttempt(db: DatabaseSync, job: LeasedJob, now: number): boolean {
+  return db.prepare(
+    `UPDATE jobs SET attempt_count = attempt_count + 1, updated_at = ?
+     WHERE job_id = ? AND status = 'leased' AND owner = ? AND fence = ?
+       AND lease_expires_at > ? AND attempt_count < ?`,
+  ).run(now, job.jobId, job.owner, job.fence, now, MAX_NETWORK_ATTEMPTS).changes === 1;
+}
+
+/** Defer without launching a model request when the shared budget is exhausted. */
+export function deferExtractionForBudget(db: DatabaseSync, job: LeasedJob,
+  reason: string, now: number, nextDue: number): boolean {
+  return db.prepare(
+    `UPDATE jobs SET status = 'retry_wait', due_at = ?, error_code = ?,
+       owner = NULL, lease_expires_at = NULL, attempt_count = attempt_count - 1, updated_at = ?
+     WHERE job_id = ? AND status = 'leased' AND owner = ? AND fence = ? AND lease_expires_at > ?`,
+  ).run(nextDue, reason, now, job.jobId, job.owner, job.fence, now).changes === 1;
+}
+
 /** Retry transient failures with bounded backoff; never mutate another lease's job. */
 export function failExtraction(
   db: DatabaseSync, job: LeasedJob, kind: "transient" | "blocked" | "cancelled",
@@ -242,6 +261,20 @@ function localDay(now: number, timezone: string): string {
   }).formatToParts(new Date(now));
   const value = (type: string) => parts.find((part) => part.type === type)?.value;
   return `${value("year")}-${value("month")}-${value("day")}`;
+}
+
+/** Earliest next local day, including 23/25-hour DST days. */
+export function nextLocalDayTime(now: number, timezone: string): number {
+  const day = localDay(now, timezone);
+  let low = now;
+  let high = now + 26 * 60 * 60 * 1000;
+  while (localDay(high, timezone) === day) high += 24 * 60 * 60 * 1000;
+  while (high - low > 1) {
+    const midpoint = Math.floor((low + high) / 2);
+    if (localDay(midpoint, timezone) === day) low = midpoint;
+    else high = midpoint;
+  }
+  return high;
 }
 
 /** Reserve across all providers/models atomically, before a network request. */

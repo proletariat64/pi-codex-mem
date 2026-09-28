@@ -60,6 +60,12 @@ export function parseV1Output(response: string, maxBytes: number): V1ParseResult
   return { ok: true, output, outcome, outputHash: digest(JSON.stringify(output)) };
 }
 
+export function v1PromptHash(): string {
+  const system = readFileSync(new URL("../../prompts/upstream/v1/stage_one_system.md", import.meta.url), "utf8");
+  const template = readFileSync(new URL("../../prompts/upstream/v1/stage_one_input.md", import.meta.url), "utf8");
+  return digest(system + "\n" + template);
+}
+
 export interface V1RequestInput {
   snapshotPath: string;
   cwd: string;

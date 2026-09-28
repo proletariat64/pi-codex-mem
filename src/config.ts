@@ -2,7 +2,8 @@
 // This module is pure Node — no pi imports — so it is unit-testable and
 // reusable from a future standalone CLI.
 
-import { linkSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, constants as fsConstants, existsSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
 
@@ -379,152 +380,124 @@ export function updateConfig(
 }
 
 /**
- * Store control lock: a single FILE (config.json.lock) claimed atomically
- * via link(2) — the token is fully written to a temp file first, then
- * hard-linked into place; linkSync fails with EEXIST if the lock exists,
- * so creation and ownership are one atomic step with no mid-claim window
- * (a mkdir lock dir plus a separately-written owner file was observed to
- * admit overlapping holders under race; see tests/lock-race.test.ts).
- *
- * A lock is stale when its owner PID is dead, its Linux process-birth value
- * proves PID reuse, or its owner is unreadable and its mtime is old. A live
- * owner is NEVER expired by age: a writer could have passed its pre-commit
- * fence, so stealing its lock would allow a lost update. A hung live holder
- * requires manual intervention on platforms without process-birth evidence.
- * Breaking moves the lock aside and re-checks that moved instance (also
- * supports the pre-upgrade directory/owner format). Callers fence before
- * and after committing a write.
+ * The SQLite write transaction is the control lock. BEGIN IMMEDIATE is an
+ * atomic OS-backed claim across pi processes; process exit releases it, so
+ * no PID, lease, stale-break, compare-and-unlink, or token-file race exists.
+ * Configuration I/O happens while the transaction is open. state.sqlite is
+ * also the shared store DB; its schema can be initialized later by capture.
+ * A directory guard is additionally kept during migration so older pi
+ * processes using the prior mkdir protocol cannot write concurrently.
  */
-const LOCK_STALE_MS = 30_000;
-const LEGACY_LOCK_OWNER_FILE = "owner";
+const heldLocks = new Map<string, { db: DatabaseSync; lockPath: string }>();
 
 function isPidAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    // EPERM means the process exists but is not ours to signal.
-    return (err as NodeJS.ErrnoException).code === "EPERM";
-  }
+  try { process.kill(pid, 0); return true; }
+  catch (err) { return (err as NodeJS.ErrnoException).code === "EPERM"; }
 }
 
-/** PID of the lock owner, or NaN when the content is missing/malformed. */
-function ownerPid(content: string | undefined): number {
-  if (!content) return NaN;
-  const pid = Number(content.split(":")[0]);
-  return Number.isInteger(pid) && pid > 0 ? pid : NaN;
-}
-
-function readLock(lockPath: string): string | undefined {
-  try {
-    return readFileSync(lockPath, "utf8");
-  } catch {
-    return undefined;
-  }
-}
-
-/** Linux process birth from /proc, unlike PID alone, survives PID reuse. */
 function processBirth(pid: number): string | null {
   try {
     const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
     return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19] ?? null;
-  } catch {
-    return null; // non-Linux or unavailable: fail closed for a live PID
-  }
+  } catch { return null; }
 }
 
-interface LockState { content: string | undefined; mtimeMs: number }
-
-/** Read a file token or the pre-upgrade directory/owner format. */
-function readLockState(path: string): LockState | undefined {
+/** A leftover pre-upgrade file/dir needs a demonstrably dead owner. */
+function clearDeadLegacyLock(lockPath: string): boolean {
+  if (!existsSync(lockPath)) return true;
   try {
-    const stat = statSync(path);
-    let content: string | undefined;
-    try {
-      content = readFileSync(stat.isDirectory() ? join(path, LEGACY_LOCK_OWNER_FILE) : path, "utf8");
-    } catch {
-      content = undefined; // ownerless or unreadable; only break after age
-    }
-    return { content, mtimeMs: stat.mtimeMs };
-  } catch {
-    return undefined; // lock path vanished
-  }
-}
-
-/** A verified dead owner or reused PID is stale; never age-break a live owner. */
-function isStale({ content, mtimeMs }: LockState): boolean {
-  const pid = ownerPid(content);
-  if (!Number.isNaN(pid)) {
-    if (!isPidAlive(pid)) return true;
-    const claimedBirth = content!.split(":")[1];
-    const actualBirth = processBirth(pid);
-    return Boolean(/^\d+$/.test(claimedBirth ?? "") && actualBirth && claimedBirth !== actualBirth);
-  }
-  return Date.now() - mtimeMs > LOCK_STALE_MS;
-}
-
-/** Atomically claim the lock file; false when it already exists. */
-function tryClaimFile(lockPath: string, token: string): boolean {
-  const tmp = `${lockPath}.tmp-${process.pid}-${randomBytes(8).toString("hex")}`;
-  try {
-    writeFileSync(tmp, token, { mode: 0o600 });
-    linkSync(tmp, lockPath); // atomic; EEXIST when held
+    const state = statSync(lockPath);
+    const text = readFileSync(state.isDirectory() ? join(lockPath, "owner") : lockPath, "utf8");
+    const [rawPid, claimedBirth, nonce] = text.split(":");
+    const pid = Number(rawPid);
+    if (!Number.isInteger(pid) || pid <= 0) return false;
+    const born = processBirth(pid);
+    const recycled = Boolean(nonce && /^\d+$/.test(claimedBirth ?? "") && born && born !== claimedBirth);
+    if (isPidAlive(pid) && !recycled) return false;
+    rmSync(lockPath, { recursive: true, force: true });
     return true;
   } catch {
+    // Unknown owner may still be mid-claim in an old process. Fail closed.
     return false;
-  } finally {
-    rmSync(tmp, { force: true });
   }
 }
 
 export function acquireLock(lockPath: string): string | false {
-  const token = `${process.pid}:${processBirth(process.pid) ?? "unknown"}:${randomBytes(8).toString("hex")}`;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    if (tryClaimFile(lockPath, token)) return token;
-    // The first read may span two lock generations; the moved-file re-read
-    // below is authoritative before we delete anything.
-    const held = readLockState(lockPath);
-    if (!held) continue; // vanished between claim and read
-    if (!isStale(held)) return false;
-    const trash = `${lockPath}.stale-${process.pid}-${randomBytes(8).toString("hex")}`;
-    try {
-      renameSync(lockPath, trash);
-    } catch {
-      continue; // another breaker moved it first
-    }
-    const moved = readLockState(trash);
-    if (!moved || !isStale(moved)) {
-      // A normal file can be restored with link(2) only if the path is still
-      // vacant. rename(2) here would OVERWRITE a newer holder's lock.
-      // Directory-format locks cannot be hard-linked: retain their moved
-      // instance for manual reconciliation rather than risk replacement.
-      try {
-        if (statSync(trash).isFile()) {
-          linkSync(trash, lockPath);
-          rmSync(trash, { force: true });
-        }
-      } catch {
-        // Newly claimed path or unreadable instance: retain trash intact.
-      }
-      return false;
-    }
-    rmSync(trash, { recursive: true, force: true });
-    // Loop around to claim after discarding the verified stale instance.
-    briefSleep(10 * (attempt + 1));
+  const root = dirname(lockPath);
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  chmodSync(root, 0o700);
+  const dbPath = join(root, "state.sqlite");
+  try {
+    // Pre-create with 0600 before SQLite opens it (no transient 0644 file).
+    closeSync(openSync(dbPath, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW, 0o600));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    if (!lstatSync(dbPath).isFile()) throw new Error("state.sqlite must be a regular file");
   }
-  return false;
+  chmodSync(dbPath, 0o600);
+  const db = new DatabaseSync(dbPath);
+  try {
+    // The installed Node 22.19+ SQLite API supports this pragma; a failed
+    // immediate claim yields to the outer config retry loop.
+    db.exec("PRAGMA busy_timeout = 0");
+    db.exec("BEGIN IMMEDIATE");
+  } catch (err) {
+    db.close();
+    if (/SQLITE_BUSY|database is locked/i.test((err as Error).message)) return false;
+    throw err;
+  }
+  if (!clearDeadLegacyLock(lockPath)) {
+    db.exec("ROLLBACK");
+    db.close();
+    return false;
+  }
+  const token = `${process.pid}:${processBirth(process.pid) ?? "unknown"}:${randomBytes(16).toString("hex")}`;
+  let guardCreated = false;
+  try {
+    mkdirSync(lockPath, { mode: 0o700 });
+    guardCreated = true;
+    writeFileSync(join(lockPath, "owner"), token, { mode: 0o600, flag: "wx" });
+  } catch (err) {
+    // A prior-version contender may have claimed its guard after we checked.
+    // Never delete a guard we did not create (or one since displaced).
+    const owner = readFileSyncIfExists(join(lockPath, "owner"));
+    if (guardCreated && (owner === undefined || owner === token)) rmSync(lockPath, { recursive: true, force: true });
+    db.exec("ROLLBACK");
+    db.close();
+    if ((err as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw err;
+  }
+  heldLocks.set(token, { db, lockPath });
+  return token;
 }
 
-/** Fencing check: true only while the lock still belongs to this token. */
+/** A live connection with an IMMEDIATE transaction is our ownership fence. */
 export function verifyLockOwnership(lockPath: string, token: string): boolean {
-  return readLock(lockPath) === token;
+  const held = heldLocks.get(token);
+  if (!held || held.lockPath !== lockPath) return false;
+  try {
+    held.db.prepare("SELECT 1").get();
+    return readFileSyncIfExists(join(lockPath, "owner")) === token;
+  } catch { return false; }
 }
 
-/** Release only if we still own the lock — never delete another holder's. */
+/** Release only our exact connection; never unlink a successor's lock. */
 export function releaseLock(lockPath: string, token: string): void {
-  if (verifyLockOwnership(lockPath, token)) {
-    rmSync(lockPath, { force: true });
+  const held = heldLocks.get(token);
+  if (!held || held.lockPath !== lockPath) return;
+  heldLocks.delete(token);
+  try {
+    if (readFileSyncIfExists(join(lockPath, "owner")) === token) {
+      rmSync(lockPath, { recursive: true, force: true });
+    }
+  } finally {
+    try { held.db.exec("ROLLBACK"); }
+    finally { held.db.close(); }
   }
+}
+
+function readFileSyncIfExists(path: string): string | undefined {
+  try { return readFileSync(path, "utf8"); } catch { return undefined; }
 }
 
 /** Synchronous short sleep for lock contention backoff (ms). */

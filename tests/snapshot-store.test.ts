@@ -18,6 +18,8 @@ const WS: WorkspaceIdentity = {
   repoKey: "r".repeat(64),
   checkoutKey: "c".repeat(64),
   cwdReal: "/repo",
+  gitCommonDir: "/repo/.git",
+  gitTopLevel: "/repo",
   gitBranch: "main",
   gitHead: "h".repeat(40),
 };

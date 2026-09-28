@@ -73,12 +73,30 @@ test("agent_settled writes an immutable snapshot and DB rows (R01); status repor
   assert.ok(snapshot.lineageKey);
   assert.equal(snapshot.items[0].text, "decided: TypeScript over Rust");
   assert.ok(existsSync(join(memoryRoot, "state.sqlite")), "state store created");
+  await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
+  assert.equal(snapshotFiles(memoryRoot).length, 1, "repeat settlement is idempotent");
 
   // second settlement with a longer branch -> a second revision on the same branch
   const sm2 = fakeSessionManager(cwd, [userEntry("u1", "decided: TypeScript over Rust"), userEntry("u2", "because types")]);
   const ctx2 = { ...ctx, sessionManager: sm2 };
   await mock.fire("agent_settled", { type: "agent_settled" }, ctx2);
   assert.equal(snapshotFiles(memoryRoot).length, 2, "new revision, same lineage");
+});
+
+test("compaction and shutdown checkpoint branch state without waiting for a model (§6.1)", async (t) => {
+  const { cwd, memoryRoot } = makeSandbox(t);
+  const mock = makeMockPi(); memoryExtension(mock.pi);
+  const entries: unknown[] = [userEntry("u1", "pre-compaction decision")];
+  const ctx = { cwd, hasUI: false, mode: "tui", sessionManager: fakeSessionManager(cwd, entries),
+    modelRegistry: { find: () => ({}), streamSimple: () => ({}) }, ui: { notify: () => {} } };
+  await mock.fire("session_start", { type: "session_start" }, ctx);
+  await mock.fire("session_before_compact", { type: "session_before_compact" }, ctx);
+  assert.equal(snapshotFiles(memoryRoot).length, 1);
+  entries.push({ ...userEntry("u2", "last unscheduled decision"), parentId: "u1" });
+  await mock.fire("session_shutdown", { type: "session_shutdown", reason: "exit" }, ctx);
+  const files = snapshotFiles(memoryRoot);
+  assert.equal(files.length, 2);
+  assert.ok(files.some((f) => readFileSync(f, "utf8").includes("last unscheduled decision")));
 });
 
 test("session_tree retires the abandoned head (T08)", async (t) => {
@@ -100,8 +118,12 @@ test("session_tree retires the abandoned head (T08)", async (t) => {
   const { DatabaseSync } = await import("node:sqlite");
   const db = new DatabaseSync(join(memoryRoot, "state.sqlite"), { open: true });
   const heads = db.prepare("SELECT state FROM branch_heads").all() as { state: string }[];
+  const epoch = db.prepare("SELECT control_epoch FROM store_state").get() as { control_epoch: number };
+  const blocked = db.prepare("SELECT read_blocked FROM pipeline_state").all() as { read_blocked: number }[];
   db.close();
   assert.ok(heads.every((h) => h.state === "retired"), "old head retired after /tree switch");
+  assert.equal(epoch.control_epoch, 1);
+  assert.deepEqual(blocked.map((r) => r.read_blocked), [1, 1]);
 });
 
 test("context edit removes sensitive evidence, supersedes old revision, and never touches source session (T10/R07)", async (t) => {
@@ -120,14 +142,18 @@ test("context edit removes sensitive evidence, supersedes old revision, and neve
   entries.push({ type: "context_edit", id: "e1", parentId: "u1", targetId: "u1", replacement: null, timestamp: new Date().toISOString() });
   await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
   const files = snapshotFiles(memoryRoot);
-  assert.equal(files.length, 2);
+  assert.equal(files.length, 1, "privacy edit deletes the prior at-rest snapshot");
   const contents = files.map((f) => JSON.parse(readFileSync(f, "utf8")));
   assert.ok(contents.some((s) => s.items.length === 0));
   assert.equal(readFileSync(sourceFile, "utf8"), "authoritative session bytes\n");
   const { DatabaseSync } = await import("node:sqlite");
   const db = new DatabaseSync(join(memoryRoot, "state.sqlite"));
   const statuses = db.prepare("SELECT status FROM source_revisions ORDER BY captured_at").all() as { status: string }[];
-  assert.deepEqual(statuses.map((r) => r.status).sort(), ["captured", "superseded"]);
+  assert.deepEqual(statuses.map((r) => r.status).sort(), ["captured", "privacy_revoked"]);
+  const epoch = db.prepare("SELECT control_epoch FROM store_state").get() as { control_epoch: number };
+  assert.equal(epoch.control_epoch, 1);
+  const blocks = db.prepare("SELECT read_blocked FROM pipeline_state").all() as { read_blocked: number }[];
+  assert.deepEqual(blocks.map((r) => r.read_blocked), [1, 1]);
   db.close();
 });
 
@@ -142,6 +168,8 @@ test("pre-compaction ancestry is captured but the derived summary is not counted
   await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
   const snapshot = JSON.parse(readFileSync(snapshotFiles(memoryRoot)[0]!, "utf8"));
   assert.deepEqual(snapshot.items.map((item: { sourceId: string }) => item.sourceId), ["u1"]);
+  assert.equal(snapshot.omissionsManifest.count, 1);
+  assert.deepEqual(snapshot.omissionsManifest.entryIds, ["c1"]);
 });
 
 test("forked session receives a distinct session identity (T09)", async (t) => {
@@ -160,7 +188,11 @@ test("forked session receives a distinct session identity (T09)", async (t) => {
   const files = snapshotFiles(memoryRoot);
   const snapshots = files.map((f) => JSON.parse(readFileSync(f, "utf8")));
   assert.equal(new Set(snapshots.map((s) => s.sessionKey)).size, 2);
-  assert.equal(snapshots.find((s) => s.parentSession)?.parentSession, sm.getSessionFile());
+  assert.equal(new Set(snapshots.map((s) => s.sourceId)).size, 2);
+  const source = snapshots.find((s) => !s.parentSession);
+  const copied = snapshots.find((s) => s.parentSession);
+  assert.equal(copied?.parentSession, sm.getSessionFile());
+  assert.equal(copied.items[0].evidenceKey, source.items[0].evidenceKey, "copied ancestor is not independent corroboration");
   const { DatabaseSync } = await import("node:sqlite");
   const db = new DatabaseSync(join(memoryRoot, "state.sqlite"));
   const parent = db.prepare("SELECT session_key FROM sessions WHERE path = ?").get(sm.getSessionFile()) as { session_key: string };
@@ -184,6 +216,27 @@ test("capture skipped in non-enrolled modes (§6.3: TUI-only by default)", async
   await mock.fire("session_start", { type: "session_start" }, ctx);
   await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
   assert.deepEqual(snapshotFiles(memoryRoot), [], "rpc mode is not captured by default");
+});
+
+test("excluded parent workspace suppresses capture in a descendant but not a sibling (§14)", async (t) => {
+  const { cwd, memoryRoot } = makeSandbox(t);
+  mkdirSync(memoryRoot, { recursive: true });
+  const parent = join(cwd, "excluded");
+  const descendant = join(parent, "child");
+  const sibling = join(cwd, "excluded-other");
+  mkdirSync(descendant, { recursive: true }); mkdirSync(sibling);
+  const { defaultConfig } = await import("../src/config.ts");
+  writeFileSync(join(memoryRoot, "config.json"), JSON.stringify({ ...defaultConfig("UTC"), excludedWorkspaces: [parent] }));
+  const mock = makeMockPi(); memoryExtension(mock.pi);
+  const ctx = { cwd: descendant, hasUI: false, mode: "tui", sessionManager: fakeSessionManager(descendant, [userEntry("u1", "private")]),
+    modelRegistry: { find: () => ({}), streamSimple: () => ({}) }, ui: { notify: () => {} } };
+  await mock.fire("session_start", { type: "session_start" }, ctx);
+  await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
+  assert.deepEqual(snapshotFiles(memoryRoot), []);
+  const siblingContext = { ...ctx, cwd: sibling, sessionManager: fakeSessionManager(sibling, [userEntry("u2", "allowed")]) };
+  await mock.fire("session_start", { type: "session_start" }, siblingContext);
+  await mock.fire("agent_settled", { type: "agent_settled" }, siblingContext);
+  assert.equal(snapshotFiles(memoryRoot).length, 1);
 });
 
 test("enabled=false captures nothing", async (t) => {

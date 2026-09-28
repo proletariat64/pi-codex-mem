@@ -32,6 +32,8 @@ test("non-Git directory: workspaceKey = sha256(realpath(cwd)), no git fields", (
   assert.equal(id.workspaceKey, sha(realpathSync(dir)));
   assert.equal(id.repoKey, null);
   assert.equal(id.checkoutKey, null);
+  assert.equal(id.gitCommonDir, null);
+  assert.equal(id.gitTopLevel, null);
   assert.equal(id.gitBranch, null);
   assert.equal(id.gitHead, null);
 });
@@ -51,8 +53,10 @@ test("Git repo: repoKey from common dir, checkoutKey from top-level, HEAD record
   const id = computeWorkspaceIdentity(repo);
   assert.equal(id.repoKey, sha(commonDir));
   assert.equal(id.checkoutKey, sha(topLevel));
+  assert.equal(id.gitCommonDir, commonDir);
+  assert.equal(id.gitTopLevel, topLevel);
   assert.equal(id.gitHead, head);
-  assert.equal(id.gitBranch, "master"); // git init default on this host
+  assert.equal(id.gitBranch, git(repo, ["symbolic-ref", "--short", "HEAD"]));
 });
 
 test("worktrees share repoKey but keep distinct checkoutKey (§5.2)", (t) => {

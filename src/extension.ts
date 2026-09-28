@@ -2,10 +2,11 @@ import { accessSync, constants as fsConstants, existsSync, realpathSync } from "
 import { homedir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { join, resolve } from "node:path";
-import { getAgentDir, VERSION as PI_VERSION, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, VERSION as PI_VERSION, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { captureSettledSession, type CaptureResult } from "./capture.ts";
 import { openStateDb, retireOtherHeads } from "./store/db.ts";
 import { computeSessionKey } from "./identity.ts";
+import { isExcludedWorkspace } from "./workspace-policy.ts";
 import {
   formatModelRef,
   legacyLockRecovery,
@@ -162,6 +163,24 @@ export default function (pi: ExtensionAPI) {
       state.config = loadConfig(root, {
         timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
       });
+      // On resume, a different selected leaf may be active before any new
+      // agent_settled event. Revoke stale heads before future reads (§5.3).
+      if (state.compat.supported && existsSync(join(root, "state.sqlite"))) {
+        try {
+          state.db = openStateDb(root);
+          const header = ctx.sessionManager.getHeader();
+          const file = ctx.sessionManager.getSessionFile();
+          if (header && file) {
+            const key = computeSessionKey(getAgentDir(), file, header.id);
+            const heads = state.db.prepare("SELECT selected_leaf FROM branch_heads WHERE session_key = ? AND state = 'active'")
+              .all(key) as { selected_leaf: string }[];
+            const ancestry = new Set(ctx.sessionManager.getBranch().map((entry) => entry.id));
+            if (heads.some((head) => !ancestry.has(head.selected_leaf))) retireOtherHeads(state.db, key, "");
+          }
+        } catch (err) {
+          state.captureError = `resume reconciliation failed: ${(err as Error).message}`;
+        }
+      }
     }
     const badFlag = pi.getFlag("pi-memory-mode");
     if (badFlag !== undefined && flagMode() === undefined && ctx.hasUI) {
@@ -190,7 +209,7 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  pi.on("agent_settled", (_event, ctx) => {
+  function captureNow(ctx: ExtensionContext): void {
     const root = resolveMemoryRoot();
     if (!state.compat?.supported || rootPointsIntoForeignMemory(root)) return;
     // §6.3: captureModes is independent of generate (which only controls
@@ -198,7 +217,7 @@ export default function (pi: ExtensionAPI) {
     const config = loadConfig(root, { create: false });
     if (config.status !== "ok" || !config.config.enabled ||
         !config.config.captureModes.includes(ctx.mode) ||
-        config.config.excludedWorkspaces.includes(ctx.cwd) ||
+        isExcludedWorkspace(ctx.cwd, config.config.excludedWorkspaces) ||
         flagMode() === "off" || flagMode() === "read") return;
     try {
       if (!ctx.sessionManager.getSessionFile() || !ctx.sessionManager.getHeader() || !ctx.sessionManager.getLeafId()) {
@@ -220,7 +239,10 @@ export default function (pi: ExtensionAPI) {
       state.captureError = `capture failed: ${(err as Error).message}`;
       if (ctx.hasUI) ctx.ui.notify(`pi-memory: ${state.captureError}`, "warning");
     }
-  });
+  }
+
+  pi.on("agent_settled", (_event, ctx) => captureNow(ctx));
+  pi.on("session_before_compact", (_event, ctx) => captureNow(ctx));
 
   pi.on("session_tree", (_event, ctx) => {
     const root = resolveMemoryRoot();
@@ -243,9 +265,13 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  pi.on("session_shutdown", () => {
-    state.db?.close();
-    state.db = null;
+  pi.on("session_shutdown", (_event, ctx) => {
+    try {
+      captureNow(ctx);
+    } finally {
+      state.db?.close();
+      state.db = null;
+    }
   });
 
   pi.on("before_agent_start", (event) => {

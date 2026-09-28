@@ -12,6 +12,8 @@ export interface WorkspaceIdentity {
   repoKey: string | null;
   checkoutKey: string | null;
   cwdReal: string;
+  gitCommonDir: string | null;
+  gitTopLevel: string | null;
   gitBranch: string | null;
   gitHead: string | null;
 }
@@ -55,6 +57,8 @@ export function computeWorkspaceIdentity(cwd: string): WorkspaceIdentity {
       repoKey: null,
       checkoutKey: null,
       cwdReal,
+      gitCommonDir: null,
+      gitTopLevel: null,
       gitBranch: null,
       gitHead: null,
     };
@@ -67,13 +71,17 @@ export function computeWorkspaceIdentity(cwd: string): WorkspaceIdentity {
       return p;
     }
   };
-  const repoKey = sha256(resolveReal(commonDirRaw));
-  const checkoutKey = sha256(resolveReal(topLevelRaw));
+  const gitCommonDir = resolveReal(commonDirRaw);
+  const gitTopLevel = resolveReal(topLevelRaw);
+  const repoKey = sha256(gitCommonDir);
+  const checkoutKey = sha256(gitTopLevel);
   return {
     workspaceKey: checkoutKey,
     repoKey,
     checkoutKey,
     cwdReal,
+    gitCommonDir,
+    gitTopLevel,
     gitBranch: git(cwd, ["branch", "--show-current"]),
     gitHead: git(cwd, ["rev-parse", "HEAD"]),
   };

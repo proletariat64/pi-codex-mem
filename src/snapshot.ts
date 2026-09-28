@@ -47,6 +47,11 @@ export function applyContextEdits<T extends SessionEntry>(entries: T[]): T[] {
 
 export interface EvidenceItem {
   sourceId: string;
+  entryId: string;
+  /** Stable across copied fork ancestry when the parent snapshot is known. */
+  evidenceKey?: string;
+  timestamp: number;
+  toolCallId?: string;
   role: "user" | "assistant" | "tool";
   text: string;
   origin: "human_observed" | "programmatic" | "unknown" | null;
@@ -109,8 +114,10 @@ function renderBlocks(blocks: ContentBlock[], role: "user" | "assistant" | "tool
   for (const b of blocks) {
     if (b.type === "text" && typeof b.text === "string") {
       parts.push(b.text);
-    } else if (b.type === "image") {
-      parts.push(`[omitted media: ${b.mimeType ?? "unknown"}]`); // §7.2: never interpret
+    } else if (["image", "audio", "video", "binary", "file"].includes(b.type ?? "") || typeof b.data === "string") {
+      const mime = typeof b.mimeType === "string" && /^[a-z]+\/[a-z0-9.+-]{1,32}$/i.test(b.mimeType)
+        ? b.mimeType : "unknown";
+      parts.push(`[omitted media: ${mime}]`); // §7.2: never interpret
     } else if (b.type === "thinking") {
       // §7.2: reasoning excluded entirely
     } else if (b.type === "toolCall" && role === "assistant") {
@@ -130,6 +137,9 @@ export function normalizeEvidence(
   const candidates: EvidenceItem[] = [];
 
   for (const e of entries) {
+    const parsedTime = Date.parse(e.timestamp);
+    const timestamp = Number.isFinite(parsedTime) ? parsedTime : 0;
+    const base = { sourceId: e.id, entryId: e.id, timestamp };
     if (e.type === "message") {
       const m = (e as SessionMessageEntry).message as {
         role: string;
@@ -150,18 +160,18 @@ export function normalizeEvidence(
         const claimedOrigin = (m as { origin?: unknown }).origin;
         const origin = claimedOrigin === "human_observed" || claimedOrigin === "programmatic"
           ? claimedOrigin : "unknown";
-        candidates.push({ sourceId: e.id, role: "user", text: t.text, origin, isError: false, truncated: t.truncated });
+        candidates.push({ ...base, role: "user", text: t.text, origin, isError: false, truncated: t.truncated });
       } else if (m.role === "assistant") {
         const visible = blocks.filter((b) => b.type !== "toolCall");
         const text = renderBlocks(visible, "assistant").join("\n");
         if (text) {
           const t = truncateUtf8(redactSensitive(text), limits.itemBytes);
-          candidates.push({ sourceId: e.id, role: "assistant", text: t.text, origin: null, isError: false, truncated: t.truncated });
+          candidates.push({ ...base, role: "assistant", text: t.text, origin: null, isError: false, truncated: t.truncated });
         }
         for (const call of blocks.filter((b) => b.type === "toolCall")) {
           const rendered = `[tool call: ${call.name ?? "unknown"}(${JSON.stringify(call.arguments ?? {})})]`;
           const t = truncateUtf8(redactSensitive(rendered), limits.toolResultBytes);
-          candidates.push({ sourceId: e.id, role: "tool", text: t.text, origin: null, isError: false, truncated: t.truncated });
+          candidates.push({ ...base, role: "tool", toolCallId: call.id, text: t.text, origin: null, isError: false, truncated: t.truncated });
         }
         if (!text && !blocks.some((b) => b.type === "toolCall")) {
           omissions.push({ entryId: e.id, reason: blocks.some((b) => b.type === "thinking") ? "reasoning-excluded" : "empty-after-filtering" });
@@ -174,8 +184,9 @@ export function normalizeEvidence(
         }
         const t = truncateUtf8(redactSensitive(text), limits.toolResultBytes);
         candidates.push({
-          sourceId: e.id,
+          ...base,
           role: "tool",
+          toolCallId: (m as { toolCallId?: string }).toolCallId,
           text: t.text,
           origin: null,
           isError: m.isError === true,
@@ -209,9 +220,18 @@ export function normalizeEvidence(
   let used = 0;
   for (const tier of byTier) {
     for (const item of [...tier].reverse()) {
-      const bytes = Buffer.byteLength(item.text, "utf8");
+      if (selected.has(item)) continue;
+      const index = candidates.indexOf(item);
+      const previous = candidates[index - 1];
+      const dependsOnQuestion = item.role === "user" && item.text.length <= 128 &&
+        /^\s*(?:use|choose|pick|option\s+\d|yes\b|no\b|the\s+(?:first|second)|that one)\b/i.test(item.text) &&
+        previous && (previous.role === "assistant" || previous.role === "user") && previous.text.includes("?");
+      // A short reply without its adjacent question would invent certainty
+      // about what was chosen. Select the pair or omit the reply (§7.3).
+      const group = dependsOnQuestion && !selected.has(previous) ? [previous, item] : [item];
+      const bytes = group.reduce((sum, candidate) => sum + Buffer.byteLength(candidate.text, "utf8"), 0);
       if (used + bytes <= limits.totalBytes) {
-        selected.add(item);
+        for (const candidate of group) selected.add(candidate);
         used += bytes;
       }
     }

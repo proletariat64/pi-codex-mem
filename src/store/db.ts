@@ -1,6 +1,6 @@
 import { DatabaseSync } from "node:sqlite";
-import { chmodSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { chmodSync, mkdirSync, realpathSync, unlinkSync } from "node:fs";
+import { dirname, join, resolve, sep } from "node:path";
 import type { WorkspaceIdentity } from "../identity.ts";
 
 /**
@@ -30,9 +30,10 @@ export interface SnapshotRecord {
     sourceTime: number;
   };
   capturedAt: number;
+  privacyEdit?: boolean;
 }
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 const MIGRATION_1 = `
 CREATE TABLE schema_migrations (
@@ -87,6 +88,21 @@ CREATE TABLE source_revisions (
 );
 `;
 
+const MIGRATION_2 = `
+CREATE TABLE store_state (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  control_epoch INTEGER NOT NULL
+);
+INSERT INTO store_state (singleton, control_epoch) VALUES (1, 0);
+CREATE TABLE pipeline_state (
+  memory_version TEXT PRIMARY KEY CHECK (memory_version IN ('v1', 'v2')),
+  reconciled_epoch INTEGER NOT NULL DEFAULT 0,
+  read_blocked INTEGER NOT NULL DEFAULT 0,
+  block_reason TEXT
+);
+INSERT INTO pipeline_state (memory_version) VALUES ('v1'), ('v2');
+`;
+
 export function openStateDb(root: string): DatabaseSync {
   mkdirSync(root, { recursive: true, mode: 0o700 });
   chmodSync(root, 0o700);
@@ -111,19 +127,55 @@ export function openStateDb(root: string): DatabaseSync {
   if (current < SCHEMA_VERSION) {
     db.exec("BEGIN");
     try {
-      db.exec(MIGRATION_1);
-      db.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(SCHEMA_VERSION, Date.now());
+      if (current < 1) {
+        db.exec(MIGRATION_1);
+        db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(1, Date.now());
+      }
+      if (current < 2) {
+        db.exec(MIGRATION_2);
+        db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(2, Date.now());
+      }
       db.exec("COMMIT");
     } catch (err) {
       db.exec("ROLLBACK");
+      db.close();
       throw err;
     }
   }
+  prunePrivacyRevoked(db, root);
   return db;
 }
 
+/** Retry removal after a crash between DB revocation and filesystem cleanup. */
+function prunePrivacyRevoked(db: DatabaseSync, root: string): void {
+  const rows = db.prepare("SELECT snapshot_path FROM source_revisions WHERE status = 'privacy_revoked'")
+    .all() as { snapshot_path: string }[];
+  if (rows.length === 0) return;
+  const sources = realpathSync(join(root, "sources"));
+  for (const row of rows) {
+    const path = resolve(row.snapshot_path);
+    if (!/^[a-f0-9]{64}\.json$/.test(path.split(sep).at(-1) ?? "")) {
+      throw new Error(`invalid revoked snapshot filename: ${path}`);
+    }
+    try {
+      // Resolve the parent to reject a symlink escaping the owned store.
+      if (!realpathSync(dirname(path)).startsWith(sources + sep)) throw new Error("revoked snapshot parent escaped sources");
+      unlinkSync(path);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    }
+  }
+}
+
+function blockBothViews(db: DatabaseSync, reason: string): void {
+  db.exec("UPDATE store_state SET control_epoch = control_epoch + 1 WHERE singleton = 1");
+  db.prepare("UPDATE pipeline_state SET read_blocked = 1, block_reason = ?")
+    .run(reason);
+}
+
 /** Transactionally record a captured snapshot (R01). Idempotent per revision. */
-export function recordSnapshot(db: DatabaseSync, rec: SnapshotRecord): void {
+export function recordSnapshot(db: DatabaseSync, rec: SnapshotRecord, root?: string): void {
+  if (rec.privacyEdit && !root) throw new Error("privacy revocation requires the owned memory root");
   db.exec("BEGIN");
   try {
     db.prepare(
@@ -190,18 +242,29 @@ export function recordSnapshot(db: DatabaseSync, rec: SnapshotRecord): void {
       rec.capturedAt,
     );
     // Only the selected branch and its latest projection remain eligible.
-    // Context-edit removals must revoke earlier revisions immediately (T10).
-    db.prepare(
+    // A branch switch without a session_tree event must also revoke reads.
+    const retired = db.prepare(
       "UPDATE branch_heads SET state = 'retired' WHERE session_key = ? AND branch_id != ? AND state = 'active'",
     ).run(rec.session.sessionKey, rec.session.branchId);
+    if (retired.changes > 0) blockBothViews(db, "branch_switch");
     db.prepare(
       "UPDATE source_revisions SET status = 'superseded' WHERE session_key = ? AND source_id != ? AND status = 'captured'",
     ).run(rec.session.sessionKey, rec.revision.sourceId);
-    // Re-selecting an identical historic leaf must restore its eligibility.
-    db.prepare("UPDATE source_revisions SET status = 'captured' WHERE source_id = ?")
+    // Re-selecting an identical historic leaf must restore its eligibility
+    // unless its content was privacy-revoked (a removed statement cannot be
+    // brought back by branch reactivation).
+    db.prepare("UPDATE source_revisions SET status = 'captured' WHERE source_id = ? AND status != 'privacy_revoked'")
       .run(rec.revision.sourceId);
+    if (rec.privacyEdit) {
+      db.prepare(
+        `UPDATE source_revisions SET status = 'privacy_revoked'
+         WHERE session_key = ? AND branch_id = ? AND source_id != ? AND status = 'superseded'`,
+      ).run(rec.session.sessionKey, rec.session.branchId, rec.revision.sourceId);
+      blockBothViews(db, "context_edit");
+    }
 
     db.exec("COMMIT");
+    if (rec.privacyEdit) prunePrivacyRevoked(db, root!);
   } catch (err) {
     db.exec("ROLLBACK");
     throw err;
@@ -220,6 +283,7 @@ export function retireOtherHeads(db: DatabaseSync, sessionKey: string, activeBra
       `UPDATE source_revisions SET status = 'superseded'
        WHERE session_key = ? AND branch_id != ? AND status = 'captured'`,
     ).run(sessionKey, activeBranchId);
+    if (db.prepare("SELECT changes() AS n").get()?.n) blockBothViews(db, "session_tree");
     db.exec("COMMIT");
   } catch (err) {
     db.exec("ROLLBACK");

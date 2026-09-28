@@ -87,6 +87,22 @@ test("own pi_memory messages and other extensions' custom messages excluded (§7
   assert.equal(out.omissions.length, 3);
 });
 
+test("signed access URLs lose credential query while retaining safe path", () => {
+  const out = normalizeEvidence([userMsg("u1", "Download https://example.org/data?X-Amz-Signature=secret123&X-Amz-Credential=owner and read https://example.org/docs")]);
+  assert.match(out.items[0]!.text, /https:\/\/example.org\/data\[REDACTED signed URL query\]/);
+  assert.ok(!out.items[0]!.text.includes("secret123"));
+  assert.match(out.items[0]!.text, /https:\/\/example.org\/docs/);
+});
+
+test("short user choice keeps its adjacent assistant question under a tight total budget", () => {
+  const out = normalizeEvidence([
+    assistantMsg("q1", [{ type: "text", text: "Should I use option 1 or option 2?" }]),
+    userMsg("a1", "use option 1"),
+    assistantMsg("other", [{ type: "text", text: "a long unrelated conclusion that should lose priority" }]),
+  ], { limits: { itemBytes: 256, toolResultBytes: 256, totalBytes: 54 } });
+  assert.deepEqual(out.items.map((i) => i.sourceId), ["q1", "a1"]);
+});
+
 test("redaction precedes truncation so cut-off secret prefixes cannot leak", () => {
   const secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWX";
   const out = normalizeEvidence([userMsg("u1", "preamble ".repeat(3) + secret + "y".repeat(200))],
@@ -102,6 +118,9 @@ test("assistant prose and tool calls retain distinct roles and bounds", () => {
   ])]);
   assert.deepEqual(out.items.map((i) => i.role), ["assistant", "tool"]);
   assert.equal(out.items[0]!.text, "I propose TypeScript");
+  assert.equal(out.items[1]!.toolCallId, "tc1");
+  assert.equal(out.items[1]!.entryId, "a1");
+  assert.equal(out.items[1]!.timestamp, 0);
   assert.ok(Buffer.byteLength(out.items[1]!.text, "utf8") <= DEFAULT_NORMALIZE_LIMITS.toolResultBytes);
 });
 

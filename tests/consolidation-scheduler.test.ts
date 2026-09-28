@@ -5,22 +5,24 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defaultConfig } from "../src/config.ts";
 import { openStateDb } from "../src/store/db.ts";
-import { getPublishedGeneration, selectConsolidation } from "../src/store/consolidation.ts";
+import { claimConsolidation, getPublishedGeneration, selectConsolidation } from "../src/store/consolidation.ts";
 import { ConsolidationScheduler } from "../src/pipeline/scheduler.ts";
-import { buildStaging } from "../src/pipeline/staging.ts";
+import { buildStaging, textHash } from "../src/pipeline/staging.ts";
 import { MINIMAL_V1_SUMMARY } from "../src/pipeline/validate.ts";
 import { acquireReadView } from "../src/read/view.ts";
+import type { ConsolidationModelPort } from "../src/pipeline/model-port.ts";
+import { createAssistantMessageEventStream, type Api, type AssistantMessage, type Model } from "@earendil-works/pi-ai";
 
 const NOW = Date.UTC(2026, 8, 29);
 
-function fixture(t: test.TestContext) {
+function fixture(t: test.TestContext, modelPort: () => ConsolidationModelPort | null = () => { throw new Error("empty selection must not resolve a model"); }) {
   const root = mkdtempSync(join(tmpdir(), "pi-memory-consolidation-scheduler-"));
   const db = openStateDb(root);
   const config = defaultConfig("UTC");
   let now = NOW;
   const scheduled: { run: () => Promise<void>; delay: number; cancelled: boolean }[] = [];
   const scheduler = new ConsolidationScheduler({ db, root, config: () => config,
-    modelPort: () => { throw new Error("empty selection must not resolve a model"); },
+    modelPort,
     now: () => now, isForegroundIdle: () => true,
     timer: { schedule(run, delay) { const item = { run, delay, cancelled: false }; scheduled.push(item);
       return { cancel: () => { item.cancelled = true; } }; } } });
@@ -29,7 +31,7 @@ function fixture(t: test.TestContext) {
 }
 
 test("an expired writer's leftover staging cannot block a reclaimed lease or serve uncommitted output", async (t) => {
-  const { root, db, scheduler, advance } = fixture(t);
+  const { root, db, scheduler, advance, scheduled } = fixture(t);
   await scheduler.runPass();
   await scheduler.runPass();
   const before = getPublishedGeneration(db, "v1", NOW)!;
@@ -42,12 +44,58 @@ test("an expired writer's leftover staging cannot block a reclaimed lease or ser
   const leftovers = [abandoned.job_id, `${abandoned.job_id}-${abandoned.fence}`].map((jobId) =>
     buildStaging({ root, jobId, snapshot, promptHash: abandoned.prompt_hash }).directory);
   for (const directory of leftovers) writeFileSync(join(directory, "memory_summary.md"), "uncommitted claim");
+  assert.deepEqual(await scheduler.runPass(), [], "a live foreign lease must not be stolen");
+  assert.equal(scheduled.filter(item => !item.cancelled).at(-1)?.delay, 180_000,
+    "lease contention keeps a recovery wake even when content is unchanged");
   advance(180_001);
   assert.deepEqual(await scheduler.runPass(), [{ status: "unchanged" }]);
   assert.equal(getPublishedGeneration(db, "v1", NOW + 180_001)?.generationId, before.generationId);
   assert.equal(acquireReadView({ db, root, memoryVersion: "v1", now: NOW + 180_001 })?.summary, MINIMAL_V1_SUMMARY);
   assert.equal((db.prepare("SELECT status FROM jobs WHERE job_id = ?").get(abandoned.job_id) as { status: string }).status, "succeeded");
   assert.ok(leftovers.every((directory) => !existsSync(directory)));
+});
+
+test("two dirty versions rotate the first model opportunity after a transport retry", async (t) => {
+  const order: string[] = [];
+  const model: Model<Api> = { provider: "mock", id: "writer", name: "Writer", api: "openai-completions", baseUrl: "https://unused.invalid",
+    reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200_000, maxTokens: 8_000 };
+  const port: ConsolidationModelPort = { resolve: () => model, stream: (_model, context) => {
+    const tools = context.messages.flatMap(message => message.role === "system" ? message.toolsAdded ?? [] : []);
+    order.push(tools.some(tool => tool.name === "workspace_delete") ? "v1" : "v2");
+    const stream = createAssistantMessageEventStream();
+    const message: AssistantMessage = { role: "assistant", api: model.api, provider: model.provider, model: model.id,
+      content: [], stopReason: "error", errorMessage: "temporary provider error", timestamp: NOW,
+      usage: { input: 10, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 11,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+    stream.push({ type: "error", reason: "error", error: message });
+    return stream;
+  } };
+  const { root, db, config, scheduler, advance } = fixture(t, () => port);
+  config.dualWrite = true;
+  config.models.consolidate = { provider: "mock", modelId: "writer" };
+  const note = "Preserve the project's explicit TypeScript decision.\n";
+  const path = join(root, "rotation-note.md"); writeFileSync(path, note);
+  db.prepare("INSERT INTO notes (note_id, text_path, text_hash, scope, created_at) VALUES ('rotation', ?, ?, 'global', ?)")
+    .run(path, textHash(note), NOW);
+  assert.ok((await scheduler.runPass()).every(result => result.status === "retry_wait"));
+  advance(60_000);
+  assert.ok((await scheduler.runPass()).every(result => result.status === "retry_wait"));
+  assert.deepEqual(order, ["v1", "v2", "v2", "v1"]);
+});
+
+test("v2 blocked by another version's live lease wakes after expiry without another input event", async (t) => {
+  const { root, db, config, scheduler, advance, scheduled } = fixture(t);
+  config.version = "v2";
+  assert.ok(claimConsolidation(db, { memoryVersion: "v1", owner: "dead-writer", promptHash: "other-version", now: NOW }));
+  assert.deepEqual(await scheduler.runPass(), []);
+  const wake = scheduled.filter(item => !item.cancelled).at(-1);
+  assert.ok(wake);
+  assert.equal(wake.delay, 180_000);
+  advance(180_001);
+  await wake.run();
+  assert.ok(getPublishedGeneration(db, "v2", NOW + 180_001));
+  assert.equal(getPublishedGeneration(db, "v1", NOW + 180_001), null);
+  assert.equal(acquireReadView({ db, root, memoryVersion: "v2", now: NOW + 180_001 })?.summary, MINIMAL_V1_SUMMARY);
 });
 
 test("empty selection publishes deterministic v1 artifacts without a model and unchanged input preserves the generation", async (t) => {
@@ -59,8 +107,24 @@ test("empty selection publishes deterministic v1 artifacts without a model and u
   assert.deepEqual(await scheduler.runPass(), [{ status: "unchanged" }]);
   assert.equal(getPublishedGeneration(db, "v1", NOW)?.generationId, generation.generationId);
   config.version = "v2";
-  assert.deepEqual(await scheduler.runPass(), []);
   assert.equal(acquireReadView({ db, root, memoryVersion: "v2", now: NOW }), null);
+});
+
+test("selected v2 publishes without a handbook and dual writing preserves independent current generations", async (t) => {
+  const { root, db, config, scheduler } = fixture(t);
+  config.version = "v2";
+  assert.deepEqual(await scheduler.runPass(), [{ status: "published" }]);
+  const v2 = getPublishedGeneration(db, "v2", NOW)!;
+  assert.ok(v2);
+  assert.equal(getPublishedGeneration(db, "v1", NOW), null);
+  assert.equal(existsSync(join(v2.directory, "MEMORY.md")), false);
+  assert.equal(existsSync(join(v2.directory, "raw_memories.md")), false);
+  assert.equal(readFileSync(join(v2.directory, "memory_summary.md"), "utf8"), MINIMAL_V1_SUMMARY);
+  config.dualWrite = true;
+  assert.deepEqual(await scheduler.runPass(), [{ status: "unchanged" }, { status: "published" }]);
+  assert.equal(getPublishedGeneration(db, "v2", NOW)?.generationId, v2.generationId);
+  assert.ok(getPublishedGeneration(db, "v1", NOW));
+  assert.equal(acquireReadView({ db, root, memoryVersion: "v2", now: NOW })?.memoryVersion, "v2");
 });
 
 test("a valid larger source-count configuration stays within the v1 policy and can publish", async (t) => {

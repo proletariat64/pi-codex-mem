@@ -43,7 +43,8 @@ test("/memory run --now follows selected v2 and reports its independent extracti
   await mock.fire("session_start", { type: "session_start" }, ctx);
   const configPath = join(agentDir, "memory", "config.json");
   const config = JSON.parse(readFileSync(configPath, "utf8"));
-  writeFileSync(configPath, JSON.stringify({ ...config, version: "v2" }));
+  // One shared request isolates extraction; the real writer is covered by lifecycle tests.
+  writeFileSync(configPath, JSON.stringify({ ...config, version: "v2", limits: { ...config.limits, dailyRequests: 1 } }));
   await mock.fire("before_agent_start", { type: "before_agent_start", systemPromptOptions: { sections: {} } }, ctx);
   await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
   await mock.commands.get("memory")!.handler("run --now", ctx);

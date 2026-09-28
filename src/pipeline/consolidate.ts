@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
 import { Agent, type StreamFn } from "@earendil-works/pi-agent-core";
 import { createAssistantMessageEventStream, type Api, type AssistantMessage, type Model } from "@earendil-works/pi-ai";
-import type { MemoryConfig, ModelRef } from "../config.ts";
+import type { MemoryConfig, MemoryVersion, ModelRef } from "../config.ts";
 import { truncateUtf8 } from "../snapshot.ts";
 import { redactSensitive } from "../sensitive.ts";
 import { reconcileModelCall, reserveModelCall } from "../store/jobs.ts";
@@ -37,28 +37,29 @@ const MAX_CALLS = 12;
 const MAX_TOOLS = 40;
 const TOTAL_TIMEOUT_MS = 300_000;
 const OUTPUT_TOKENS = 4_000;
-const writerTemplate = () => readFileSync(new URL("../../prompts/upstream/v1/consolidation.md", import.meta.url), "utf8");
-const adaptation = () => readFileSync(new URL("../../prompts/pi/v1/consolidation-boundaries.md", import.meta.url), "utf8");
+const writerTemplate = (version: MemoryVersion) => readFileSync(new URL(`../../prompts/upstream/${version}/${version === "v1" ? "consolidation.md" : "consolidation_v2.md"}`, import.meta.url), "utf8");
+const adaptation = (version: MemoryVersion) => readFileSync(new URL(`../../prompts/pi/${version}/consolidation-boundaries.md`, import.meta.url), "utf8");
 
 /** All writer instructions and boundary semantics participate in the dirty check. */
-export function consolidationPromptHash(config: MemoryConfig): string {
-  return createHash("sha256").update(writerTemplate()).update("\n").update(adaptation()).update(JSON.stringify({
-    schemaVersion: 1, memoryVersion: "v1", summaryBytes: config.limits.summaryBytes,
+export function consolidationPromptHash(config: MemoryConfig, version: MemoryVersion = "v1"): string {
+  return createHash("sha256").update(writerTemplate(version)).update("\n").update(adaptation(version)).update(JSON.stringify({
+    schemaVersion: 1, rendererVersion: 2, memoryVersion: version, summaryBytes: Math.min(9999, config.limits.summaryBytes),
     toolResponseBytes: config.limits.toolResponseBytes, maxCalls: MAX_CALLS, maxTools: MAX_TOOLS,
     timeoutMs: TOTAL_TIMEOUT_MS, outputTokens: OUTPUT_TOKENS,
-    outputAllowlist: ["MEMORY.md", "memory_summary.md", "skills/<slug>/SKILL.md"],
+    outputAllowlist: version === "v1" ? ["MEMORY.md", "memory_summary.md", "skills/<slug>/SKILL.md"] : ["memory_summary.md"],
     toolExecution: "sequential", contextByteRatio: 0.7, contextOverhead: 1_024,
     maxValidationRepairs: 1, validationDiagnosticBytes: 512,
   })).digest("hex");
 }
 
-function renderWriter(config: MemoryConfig): string {
-  return writerTemplate()
+function renderWriter(config: MemoryConfig, version: MemoryVersion): string {
+  return writerTemplate(version)
     .replaceAll("{{ memory_root }}", ".")
     .replaceAll("{{ phase2_workspace_diff_file }}", "phase2_workspace_diff.md")
     .replaceAll("{{ memory_extensions_folder_structure }}", "- notes/<note-id>.md: host-staged read-only shared user-note snapshot")
-    .replaceAll("{{ memory_extensions_primary_inputs }}", "- `notes/*.md`: read-only shared active user notes; cite explicit note IDs") +
-    "\n\n" + adaptation() + `\nSummary maximum: ${config.limits.summaryBytes} UTF-8 bytes.\n`;
+    .replaceAll("{{ memory_extensions_primary_inputs }}", "- `notes/*.md`: read-only shared active user notes; cite explicit note IDs")
+    .replaceAll("thread_id=", "session_key=").replaceAll("source thread identifier", "pi session identifier") +
+    "\n\n" + adaptation(version) + `\nSummary maximum: ${Math.min(9999, config.limits.summaryBytes)} UTF-8 bytes.\n`;
 }
 
 function providerFailure(message: string | undefined): ConsolidationRunResult {
@@ -93,9 +94,9 @@ function failureMessage(model: Model<Api>, clock: () => number, aborted: boolean
 /** Confined in-memory Agent. A completed writer is still unpublished until host validation/CAS. */
 export async function runConsolidation(input: ConsolidationRunInput): Promise<ConsolidationRunResult> {
   const clock = input.clock ?? Date.now;
-  if (input.lease.memoryVersion !== "v1") return { status: "blocked", reason: "unsupported_version" };
+  const version = input.lease.memoryVersion;
   if (input.signal.aborted) return { status: "cancelled", reason: "aborted" };
-  if (input.lease.promptHash !== consolidationPromptHash(input.config)) return { status: "blocked", reason: "prompt_changed" };
+  if (input.lease.promptHash !== consolidationPromptHash(input.config, version)) return { status: "blocked", reason: "prompt_changed" };
   const model = input.port.resolve(input.modelRef);
   if (!model) return { status: "blocked", reason: "model_not_found" };
   const maxTokens = Math.min(OUTPUT_TOKENS, model.maxTokens);
@@ -221,8 +222,8 @@ export async function runConsolidation(input: ConsolidationRunInput): Promise<Co
   };
 
   try {
-    agent = new Agent({ initialState: { model, messages: [], systemPrompt: renderWriter(input.config),
-      tools: createWorkspaceTools(input.directory, { memoryVersion: "v1", responseBytes: Math.min(input.config.limits.toolResponseBytes, 16_384) }),
+    agent = new Agent({ initialState: { model, messages: [], systemPrompt: renderWriter(input.config, version),
+      tools: createWorkspaceTools(input.directory, { memoryVersion: version, responseBytes: Math.min(input.config.limits.toolResponseBytes, 16_384) }),
       thinkingLevel: "off" }, streamFn, toolExecution: "sequential",
       beforeToolCall: async () => {
         if (!fence() || result) return { block: true, reason: result?.reason ?? "writer_stopped", terminate: true };
@@ -254,7 +255,7 @@ export async function runConsolidation(input: ConsolidationRunInput): Promise<Co
         if (tools > MAX_TOOLS) abort({ status: "blocked", reason: "tool_budget" });
       }
     });
-    await Promise.race([agent.prompt("Consolidate this v1 staged workspace. Read phase2_workspace_diff.md first, then selected evidence and notes. Write the required outputs using workspace tools."), aborted]);
+    await Promise.race([agent.prompt(`Consolidate this ${version} staged workspace. Read phase2_workspace_diff.md first, then selected evidence and notes. Write the required outputs using workspace tools.`), aborted]);
     if (result) return result;
     if (!fence()) return result ?? { status: "blocked", reason: "lease_lost" };
     const last = agent.state.messages.filter((message): message is AssistantMessage => message.role === "assistant").at(-1);

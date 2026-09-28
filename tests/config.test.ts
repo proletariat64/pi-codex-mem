@@ -201,8 +201,8 @@ test("loadConfig create path respects a held control lock instead of racing it",
 test("a stale control lock from a crashed process is broken, not obeyed forever", (t) => {
   const root = makeRoot(t);
   const lock = join(root, "config.json.lock");
-  mkdirSync(lock);
-  // Age the lock beyond the staleness threshold (locks are held for ms)
+  // Dead owner (4194303 > default Linux pid_max), aged beyond the threshold
+  writeFileSync(lock, "4194303:stale");
   const old = new Date(Date.now() - 120_000);
   utimesSync(lock, old, old);
   const result = loadConfig(root, { timezone: "UTC" });
@@ -226,21 +226,19 @@ test("a displaced lock holder detects loss and never deletes the new holder's lo
   const token = acquireLock(lock);
   assert.ok(token, "first acquire succeeds");
   // Simulate a stale-break race displacing us: another process claims it
-  rmSync(lock, { recursive: true, force: true });
-  mkdirSync(lock);
-  writeFileSync(join(lock, "owner"), "999999:foreign");
+  rmSync(lock, { force: true });
+  writeFileSync(lock, "999999:foreign");
   assert.equal(verifyLockOwnership(lock, token), false);
   releaseLock(lock, token); // must NOT remove the foreign lock
-  assert.equal(readFileSync(join(lock, "owner"), "utf8"), "999999:foreign");
-  rmSync(lock, { recursive: true, force: true });
+  assert.equal(readFileSync(lock, "utf8"), "999999:foreign");
+  rmSync(lock, { force: true });
 });
 
 test("a lock whose owner process is dead is broken even when fresh", (t) => {
   const root = makeRoot(t);
   const lock = join(root, "config.json.lock");
-  mkdirSync(lock);
   // 4194303 is above Linux's default pid_max — guaranteed dead
-  writeFileSync(join(lock, "owner"), "4194303:deadbeef");
+  writeFileSync(lock, "4194303:deadbeef");
   const token = acquireLock(lock);
   assert.ok(token, "dead owner's lock is broken and claimed");
   assert.equal(verifyLockOwnership(lock, token), true);
@@ -252,8 +250,7 @@ test("owner metadata and directory identity are bound: replacement between reads
   const root = makeRoot(t);
   const lock = join(root, "config.json.lock");
   // Dead owner's stale lock
-  mkdirSync(lock);
-  writeFileSync(join(lock, "owner"), "4194303:deadbeef");
+  writeFileSync(lock, "4194303:deadbeef");
   // A breaker acquiring now should win (dead owner)…
   const token1 = acquireLock(lock);
   assert.ok(token1);

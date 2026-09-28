@@ -12,6 +12,8 @@ export const REQUIRED_EVENTS = [
   "agent_start",
   "agent_before_settle",
   "agent_settled",
+  "input",
+  "turn_end",
 ] as const;
 
 export type RequiredEvent = (typeof REQUIRED_EVENTS)[number];

@@ -8,6 +8,7 @@ import {
   type LoadConfigResult,
   type MemoryConfig,
 } from "./config.ts";
+import { SessionCapture } from "./capture.ts";
 import {
   checkHostCompat,
   MIN_PI_VERSION,
@@ -67,6 +68,10 @@ interface RuntimeState {
   config: LoadConfigResult | null;
   promptSections: "confirmed" | "unobserved" | "unavailable";
   modelRegistry: { find?: unknown } | null;
+  /** Live capture state for this session (null when disabled/failed). */
+  capture: SessionCapture | null;
+  /** Latest capture failure, surfaced via /memory doctor. */
+  captureError: string | null;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -75,6 +80,8 @@ export default function (pi: ExtensionAPI) {
     config: null,
     promptSections: "unobserved",
     modelRegistry: null,
+    capture: null,
+    captureError: null,
   };
 
   pi.registerFlag("pi-memory-mode", {
@@ -142,6 +149,26 @@ export default function (pi: ExtensionAPI) {
       state.config = loadConfig(root, {
         timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
       });
+      // Live capture (ticket #3): bind identity + canaries once per session.
+      state.capture = null;
+      state.captureError = null;
+      if (state.compat.supported && state.config.status !== "invalid") {
+        const cfg =
+          state.config.status === "ok" || state.config.status === "created" ? state.config.config : null;
+        if (cfg?.enabled && cfg.generate) {
+          try {
+            state.capture = new SessionCapture({
+              root,
+              agentDir: getAgentDir(),
+              cwd: ctx.cwd,
+              timezone: cfg.timezone,
+              sessionStartIso: new Date().toISOString(),
+            });
+          } catch (err) {
+            state.captureError = `capture init failed: ${(err as Error).message}`;
+          }
+        }
+      }
     }
     const badFlag = pi.getFlag("pi-memory-mode");
     if (badFlag !== undefined && flagMode() === undefined && ctx.hasUI) {
@@ -161,6 +188,36 @@ export default function (pi: ExtensionAPI) {
         `pi-memory: config.json invalid — file preserved, generation disabled:\n${state.config.problems.join("\n")}`,
         "warning",
       );
+    }
+  });
+
+  pi.on("input", (event) => {
+    // Live capture: remember the latest user text for the current turn.
+    try {
+      state.capture?.onInput((event as { text?: string }).text ?? "");
+    } catch (err) {
+      state.captureError = `input capture failed: ${(err as Error).message}`;
+    }
+  });
+
+  pi.on("turn_end", (event) => {
+    // Live capture: write the user + assistant raw events for this turn.
+    if (!state.capture) return;
+    try {
+      const extract = (message: unknown): string[] => {
+        const content = (message as { content?: unknown })?.content;
+        if (!Array.isArray(content)) return [];
+        return content
+          .filter((b): b is { type: string; text: string } =>
+            Boolean(b && typeof b === "object" && (b as { type?: unknown }).type === "text"),
+          )
+          .map((b) => b.text);
+      };
+      const e = event as { turnIndex?: number; message?: unknown; toolResults?: unknown[] };
+      const toolTexts = (e.toolResults ?? []).flatMap(extract);
+      state.capture.onTurnEnd(e.turnIndex ?? 0, extract(e.message), toolTexts);
+    } catch (err) {
+      state.captureError = `turn capture failed: ${(err as Error).message}`;
     }
   });
 

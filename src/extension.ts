@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import { getAgentDir, VERSION as PI_VERSION, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   formatModelRef,
+  legacyLockRecovery,
   loadConfig,
   type LoadConfigResult,
   type MemoryConfig,
@@ -27,6 +28,11 @@ type MemoryMode = "off" | "read" | "read-write";
 /** The independent pi memory root (spec §5.1). Never Codex or Claude-mem data. */
 function resolveMemoryRoot(): string {
   return join(getAgentDir(), "memory");
+}
+
+function legacyLockPath(root: string): string | null {
+  const path = join(root, "config.json.lock");
+  return existsSync(path) ? path : null;
 }
 
 /**
@@ -165,6 +171,10 @@ export default function (pi: ExtensionAPI) {
     } else if (state.config.status === "missing" && state.config.reason && ctx.hasUI) {
       ctx.ui.notify(`pi-memory: ${state.config.reason}; capture disabled`, "warning");
     }
+    const legacy = legacyLockPath(root);
+    if (legacy && ctx.hasUI && state.config.status !== "missing") {
+      ctx.ui.notify(`pi-memory: ${legacyLockRecovery(legacy)}; configuration updates blocked`, "warning");
+    }
   });
 
   pi.on("before_agent_start", (event) => {
@@ -242,6 +252,7 @@ export default function (pi: ExtensionAPI) {
         rootIsCodex: rootPointsIntoForeignMemory(root),
       },
       store: { state: storeState },
+      legacyControlLock: legacyLockPath(root),
       models: { extract: resolveRef(cfg?.models.extract ?? null), consolidate: resolveRef(cfg?.models.consolidate ?? null) },
       promptSections: state.promptSections,
     };
@@ -250,6 +261,8 @@ export default function (pi: ExtensionAPI) {
   function statusLines(): string[] {
     const root = resolveMemoryRoot();
     const lines = [`pi-memory ${EXTENSION_VERSION} (pi ${PI_VERSION})`, `memory root: ${root}`];
+    const legacy = legacyLockPath(root);
+    if (legacy) lines.push(`upgrade BLOCKED: ${legacyLockRecovery(legacy)}`);
     if (state.compat && !state.compat.supported) {
       lines.push(`state: DISABLED — unsupported host`, ...state.compat.problems.map((p) => `  - ${p}`));
       return lines;

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import extension from "../src/extension.ts";
@@ -63,6 +63,23 @@ test("config edited mid-session takes effect at the next foreground run", async 
   assert.match(status!, /store: not initialized yet/, "control DB alone is not a captured store");
   await commands.get("memory")!.handler("doctor", ctx as never);
   assert.ok(notifyLog.some((m) => m.includes("state.sqlite not initialized")));
+});
+
+test("existing valid config plus legacy lock is diagnosed by status and doctor", async (t) => {
+  const agentDir = mkdtempSync(join(tmpdir(), "pi-memory-agent-"));
+  t.after(() => rmSync(agentDir, { recursive: true, force: true }));
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  t.after(() => delete process.env.PI_CODING_AGENT_DIR);
+  const { pi, handlers, commands } = mockPi();
+  const notifyLog: string[] = [];
+  extension(pi as never);
+  const ctx = mockCtx(notifyLog);
+  await handlers.get("session_start")!({}, ctx); // creates valid config first
+  mkdirSync(join(agentDir, "memory", "config.json.lock"));
+  await commands.get("memory")!.handler("status", ctx as never);
+  await commands.get("memory")!.handler("doctor", ctx as never);
+  assert.ok(notifyLog.some((m) => m.includes("upgrade BLOCKED") && m.includes("manually remove")));
+  assert.ok(notifyLog.some((m) => m.includes("control-lock") && m.includes("pre-upgrade Pi processes")));
 });
 
 test("a foreground run without structured sections marks them unavailable; next session resets", async (t) => {

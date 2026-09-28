@@ -401,7 +401,7 @@ export function updateConfig(
  */
 const heldLocks = new Map<string, { db: DatabaseSync; lockPath: string }>();
 
-function legacyLockRecovery(lockPath: string): string {
+export function legacyLockRecovery(lockPath: string): string {
   return `legacy control lock at ${lockPath}; stop all pre-upgrade pi processes, verify they have exited, then manually remove the legacy lock before retrying`;
 }
 

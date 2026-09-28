@@ -25,6 +25,7 @@ export interface DoctorInput {
     rootIsCodex: boolean;
   };
   store: { state: "absent" | "current" | "legacy_layout" | "unavailable" };
+  legacyControlLock?: string | null;
   models: {
     extract:
       | { status: "unset" }
@@ -115,6 +116,15 @@ export function runDoctor(input: DoctorInput): DoctorReport {
         c.status === "created"
           ? "config.json created with defaults"
           : `valid (version=${c.config.version}, dualWrite=${c.config.dualWrite}, generate=${c.config.generate}, read=${c.config.read}, enabled=${c.config.enabled})`,
+    });
+  }
+
+  if (input.legacyControlLock) {
+    probes.push({
+      id: "control-lock",
+      label: "configuration upgrade",
+      status: "fail",
+      detail: `legacy control lock at ${input.legacyControlLock}; stop all pre-upgrade Pi processes and manually remove the lock`,
     });
   }
 

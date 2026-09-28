@@ -78,9 +78,10 @@ test("concurrent stale-lock breakers: exactly one winner per round", async (t) =
     const dir = join(root, `round-${round}`);
     mkdirSync(dir, { recursive: true });
     const lock = join(dir, "lock");
-    mkdirSync(lock);
+    // Stale lock file: dead owner (4194303 > default pid_max), aged metadata
+    writeFileSync(lock, "4194303:stale");
     const old = new Date(Date.now() - 120_000);
-    utimesSync(lock, old, old); // stale (ownerless + old)
+    utimesSync(lock, old, old);
 
     const racers = 4;
     const pending = race(lock, dir, racers);

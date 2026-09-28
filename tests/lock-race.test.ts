@@ -1,20 +1,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { pathToFileURL } from "node:url";
 
 /**
- * Greptile findings (PR #20/#21): concurrent stale-lock breakers must
- * produce exactly one winner, and the test must not flake when a contender
- * is slow. Synchronization is explicit, not timing-based:
- *  - every child writes ready-<i> after spawn setup, then waits at a barrier
- *  - the parent releases the barrier only after ALL children are ready
- *  - after its attempt each child writes done-<i>
- *  - the winner stays alive (owner PID live → lock unbreakable) until every
- *    contender's done-<i> exists, then exits
+ * Concurrent SQLite BEGIN IMMEDIATE contenders produce exactly one holder
+ * for the duration of the test. Barrier/done files make the interleaving
+ * deterministic rather than depending on process start timing.
  */
 
 function sleep(ms: number): Promise<void> {
@@ -70,7 +65,7 @@ function race(lockDir: string, dir: string, racers: number): Promise<number[]> {
   );
 }
 
-test("concurrent stale-lock breakers: exactly one winner per round", async (t) => {
+test("concurrent config-lock transactions: exactly one winner per round", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "pi-memory-lockrace-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
 
@@ -78,10 +73,6 @@ test("concurrent stale-lock breakers: exactly one winner per round", async (t) =
     const dir = join(root, `round-${round}`);
     mkdirSync(dir, { recursive: true });
     const lock = join(dir, "lock");
-    mkdirSync(lock);
-    const old = new Date(Date.now() - 120_000);
-    utimesSync(lock, old, old); // stale (ownerless + old)
-
     const racers = 4;
     const pending = race(lock, dir, racers);
     await waitForFiles(dir, "ready", racers, 15000); // no timing assumptions

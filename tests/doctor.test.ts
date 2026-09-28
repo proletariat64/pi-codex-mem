@@ -112,6 +112,17 @@ test("unobserved prompt sections warn; unavailable fails", () => {
   assert.equal(runDoctor(input).probes.find((p) => p.id === "prompt-sections")?.status, "fail");
 });
 
+test("legacy lock and corrupt control store are reported as failures", () => {
+  const input = goodInput();
+  input.config = { status: "missing", path: "/mem/config.json", reason: "legacy control lock; stop old processes" };
+  input.store = { state: "unavailable" };
+  const report = runDoctor(input);
+  assert.equal(report.ok, false);
+  assert.match(report.probes.find((p) => p.id === "config")?.detail ?? "", /legacy control lock/);
+  assert.equal(report.probes.find((p) => p.id === "config")?.status, "fail");
+  assert.equal(report.probes.find((p) => p.id === "store")?.status, "fail");
+});
+
 test("missing config warns instead of failing or creating", () => {
   const input = goodInput();
   input.config = { status: "missing", path: "/mem/config.json" };

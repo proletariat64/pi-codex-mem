@@ -36,7 +36,7 @@ export interface SnapshotRecord {
   evidenceRemoved?: boolean;
 }
 
-const SCHEMA_VERSION = 8;
+const SCHEMA_VERSION = 9;
 
 const MIGRATION_1 = `
 CREATE TABLE schema_migrations (
@@ -212,6 +212,84 @@ ALTER TABLE extractions ADD COLUMN original_bytes INTEGER NOT NULL DEFAULT 0 CHE
 ALTER TABLE extractions ADD COLUMN accepted_bytes INTEGER NOT NULL DEFAULT 0 CHECK (accepted_bytes BETWEEN 0 AND 9000);
 `;
 
+const MIGRATION_9 = `
+CREATE TABLE IF NOT EXISTS source_stats (
+  memory_version TEXT NOT NULL CHECK (memory_version IN ('v1', 'v2')),
+  lineage_key TEXT NOT NULL,
+  usage_count INTEGER NOT NULL DEFAULT 0 CHECK (usage_count >= 0),
+  last_used_at INTEGER,
+  retention_watermark INTEGER,
+  PRIMARY KEY (memory_version, lineage_key)
+);
+CREATE TABLE IF NOT EXISTS memory_usage (
+  memory_version TEXT NOT NULL CHECK (memory_version IN ('v1', 'v2')),
+  consumer_session TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  source_id TEXT NOT NULL REFERENCES source_revisions(source_id),
+  used_at INTEGER NOT NULL,
+  PRIMARY KEY (memory_version, consumer_session, run_id, source_id)
+);
+CREATE TABLE IF NOT EXISTS notes (
+  note_id TEXT PRIMARY KEY,
+  action TEXT NOT NULL DEFAULT 'remember',
+  text_path TEXT NOT NULL,
+  text_hash TEXT NOT NULL,
+  scope TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'superseded'))
+);
+CREATE TABLE IF NOT EXISTS generations (
+  generation_id TEXT PRIMARY KEY,
+  memory_version TEXT NOT NULL CHECK (memory_version IN ('v1', 'v2')),
+  status TEXT NOT NULL CHECK (status IN ('published', 'revoked')),
+  base_generation_id TEXT,
+  input_hash TEXT NOT NULL,
+  directory TEXT NOT NULL UNIQUE,
+  manifest_hash TEXT NOT NULL,
+  selection_hash TEXT NOT NULL,
+  prompt_hash TEXT NOT NULL,
+  control_epoch INTEGER NOT NULL,
+  max_sources INTEGER NOT NULL,
+  max_unused_days INTEGER NOT NULL,
+  retention_deadline INTEGER,
+  created_at INTEGER NOT NULL,
+  published_at INTEGER NOT NULL,
+  UNIQUE (generation_id, memory_version),
+  FOREIGN KEY (base_generation_id, memory_version) REFERENCES generations(generation_id, memory_version)
+);
+CREATE TABLE IF NOT EXISTS generation_sources (
+  generation_id TEXT NOT NULL REFERENCES generations(generation_id) ON DELETE CASCADE,
+  extraction_id TEXT NOT NULL,
+  source_id TEXT NOT NULL REFERENCES source_revisions(source_id),
+  output_hash TEXT NOT NULL,
+  PRIMARY KEY (generation_id, extraction_id)
+);
+CREATE TABLE IF NOT EXISTS note_applications (
+  note_id TEXT NOT NULL REFERENCES notes(note_id),
+  memory_version TEXT NOT NULL CHECK (memory_version IN ('v1', 'v2')),
+  note_hash TEXT NOT NULL,
+  generation_id TEXT NOT NULL,
+  control_epoch INTEGER NOT NULL,
+  PRIMARY KEY (note_id, memory_version),
+  FOREIGN KEY (generation_id, memory_version) REFERENCES generations(generation_id, memory_version)
+);
+CREATE TRIGGER IF NOT EXISTS generation_source_version BEFORE INSERT ON generation_sources
+WHEN NOT EXISTS (
+  SELECT 1 FROM extractions e JOIN generations g ON g.generation_id = NEW.generation_id
+  WHERE e.extraction_id = NEW.extraction_id AND e.memory_version = g.memory_version
+    AND e.source_id = NEW.source_id AND e.output_hash = NEW.output_hash
+)
+BEGIN SELECT RAISE(ABORT, 'generation source version mismatch'); END;
+CREATE TRIGGER IF NOT EXISTS generation_source_version_update BEFORE UPDATE ON generation_sources
+BEGIN SELECT RAISE(ABORT, 'generation sources are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS pipeline_generation_version BEFORE UPDATE OF active_generation_id ON pipeline_state
+WHEN NEW.active_generation_id IS NOT NULL AND NOT EXISTS (
+  SELECT 1 FROM generations WHERE generation_id = NEW.active_generation_id
+    AND memory_version = NEW.memory_version AND status = 'published'
+)
+BEGIN SELECT RAISE(ABORT, 'active generation version mismatch'); END;
+`;
+
 export function openStateDb(root: string, options?: { busyTimeoutMs?: number }): DatabaseSync {
   const busyTimeout = options?.busyTimeoutMs ?? 5_000;
   if (!Number.isSafeInteger(busyTimeout) || busyTimeout < 0 || busyTimeout > 5_000) {
@@ -279,6 +357,14 @@ export function openStateDb(root: string, options?: { busyTimeoutMs?: number }):
       if (current < 8) {
         db.exec(MIGRATION_8);
         db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(8, Date.now());
+      }
+      if (current < 9) {
+        const columns = db.prepare("PRAGMA table_info(pipeline_state)").all() as { name: string }[];
+        if (!columns.some(column => column.name === "active_generation_id")) {
+          db.exec("ALTER TABLE pipeline_state ADD COLUMN active_generation_id TEXT");
+        }
+        db.exec(MIGRATION_9);
+        db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(9, Date.now());
       }
       db.exec("COMMIT");
     } catch (err) {

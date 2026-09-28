@@ -99,6 +99,12 @@ test("/memory run --now extracts a settled v1 snapshot through Pi's model regist
   await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
   assert.equal(requests.length, 0, "the default six-hour idle window prevents immediate automatic work");
 
+  // Isolate this extraction contract with one shared daily provider request.
+  // Consolidation is exercised through a real Agent in consolidation-lifecycle.test.ts.
+  const configurationPath = join(agentDir, "memory", "config.json");
+  const beforeRun = JSON.parse(readFileSync(configurationPath, "utf8"));
+  writeFileSync(configurationPath, JSON.stringify({ ...beforeRun, limits: { ...beforeRun.limits, dailyRequests: 1 } }));
+
   await mock.commands.get("memory")!.handler("run --now", ctx);
 
   const db = new DatabaseSync(join(agentDir, "memory", "state.sqlite"), { readOnly: true });
@@ -119,7 +125,7 @@ test("/memory run --now extracts a settled v1 snapshot through Pi's model regist
   assert.match(notifications.at(-1) ?? "", /v1 extraction: extracted/);
 
   const configPath = join(agentDir, "memory", "config.json");
-  writeFileSync(configPath, JSON.stringify({ ...cfg, limits: { ...cfg.limits, dailyInputTokens: 100 } }));
+  writeFileSync(configPath, JSON.stringify({ ...cfg, limits: { ...cfg.limits, dailyInputTokens: 100, dailyRequests: 20 } }));
   const next = { ...entry, id: "u2", parentId: "u1", timestamp: new Date().toISOString(),
     message: { ...entry.message, content: [{ type: "text", text: "Further TypeScript decision" }] } };
   branch = [entry, next]; leafId = "u2";

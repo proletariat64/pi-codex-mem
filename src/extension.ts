@@ -32,6 +32,11 @@ import { ExtractionScheduler, targetVersions } from "./extraction/scheduler.ts";
 import { v1PromptHash } from "./extraction/v1.ts";
 import { v2PromptHash } from "./extraction/v2.ts";
 import type { MemoryVersion } from "./config.ts";
+import { ConsolidationScheduler } from "./pipeline/scheduler.ts";
+import { createConsolidationModelPort } from "./pipeline/model-port.ts";
+import { acquireReadView, type MemoryReadView } from "./read/view.ts";
+import { renderMemorySection } from "./read/inject.ts";
+import { cleanupGenerations } from "./pipeline/publish.ts";
 
 const EXTENSION_VERSION = "0.1.0";
 
@@ -124,7 +129,11 @@ export default function (pi: ExtensionAPI) {
   };
   const activityOwner = randomUUID();
   let scheduler: ExtractionScheduler | null = null;
+  let consolidator: ConsolidationScheduler | null = null;
   let runtimePort: ReturnType<typeof createRegistryModelPort> | null = null;
+  let consolidationPort: ReturnType<typeof createConsolidationModelPort> | null = null;
+  let readerPin: MemoryReadView | null = null;
+  let retentionTimer: NodeJS.Timeout | null = null;
   let heartbeat: NodeJS.Timeout | null = null;
   let privacyRetryTimer: NodeJS.Timeout | null = null;
   let privacyRetryCount = 0;
@@ -165,18 +174,30 @@ export default function (pi: ExtensionAPI) {
 
   function ensureScheduler(ctx?: ExtensionContext): void {
     if (ctx?.modelRegistry && !runtimePort) runtimePort = createRegistryModelPort(ctx.modelRegistry);
-    if (scheduler || !state.db || !state.compat?.supported || !runtimePort) return;
+    if (ctx?.modelRegistry && !consolidationPort) consolidationPort = createConsolidationModelPort(ctx.modelRegistry);
+    if (!state.db || !state.compat?.supported || !runtimePort) return;
     const root = resolveMemoryRoot();
     if (rootPointsIntoForeignMemory(root) || legacyLockPath(root)) return;
     const port = runtimePort;
+    if (!consolidator && consolidationPort) {
+      const writerPort = consolidationPort;
+      consolidator = new ConsolidationScheduler({ db: state.db, root, modelPort: () => writerPort,
+        now: Date.now, isForegroundIdle: () => foregroundIdle,
+        config: () => eligibleExtractionConfig(root),
+        pinnedGenerationIds: () => readerPin ? [readerPin.generationId] : [],
+        onError: (err) => { state.captureError = `consolidation failed: ${(err as Error).message}`; },
+      });
+    }
+    if (scheduler) return;
     scheduler = new ExtractionScheduler({ db: state.db, root, modelPort: () => port,
       now: Date.now, isForegroundIdle: () => foregroundIdle,
       onError: (err) => { state.captureError = `scheduler failed: ${(err as Error).message}`; },
+      onResult: () => consolidator?.trigger(),
       config: () => eligibleExtractionConfig(root),
     });
   }
 
-  function triggerScheduler(): void { scheduler?.trigger(); }
+  function triggerScheduler(): void { scheduler?.trigger(); consolidator?.trigger(); }
 
   /** One-shot, bounded-backoff retry when another SQLite reader holds WAL frames. */
   function schedulePrivacyCleanup(root: string): void {
@@ -216,6 +237,7 @@ export default function (pi: ExtensionAPI) {
   function markForegroundActive(ctx: ExtensionContext): void {
     foregroundIdle = false;
     scheduler?.foregroundStarted();
+    consolidator?.foregroundStarted();
     if (heartbeat) clearInterval(heartbeat);
     heartbeat = null;
     try {
@@ -246,6 +268,7 @@ export default function (pi: ExtensionAPI) {
     try {
       if (state.db) clearProcessActivity(state.db, activityOwner);
       scheduler?.foregroundSettled();
+      consolidator?.foregroundSettled();
     } catch (err) {
       state.captureError = `scheduler failed: ${(err as Error).message}`;
     }
@@ -280,8 +303,14 @@ export default function (pi: ExtensionAPI) {
     if (heartbeat) clearInterval(heartbeat);
     heartbeat = null;
     await scheduler?.stop();
+    await consolidator?.stop();
     scheduler = null;
+    consolidator = null;
     runtimePort = null;
+    consolidationPort = null;
+    readerPin = null;
+    if (retentionTimer) clearTimeout(retentionTimer);
+    retentionTimer = null;
     if (state.db) clearProcessActivity(state.db, activityOwner);
     state.db?.close();
     state.db = null;
@@ -314,6 +343,7 @@ export default function (pi: ExtensionAPI) {
       if (state.compat.supported && !legacyLockPath(root) && storeSchemaState(root) === "current") {
         try {
           state.db = openStateDb(root);
+          cleanupGenerations({ db: state.db, root, now: Date.now() });
           const header = ctx.sessionManager.getHeader();
           const file = ctx.sessionManager.getSessionFile();
           if (header && file) {
@@ -394,6 +424,8 @@ export default function (pi: ExtensionAPI) {
           totalBytes: config.config.limits.inputBytes,
         },
       });
+      cleanupGenerations({ db: state.db, root, now: Date.now(),
+        pinnedGenerationIds: readerPin ? [readerPin.generationId] : [] });
       state.captureError = null;
       if (state.capture.status === "captured" && config.config.generate) {
         for (const version of targetVersions(config.config)) {
@@ -436,8 +468,9 @@ export default function (pi: ExtensionAPI) {
       // All previous selected heads are conservatively retired until the
       // new branch is captured and validated (§5.3, T08).
       retireOtherHeads(state.db, key, "");
+      readerPin = null;
       state.capture = null;
-      scheduler?.trigger();
+      triggerScheduler();
     } catch (err) {
       if (!notePrivacyCleanupFailure(err, root)) {
         state.captureError = `tree reconciliation failed: ${(err as Error).message}`;
@@ -450,7 +483,12 @@ export default function (pi: ExtensionAPI) {
     if (heartbeat) clearInterval(heartbeat);
     heartbeat = null;
     await scheduler?.stop();
+    await consolidator?.stop();
     scheduler = null;
+    consolidator = null;
+    readerPin = null;
+    if (retentionTimer) clearTimeout(retentionTimer);
+    retentionTimer = null;
     try {
       if (state.db) {
         state.db.exec("PRAGMA busy_timeout = 100");
@@ -460,6 +498,7 @@ export default function (pi: ExtensionAPI) {
     } finally {
       cancelPrivacyCleanup();
       runtimePort = null;
+      consolidationPort = null;
       state.db?.close();
       state.db = null;
     }
@@ -494,6 +533,40 @@ export default function (pi: ExtensionAPI) {
       if (saved.ok) state.config = { status: "ok", config: saved.config, path: join(root, "config.json") };
       else if (ctx.hasUI) ctx.ui.notify(`pi-memory: model default not saved — ${saved.reason}`, "warning");
     }
+    readerPin = null;
+    if (retentionTimer) clearTimeout(retentionTimer);
+    retentionTimer = null;
+    const latest = state.config;
+    const sections = opts?.sections;
+    if (!sections || typeof sections !== "object" || Array.isArray(sections)) return;
+    const sectionMap = sections as Record<string, string>;
+    delete sectionMap.pi_memory;
+    if (!state.compat?.supported || typeof ctx.cwd !== "string" || latest.status !== "ok" || !latest.config.enabled ||
+        !latest.config.read || flagMode() === "off" || rootPointsIntoForeignMemory(root) ||
+        legacyLockPath(root) || isExcludedWorkspace(ctx.cwd, latest.config.excludedWorkspaces)) return;
+    let readerDb: DatabaseSync | undefined;
+    try {
+      if (!state.db) {
+        const path = join(root, "state.sqlite");
+        if (!existsSync(path) || lstatSync(path).isSymbolicLink()) return;
+        readerDb = new DatabaseSync(path, { readOnly: true });
+        readerDb.exec("PRAGMA busy_timeout = 50");
+      }
+      readerPin = acquireReadView({ db: state.db ?? readerDb!, root,
+        memoryVersion: latest.config.version, summaryBytes: latest.config.limits.summaryBytes,
+        maxUnusedDays: latest.config.schedule.maxUnusedDays });
+      if (!readerPin) return;
+      sectionMap.pi_memory = renderMemorySection(readerPin, ctx.cwd);
+      if (readerPin.retentionDeadline !== null) {
+        retentionTimer = setTimeout(() => {
+          readerPin = null;
+          retentionTimer = null;
+          consolidator?.trigger();
+        }, Math.max(0, Math.min(2_147_483_647, readerPin.retentionDeadline - Date.now())));
+        retentionTimer.unref();
+      }
+    } catch { /* Memory failure must not stop the user's foreground task. */ }
+    finally { readerDb?.close(); }
   });
 
   function storeSchemaState(root: string): "absent" | "current" | "unavailable" {
@@ -669,6 +742,7 @@ export default function (pi: ExtensionAPI) {
       ensureScheduler(ctx);
       if (!scheduler) { report("scheduler unavailable", "warning"); return; }
       const results = await scheduler.runPass(true);
+      const consolidated = await consolidator?.runPass(true) ?? [];
       let message = "no eligible settled sources";
       if (results.length) {
         message = results.map((result) => result.status === "budget_deferred"
@@ -676,6 +750,8 @@ export default function (pi: ExtensionAPI) {
       } else if (state.captureError?.startsWith("scheduler failed:")) {
         message = state.captureError;
       }
+      if (consolidated.length) message += `; consolidation: ${consolidated.map((result) =>
+        result.reason ? `${result.status} (${result.reason})` : result.status).join(", ")}`;
       report(message, message.startsWith("scheduler failed:") ? "warning" : "info");
     } catch (err) {
       notePrivacyCleanupFailure(err, root);

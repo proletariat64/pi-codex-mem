@@ -210,6 +210,56 @@ test("a stale control lock from a crashed process is broken, not obeyed forever"
   assert.equal(loadConfig(root).status, "ok");
 });
 
+test("pre-upgrade directory lock with a dead owner is recovered", (t) => {
+  const root = makeRoot(t);
+  const lock = join(root, "config.json.lock");
+  mkdirSync(lock);
+  writeFileSync(join(lock, "owner"), "4194303:crashed");
+  const token = acquireLock(lock);
+  assert.ok(token, "dead legacy owner no longer blocks updates");
+  assert.equal(statSync(lock).isFile(), true);
+  releaseLock(lock, token);
+});
+
+test("aged pre-upgrade ownerless directory is recoverable, recent directory is not", (t) => {
+  const root = makeRoot(t);
+  const lock = join(root, "config.json.lock");
+  mkdirSync(lock);
+  assert.equal(acquireLock(lock), false);
+  const old = new Date(Date.now() - 120_000);
+  utimesSync(lock, old, old);
+  const token = acquireLock(lock);
+  assert.ok(token);
+  releaseLock(lock, token);
+});
+
+test("aged pre-upgrade directory with a live owner is not broken", (t) => {
+  const root = makeRoot(t);
+  const lock = join(root, "config.json.lock");
+  mkdirSync(lock);
+  writeFileSync(join(lock, "owner"), `${process.pid}:legacy`);
+  const old = new Date(Date.now() - 120_000);
+  utimesSync(lock, old, old);
+  assert.equal(acquireLock(lock), false);
+  assert.equal(statSync(lock).isDirectory(), true);
+});
+
+test("PID reuse is detected by process birth but a live aged holder is not displaced", (t) => {
+  const root = makeRoot(t);
+  const lock = join(root, "config.json.lock");
+  const token = acquireLock(lock);
+  assert.ok(token);
+  const old = new Date(Date.now() - 120_000);
+  utimesSync(lock, old, old);
+  assert.equal(acquireLock(lock), false, "age alone cannot safely break a living lock");
+  releaseLock(lock, token);
+  if (process.platform !== "linux") return; // Linux process-birth fixture
+  writeFileSync(lock, `${process.pid}:1:crashed`);
+  const reclaimed = acquireLock(lock);
+  assert.ok(reclaimed, "a different birth time proves PID reuse");
+  releaseLock(lock, reclaimed);
+});
+
 test("create path does not clobber a config committed while we waited for the lock", (t) => {
   const root = makeRoot(t);
   // Another process commits a config first; our create must then adopt it
@@ -246,7 +296,7 @@ test("a lock whose owner process is dead is broken even when fresh", (t) => {
   assert.throws(() => statSync(lock));
 });
 
-test("owner metadata and directory identity are bound: replacement between reads yields", (t) => {
+test("a new live file token is not displaced after a stale break", (t) => {
   const root = makeRoot(t);
   const lock = join(root, "config.json.lock");
   // Dead owner's stale lock
@@ -256,7 +306,7 @@ test("owner metadata and directory identity are bound: replacement between reads
   assert.ok(token1);
   releaseLock(lock, token1);
   // …and after release, a fresh claim by a live owner is never broken by
-  // someone who statted the OLD directory: simulate by claiming with our
+  // someone who inspected the OLD file: simulate by claiming with our
   // own live pid, then having a competitor attempt a break.
   const token2 = acquireLock(lock);
   assert.ok(token2);

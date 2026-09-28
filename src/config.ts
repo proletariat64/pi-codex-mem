@@ -386,15 +386,17 @@ export function updateConfig(
  * (a mkdir lock dir plus a separately-written owner file was observed to
  * admit overlapping holders under race; see tests/lock-race.test.ts).
  *
- * A lock is stale when its owner PID is dead (ESRCH; EPERM counts as
- * alive) or its content is malformed and its mtime is old. Breaking moves
- * the file aside atomically and re-reads the MOVED file's content — if it
- * names a live owner (or is malformed but fresh), the break is undone and
- * the attempt yields. Content-based re-evaluation is immune to inode
- * reuse. Callers MUST re-verify with verifyLockOwnership before
- * committing a write (fencing).
+ * A lock is stale when its owner PID is dead, its Linux process-birth value
+ * proves PID reuse, or its owner is unreadable and its mtime is old. A live
+ * owner is NEVER expired by age: a writer could have passed its pre-commit
+ * fence, so stealing its lock would allow a lost update. A hung live holder
+ * requires manual intervention on platforms without process-birth evidence.
+ * Breaking moves the lock aside and re-checks that moved instance (also
+ * supports the pre-upgrade directory/owner format). Callers fence before
+ * and after committing a write.
  */
 const LOCK_STALE_MS = 30_000;
+const LEGACY_LOCK_OWNER_FILE = "owner";
 
 function isPidAlive(pid: number): boolean {
   try {
@@ -421,16 +423,49 @@ function readLock(lockPath: string): string | undefined {
   }
 }
 
-/** Is this lock content stale? Live owner -> never; malformed -> age. */
-function isStale(content: string | undefined, mtimeMs: number): boolean {
+/** Linux process birth from /proc, unlike PID alone, survives PID reuse. */
+function processBirth(pid: number): string | null {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19] ?? null;
+  } catch {
+    return null; // non-Linux or unavailable: fail closed for a live PID
+  }
+}
+
+interface LockState { content: string | undefined; mtimeMs: number }
+
+/** Read a file token or the pre-upgrade directory/owner format. */
+function readLockState(path: string): LockState | undefined {
+  try {
+    const stat = statSync(path);
+    let content: string | undefined;
+    try {
+      content = readFileSync(stat.isDirectory() ? join(path, LEGACY_LOCK_OWNER_FILE) : path, "utf8");
+    } catch {
+      content = undefined; // ownerless or unreadable; only break after age
+    }
+    return { content, mtimeMs: stat.mtimeMs };
+  } catch {
+    return undefined; // lock path vanished
+  }
+}
+
+/** A verified dead owner or reused PID is stale; never age-break a live owner. */
+function isStale({ content, mtimeMs }: LockState): boolean {
   const pid = ownerPid(content);
-  if (!Number.isNaN(pid)) return !isPidAlive(pid);
+  if (!Number.isNaN(pid)) {
+    if (!isPidAlive(pid)) return true;
+    const claimedBirth = content!.split(":")[1];
+    const actualBirth = processBirth(pid);
+    return Boolean(/^\d+$/.test(claimedBirth ?? "") && actualBirth && claimedBirth !== actualBirth);
+  }
   return Date.now() - mtimeMs > LOCK_STALE_MS;
 }
 
 /** Atomically claim the lock file; false when it already exists. */
 function tryClaimFile(lockPath: string, token: string): boolean {
-  const tmp = `${lockPath}.tmp-${process.pid}`;
+  const tmp = `${lockPath}.tmp-${process.pid}-${randomBytes(8).toString("hex")}`;
   try {
     writeFileSync(tmp, token, { mode: 0o600 });
     linkSync(tmp, lockPath); // atomic; EEXIST when held
@@ -443,43 +478,38 @@ function tryClaimFile(lockPath: string, token: string): boolean {
 }
 
 export function acquireLock(lockPath: string): string | false {
-  const token = `${process.pid}:${randomBytes(8).toString("hex")}`;
+  const token = `${process.pid}:${processBirth(process.pid) ?? "unknown"}:${randomBytes(8).toString("hex")}`;
   for (let attempt = 0; attempt < 3; attempt++) {
     if (tryClaimFile(lockPath, token)) return token;
-    const content = readLock(lockPath);
-    if (content === undefined) continue; // vanished between claim and read
-    let held;
-    try {
-      held = statSync(lockPath);
-    } catch {
-      continue; // vanished mid-flight
-    }
-    if (!isStale(content, held.mtimeMs)) return false; // genuinely held
-    // Break: move aside atomically, then re-evaluate the MOVED instance.
-    const trash = `${lockPath}.stale-${process.pid}`;
-    rmSync(trash, { force: true });
+    // The first read may span two lock generations; the moved-file re-read
+    // below is authoritative before we delete anything.
+    const held = readLockState(lockPath);
+    if (!held) continue; // vanished between claim and read
+    if (!isStale(held)) return false;
+    const trash = `${lockPath}.stale-${process.pid}-${randomBytes(8).toString("hex")}`;
     try {
       renameSync(lockPath, trash);
     } catch {
       continue; // another breaker moved it first
     }
-    let moved;
-    try {
-      moved = { content: readFileSync(trash, "utf8"), mtimeMs: statSync(trash).mtimeMs };
-    } catch {
-      continue; // trash unreadable; nothing to break
-    }
-    if (!isStale(moved.content, moved.mtimeMs)) {
-      // We moved a live lock — restore it and yield.
+    const moved = readLockState(trash);
+    if (!moved || !isStale(moved)) {
+      // A normal file can be restored with link(2) only if the path is still
+      // vacant. rename(2) here would OVERWRITE a newer holder's lock.
+      // Directory-format locks cannot be hard-linked: retain their moved
+      // instance for manual reconciliation rather than risk replacement.
       try {
-        renameSync(trash, lockPath);
+        if (statSync(trash).isFile()) {
+          linkSync(trash, lockPath);
+          rmSync(trash, { force: true });
+        }
       } catch {
-        // path already reclaimed; displaced lock survives as trash
+        // Newly claimed path or unreadable instance: retain trash intact.
       }
       return false;
     }
-    rmSync(trash, { force: true });
-    // Loop around to claim.
+    rmSync(trash, { recursive: true, force: true });
+    // Loop around to claim after discarding the verified stale instance.
     briefSleep(10 * (attempt + 1));
   }
   return false;

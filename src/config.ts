@@ -2,7 +2,7 @@
 // This module is pure Node — no pi imports — so it is unit-testable and
 // reusable from a future standalone CLI.
 
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 export type MemoryVersion = "v1" | "v2";
@@ -123,6 +123,29 @@ export function loadConfig(root: string, opts?: { timezone?: string; create?: bo
       return { status: "missing", path };
     }
     try {
+      // Re-check under the lock: another process may have committed a
+      // config while we waited. Adopt it instead of renaming defaults over.
+      try {
+        const committed = readFileSync(path, "utf8");
+        let raw: unknown;
+        try {
+          raw = JSON.parse(committed);
+        } catch (err) {
+          return { status: "invalid", problems: [`config.json is not valid JSON: ${(err as Error).message}`], path };
+        }
+        const problems = validateConfig(raw);
+        return problems.length > 0
+          ? { status: "invalid", problems, path }
+          : { status: "ok", config: raw as MemoryConfig, path };
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+          return {
+            status: "invalid",
+            problems: [`config.json exists but cannot be read (${(err as NodeJS.ErrnoException).code ?? "unknown"}); the file is preserved and generation is disabled`],
+            path,
+          };
+        }
+      }
       const config = defaultConfig(opts?.timezone ?? "UTC");
       writeConfigAtomic(path, config);
       return { status: "created", config, path };
@@ -307,14 +330,28 @@ export function updateConfig(
   return { ok: false, reason: "config control lock held by another process" };
 }
 
-/** Atomic lock via mkdir; returns false when already held. */
+/** Locks are held for milliseconds; anything older is a crashed holder. */
+const LOCK_STALE_MS = 30_000;
+
+/** Atomic lock via mkdir; breaks locks abandoned by crashed processes. */
 function acquireLock(lockDir: string): boolean {
   try {
     mkdirSync(lockDir);
     return true;
   } catch {
-    return false;
+    // fall through to staleness check
   }
+  try {
+    const held = statSync(lockDir);
+    if (Date.now() - held.mtimeMs > LOCK_STALE_MS) {
+      rmSync(lockDir, { recursive: true, force: true });
+      mkdirSync(lockDir);
+      return true;
+    }
+  } catch {
+    // lost a staleness race — the other breaker now holds it
+  }
+  return false;
 }
 
 /** Synchronous short sleep for lock contention backoff (ms). */

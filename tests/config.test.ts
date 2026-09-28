@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defaultConfig, loadConfig, updateConfig, validateConfig } from "../src/config.ts";
@@ -196,4 +196,26 @@ test("loadConfig create path respects a held control lock instead of racing it",
   // Must not write defaults over an in-flight locked update: reports missing instead
   assert.equal(result.status, "missing");
   assert.throws(() => readFileSync(join(root, "config.json")));
+});
+
+test("a stale control lock from a crashed process is broken, not obeyed forever", (t) => {
+  const root = makeRoot(t);
+  const lock = join(root, "config.json.lock");
+  mkdirSync(lock);
+  // Age the lock beyond the staleness threshold (locks are held for ms)
+  const old = new Date(Date.now() - 120_000);
+  utimesSync(lock, old, old);
+  const result = loadConfig(root, { timezone: "UTC" });
+  assert.equal(result.status, "created");
+  assert.equal(loadConfig(root).status, "ok");
+});
+
+test("create path does not clobber a config committed while we waited for the lock", (t) => {
+  const root = makeRoot(t);
+  // Another process commits a config first; our create must then adopt it
+  const committed = { ...defaultConfig("UTC"), dualWrite: true };
+  writeFileSync(join(root, "config.json"), JSON.stringify(committed));
+  const result = loadConfig(root, { timezone: "UTC" });
+  assert.equal(result.status, "ok");
+  if (result.status === "ok") assert.equal(result.config.dualWrite, true);
 });

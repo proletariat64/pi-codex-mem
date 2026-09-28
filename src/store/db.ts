@@ -36,7 +36,7 @@ export interface SnapshotRecord {
   evidenceRemoved?: boolean;
 }
 
-const SCHEMA_VERSION = 7;
+const SCHEMA_VERSION = 8;
 
 const MIGRATION_1 = `
 CREATE TABLE schema_migrations (
@@ -206,6 +206,12 @@ CREATE TABLE privacy_scrub_state (
 INSERT INTO privacy_scrub_state (singleton, legacy_vacuum_pending) VALUES (1, 1);
 `;
 
+const MIGRATION_8 = `
+ALTER TABLE extractions ADD COLUMN truncated INTEGER NOT NULL DEFAULT 0 CHECK (truncated IN (0, 1));
+ALTER TABLE extractions ADD COLUMN original_bytes INTEGER NOT NULL DEFAULT 0 CHECK (original_bytes >= 0);
+ALTER TABLE extractions ADD COLUMN accepted_bytes INTEGER NOT NULL DEFAULT 0 CHECK (accepted_bytes BETWEEN 0 AND 9000);
+`;
+
 export function openStateDb(root: string, options?: { busyTimeoutMs?: number }): DatabaseSync {
   const busyTimeout = options?.busyTimeoutMs ?? 5_000;
   if (!Number.isSafeInteger(busyTimeout) || busyTimeout < 0 || busyTimeout > 5_000) {
@@ -269,6 +275,10 @@ export function openStateDb(root: string, options?: { busyTimeoutMs?: number }):
       if (current < 7) {
         db.exec(MIGRATION_7);
         db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(7, Date.now());
+      }
+      if (current < 8) {
+        db.exec(MIGRATION_8);
+        db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(8, Date.now());
       }
       db.exec("COMMIT");
     } catch (err) {

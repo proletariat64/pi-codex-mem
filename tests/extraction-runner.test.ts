@@ -10,23 +10,26 @@ import { openStateDb, recordSnapshot } from "../src/store/db.ts";
 import { writeSnapshotFile } from "../src/store/snapshot-files.ts";
 import { claimDueExtractions, enqueueExtraction } from "../src/store/jobs.ts";
 import { renderV1Request } from "../src/extraction/v1.ts";
-import { runV1Extraction, type MemoryModelPort, type MemoryResponse, type ResolvedMemoryModel } from "../src/extraction/runner.ts";
+import { renderV2Request } from "../src/extraction/v2.ts";
+import { runV1Extraction, runV2Extraction, type MemoryModelPort, type MemoryResponse, type ResolvedMemoryModel } from "../src/extraction/runner.ts";
 
 const NOW = Date.UTC(2024, 0, 2, 12);
 const sourceId = "source-1";
 const modelRef = { provider: "mock", modelId: "extract" };
 const limits = { outputBytes: 49_152, dailyInputTokens: 100_000, dailyOutputTokens: 20_000, dailyRequests: 20 };
 
-function setup(t: test.TestContext, items?: { entryId: string; role: string; origin: string | null; text: string; timestamp: number }[]) {
+function setup(t: test.TestContext, items?: { entryId: string; role: string; origin: string | null; text: string; timestamp: number }[],
+  version: "v1" | "v2" = "v1") {
   const root = mkdtempSync(join(tmpdir(), "pi-memory-extract-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const cwd = join(root, "repo"); mkdirSync(cwd);
   execFileSync("git", ["init", "-q"], { cwd });
+  execFileSync("git", ["symbolic-ref", "HEAD", "refs/heads/captured-branch"], { cwd });
   const memoryRoot = join(root, "agent", "memory");
   const db = openStateDb(memoryRoot);
   t.after(() => db.close());
   const workspace = computeWorkspaceIdentity(cwd);
-  const snapshot = { schemaVersion: 1, sourceId, items: items ?? [
+  const snapshot = { schemaVersion: 1, sourceId, workspace, items: items ?? [
     { entryId: "u1", role: "user", origin: "unknown", text: "User chose TypeScript over Rust", timestamp: NOW - 30_000 },
   ] };
   const saved = writeSnapshotFile(memoryRoot, "l".repeat(64), "v".repeat(64), snapshot);
@@ -34,8 +37,9 @@ function setup(t: test.TestContext, items?: { entryId: string; role: string; ori
     headerId: "historical-1", parentKey: null, branchId: "branch-1", mode: "tui" },
     revision: { sourceId, lineageKey: "l".repeat(64), revisionHash: "v".repeat(64), leafId: "u1",
       snapshotPath: saved.path, snapshotHash: saved.hash, sourceTime: NOW - 30_000 }, capturedAt: NOW - 20_000 });
-  const promptHash = renderV1Request({ snapshotPath: saved.path, cwd, items: snapshot.items }).promptHash;
-  enqueueExtraction(db, { sourceId, memoryVersion: "v1", promptHash, now: NOW });
+  const input = { snapshotPath: saved.path, cwd, items: snapshot.items, gitBranch: workspace.gitBranch };
+  const promptHash = version === "v1" ? renderV1Request(input).promptHash : renderV2Request(input).promptHash;
+  enqueueExtraction(db, { sourceId, memoryVersion: version, promptHash, now: NOW });
   const [job] = claimDueExtractions(db, { owner: "runner", now: NOW, limit: 1 });
   assert.ok(job);
   return { db, job, root: memoryRoot };
@@ -58,6 +62,76 @@ function fakePort(replies: MemoryResponse[]) {
 
 const response = (text: string): MemoryResponse => ({ stopReason: "stop", text,
   usage: { input: 100, output: 20 } });
+
+test("v2 runner uses the pinned prompt, stores NULL raw learning and bounded summary metadata", async (t) => {
+  const { db, job, root } = setup(t, undefined, "v2");
+  db.prepare("UPDATE workspaces SET git_branch = 'later-branch'").run();
+  const line = "界".repeat(1_500); // 4,500 UTF-8 bytes per line
+  const { port, calls } = fakePort([response(JSON.stringify({
+    rollout_summary: `${line}\n${line}\nURL https://example.com/important/identifier-must-stay-whole`,
+    rollout_slug: "Chinese task history",
+  }))]);
+  const result = await runV2Extraction({ db, root, job, modelRef, port, now: NOW + 1,
+    timezone: "UTC", limits: { ...limits, v2RolloutSummaryBytes: 9_000 },
+    signal: new AbortController().signal });
+  assert.deepEqual(result, { status: "succeeded" });
+  assert.equal(calls.length, 1);
+  assert.match(calls[0]?.text ?? "", /You are part of an agent memory system/);
+  assert.match(calls[0]?.text ?? "", /captured-branch/);
+  assert.doesNotMatch(calls[0]?.text ?? "", /later-branch/);
+  const row = db.prepare("SELECT memory_version, raw_memory, rollout_summary, truncated, original_bytes, accepted_bytes FROM extractions")
+    .get() as { memory_version: string; raw_memory: string | null; rollout_summary: string;
+      truncated: number; original_bytes: number; accepted_bytes: number };
+  assert.equal(row.memory_version, "v2");
+  assert.equal(row.raw_memory, null);
+  assert.equal(row.rollout_summary, `${line}\n[... remainder omitted ...]`);
+  assert.equal(row.truncated, 1);
+  assert.equal(row.accepted_bytes, Buffer.byteLength(row.rollout_summary, "utf8"));
+  assert.ok(row.original_bytes > 9_000);
+});
+
+test("v2 rejects raw_memory and repairs once within the shared attempt and request budgets", async (t) => {
+  const { db, job, root } = setup(t, undefined, "v2");
+  const { port, calls } = fakePort([
+    response('{"raw_memory":"v1 leak","rollout_summary":"history","rollout_slug":"history"}'),
+    response('{"rollout_summary":"","rollout_slug":""}'),
+  ]);
+  const result = await runV2Extraction({ db, root, job, modelRef, port, now: NOW + 1,
+    timezone: "UTC", limits: { ...limits, v2RolloutSummaryBytes: 9_000 },
+    signal: new AbortController().signal });
+  assert.deepEqual(result, { status: "no_output" });
+  assert.equal(calls.length, 2);
+  assert.match(calls[1]?.text ?? "", /two required v2 string fields/);
+  assert.equal((db.prepare("SELECT attempt_count FROM jobs").get() as { attempt_count: number }).attempt_count, 2);
+  assert.equal((db.prepare("SELECT COUNT(*) AS n FROM budget_reservations").get() as { n: number }).n, 2);
+  const row = db.prepare("SELECT raw_memory, outcome, truncated, original_bytes, accepted_bytes FROM extractions").get() as
+    { raw_memory: string | null; outcome: string; truncated: number; original_bytes: number; accepted_bytes: number };
+  assert.deepEqual({ ...row }, { raw_memory: null, outcome: "no_output", truncated: 0,
+    original_bytes: 0, accepted_bytes: 0 });
+});
+
+test("v2 repairs a slug without substantive summary instead of storing it", async (t) => {
+  const { db, job, root } = setup(t, undefined, "v2");
+  const { port, calls } = fakePort([
+    response('{"rollout_summary":"","rollout_slug":"hallucinated-slug"}'),
+    response('{"rollout_summary":"Material decision and scope","rollout_slug":"scope"}'),
+  ]);
+  assert.deepEqual(await runV2Extraction({ db, root, job, modelRef, port, now: NOW + 1,
+    timezone: "UTC", limits: { ...limits, v2RolloutSummaryBytes: 9_000 },
+    signal: new AbortController().signal }), { status: "succeeded" });
+  assert.equal(calls.length, 2);
+  assert.equal((db.prepare("SELECT rollout_summary FROM extractions").get() as { rollout_summary: string }).rollout_summary,
+    "Material decision and scope");
+});
+
+test("v1 runner refuses a v2 job without a model call or version-mismatched commit", async (t) => {
+  const { db, job, root } = setup(t, undefined, "v2");
+  const { port, calls } = fakePort([]);
+  assert.deepEqual(await runV1Extraction({ db, root, job, modelRef, port, now: NOW + 1,
+    timezone: "UTC", limits, signal: new AbortController().signal }), { status: "blocked" });
+  assert.equal(calls.length, 0);
+  assert.equal((db.prepare("SELECT COUNT(*) AS n FROM extractions").get() as { n: number }).n, 0);
+});
 
 test("run --now stores a sanitized v1 extraction with model, prompt, usage, and output hash provenance", async (t) => {
   const { db, job, root } = setup(t);

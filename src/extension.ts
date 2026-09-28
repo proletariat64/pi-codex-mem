@@ -1,42 +1,244 @@
-import { existsSync } from "node:fs";
-import { join } from "node:path";
-import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { existsSync, realpathSync, statSync } from "node:fs";
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
+import { getAgentDir, VERSION as PI_VERSION, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+  formatModelRef,
+  loadConfig,
+  type LoadConfigResult,
+  type MemoryConfig,
+} from "./config.ts";
+import {
+  checkHostCompat,
+  MIN_PI_VERSION,
+  REQUIRED_EVENTS,
+  semverAtLeast,
+  type CompatResult,
+  type HostCapabilities,
+} from "./pi/compat.ts";
+import { runDoctor, type DoctorInput } from "./doctor.ts";
 
 const EXTENSION_VERSION = "0.1.0";
+
+/** Effective runtime mode (spec §6.3): flag > config-derived. */
+type MemoryMode = "off" | "read" | "read-write";
 
 /** The independent pi memory root (spec §5.1). Never Codex or Claude-mem data. */
 function resolveMemoryRoot(): string {
   return join(getAgentDir(), "memory");
 }
 
-function statusLines(): string[] {
-  const root = resolveMemoryRoot();
-  const storeExists = existsSync(join(root, "state.sqlite"));
-  return [
-    `pi-memory ${EXTENSION_VERSION}`,
-    `memory root: ${root}`,
-    storeExists
-      ? "store: present"
-      : "store: not initialized yet (capture and generation arrive in later milestones)",
-    `upstream prompts: vendored (verify with: node scripts/verify-upstream.mjs)`,
+/**
+ * spec §5.1: a memory root inside Codex/Claude-mem locations must be rejected.
+ * Computed from the home directory, not derived from the agent dir, so a
+ * relocated PI_CODING_AGENT_DIR cannot confuse the check.
+ */
+function rootPointsIntoForeignMemory(root: string): boolean {
+  let real: string;
+  try {
+    real = realpathSync(root);
+  } catch {
+    real = resolve(root);
+  }
+  const home = homedir();
+  const forbidden = [
+    join(home, ".codex", "memories"),
+    join(home, ".codex", "memories_v2"),
+    join(home, ".codex", "sessions"),
+    join(home, ".claude-mem"),
   ];
+  return forbidden.some((f) => real === f || real.startsWith(f + "/"));
+}
+
+/** Mode derived from configuration alone (spec §14 distinctions). */
+function modeFromConfig(config: MemoryConfig): MemoryMode {
+  if (!config.enabled) return "off";
+  if (config.read && config.generate) return "read-write";
+  if (config.read) return "read";
+  return "off";
+}
+
+function describeMode(mode: MemoryMode, source: "flag" | "config"): string {
+  return `${mode} (from ${source})`;
+}
+
+interface RuntimeState {
+  compat: CompatResult | null;
+  config: LoadConfigResult | null;
+  promptSections: "confirmed" | "unobserved" | "unavailable";
+  modelRegistry: { find?: unknown } | null;
 }
 
 export default function (pi: ExtensionAPI) {
+  const state: RuntimeState = {
+    compat: null,
+    config: null,
+    promptSections: "unobserved",
+    modelRegistry: null,
+  };
+
+  pi.registerFlag("pi-memory-mode", {
+    description: "Pi Memory runtime mode: off | read | read-write (overrides config)",
+    type: "string",
+  });
+
+  function flagMode(): MemoryMode | undefined {
+    const raw = pi.getFlag("pi-memory-mode");
+    if (raw === "off" || raw === "read" || raw === "read-write") return raw;
+    return undefined;
+  }
+
+  function effectiveMode(): { mode: MemoryMode; source: "flag" | "config" } {
+    const flag = flagMode();
+    if (flag) return { mode: flag, source: "flag" };
+    const cfg = state.config;
+    if (cfg && cfg.status !== "invalid" && cfg.status !== "missing") {
+      return { mode: modeFromConfig(cfg.config), source: "config" };
+    }
+    return { mode: "off", source: "config" };
+  }
+
+  async function probeHost(ctx: { sessionManager?: unknown; modelRegistry?: unknown }): Promise<HostCapabilities> {
+    let hasNodeSqlite = false;
+    try {
+      await import("node:sqlite");
+      hasNodeSqlite = true;
+    } catch {
+      hasNodeSqlite = false;
+    }
+    const sm = ctx.sessionManager as { getBranch?: unknown } | undefined;
+    const mr = ctx.modelRegistry as { find?: unknown; streamSimple?: unknown } | undefined;
+    const piOk = semverAtLeast(PI_VERSION, MIN_PI_VERSION);
+    return {
+      nodeVersion: process.versions.node,
+      hasNodeSqlite,
+      // Event support is pinned by host version: registration does not throw
+      // on unknown names, so pi >= MIN_PI_VERSION is the documented proxy.
+      events: piOk ? REQUIRED_EVENTS : [],
+      // Refined at runtime by the before_agent_start probe below.
+      hasStructuredPromptSections: piOk,
+      hasBranchAccess: typeof sm?.getBranch === "function",
+      hasModelRegistryAccess: typeof mr?.find === "function" && typeof mr?.streamSimple === "function",
+    };
+  }
+
+  pi.on("session_start", async (_event, ctx) => {
+    state.modelRegistry = (ctx as { modelRegistry?: { find?: unknown } }).modelRegistry ?? null;
+    const caps = await probeHost(ctx);
+    state.compat = checkHostCompat(caps);
+    state.config = loadConfig(resolveMemoryRoot(), {
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
+    });
+    if (!state.compat.supported && ctx.hasUI) {
+      // One diagnostic, then memory behavior stays disabled (spec §2.3).
+      ctx.ui.notify(
+        `pi-memory disabled — unsupported host:\n${state.compat.problems.join("\n")}`,
+        "error",
+      );
+    } else if (state.config.status === "invalid" && ctx.hasUI) {
+      ctx.ui.notify(
+        `pi-memory: config.json invalid — file preserved, generation disabled:\n${state.config.problems.join("\n")}`,
+        "warning",
+      );
+    }
+  });
+
+  pi.on("before_agent_start", (event) => {
+    const opts = event.systemPromptOptions as { sections?: unknown } | undefined;
+    if (opts && typeof opts === "object" && "sections" in opts) {
+      state.promptSections = "confirmed";
+    }
+    // If sections are absent here the host (or another extension) cannot
+    // support section injection — surfaced via /memory doctor, not silently.
+  });
+
+  function gatherDoctorInput(): DoctorInput {
+    const root = resolveMemoryRoot();
+    let rootWritable = false;
+    if (existsSync(root)) {
+      try {
+        statSync(root);
+        rootWritable = true; // cheap proxy; real writes fail loudly later
+      } catch {
+        rootWritable = false;
+      }
+    }
+    const compat =
+      state.compat ?? { supported: false, problems: ["no session has started yet — capabilities not probed"] };
+    // Read-only: never create config.json from the doctor path.
+    const config = state.config ?? loadConfig(root, { create: false });
+    let storeState: DoctorInput["store"]["state"] = "absent";
+    if (existsSync(join(root, "state.sqlite"))) {
+      storeState = "current";
+    } else if (existsSync(join(root, "generations")) && !existsSync(join(root, "versions"))) {
+      storeState = "legacy_layout";
+    }
+    const cfg: MemoryConfig | null =
+      config.status === "ok" || config.status === "created" ? config.config : null;
+    const resolveRef = (ref: { provider: string; modelId: string } | null) => {
+      if (!ref) return { status: "unset" } as const;
+      const find = state.modelRegistry?.find;
+      const resolved =
+        typeof find === "function"
+          ? Boolean((find as (p: string, m: string) => unknown).call(state.modelRegistry, ref.provider, ref.modelId))
+          : false;
+      return { status: "configured", ref, resolved } as const;
+    };
+    return {
+      compat,
+      config,
+      paths: {
+        memoryRoot: root,
+        rootExists: existsSync(root),
+        rootWritable,
+        rootIsCodex: rootPointsIntoForeignMemory(root),
+      },
+      store: { state: storeState },
+      models: { extract: resolveRef(cfg?.models.extract ?? null), consolidate: resolveRef(cfg?.models.consolidate ?? null) },
+      promptSections: state.promptSections,
+    };
+  }
+
+  function statusLines(): string[] {
+    const root = resolveMemoryRoot();
+    const lines = [`pi-memory ${EXTENSION_VERSION} (pi ${PI_VERSION})`, `memory root: ${root}`];
+    if (state.compat && !state.compat.supported) {
+      lines.push(`state: DISABLED — unsupported host`, ...state.compat.problems.map((p) => `  - ${p}`));
+      return lines;
+    }
+    const cfg = state.config;
+    const { mode, source } = effectiveMode();
+    if (!cfg || cfg.status === "missing") {
+      lines.push("state: no session started yet");
+    } else if (cfg.status === "invalid") {
+      lines.push("state: DISABLED generation — config invalid (file preserved)", ...cfg.problems.map((p) => `  - ${p}`));
+    } else {
+      const c = cfg.config;
+      lines.push(
+        `mode: ${describeMode(mode, source)}`,
+        `selected version: ${c.version}${c.dualWrite ? " + dual-write v1&v2" : ""}`,
+        `models: extract=${formatModelRef(c.models.extract)}, consolidate=${formatModelRef(c.models.consolidate)}`,
+        existsSync(join(root, "state.sqlite"))
+          ? "store: present"
+          : "store: not initialized yet (capture arrives in a later milestone)",
+      );
+    }
+    return lines;
+  }
+
   pi.registerCommand("memory", {
-    description: "Pi Memory — persistent cross-session memory (status)",
+    description: "Pi Memory — persistent cross-session memory (status, doctor)",
     handler: async (args, ctx) => {
       const sub = args.trim().split(/\s+/).filter(Boolean)[0] ?? "status";
-      if (sub !== "status") {
-        if (ctx.hasUI) {
-          ctx.ui.notify(`pi-memory: unknown subcommand "${sub}". Available: status`, "warning");
-        }
-        return;
-      }
-      if (ctx.hasUI) {
+      if (!ctx.hasUI) return; // No status text on protocol stdout (spec §6.3).
+      if (sub === "status") {
         ctx.ui.notify(statusLines().join("\n"), "info");
+      } else if (sub === "doctor") {
+        const report = runDoctor(gatherDoctorInput());
+        ctx.ui.notify(report.format().join("\n"), report.ok ? "info" : "warning");
+      } else {
+        ctx.ui.notify(`pi-memory: unknown subcommand "${sub}". Available: status, doctor`, "warning");
       }
-      // Noninteractive modes stay silent: no status text on protocol stdout (spec §6.3).
     },
   });
 }

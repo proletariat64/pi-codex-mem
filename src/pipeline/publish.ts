@@ -5,6 +5,8 @@ import { dirname, join, resolve, sep } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { commitGeneration, type ConsolidationLease, type ConsolidationSnapshot } from "../store/consolidation.ts";
 import type { MemoryVersion } from "../config.ts";
+import { validateV2Artifacts } from "./validate.ts";
+import { evidencePath, notePath, type StagingManifest } from "./staging.ts";
 
 export type PublicationBoundary = "before_fsync" | "after_fsync" | "after_rename" | "before_cas" | "after_cas";
 
@@ -56,6 +58,23 @@ export function publishGeneration(opts: {
   const manifestPath = join(stagingDir, "manifest.json");
   if (lstatSync(manifestPath).isSymbolicLink() || !lstatSync(manifestPath).isFile()) throw new Error("unsafe publication manifest");
   if (createHash("sha256").update(readFileSync(manifestPath)).digest("hex") !== opts.manifestHash) throw new Error("publication manifest changed");
+  if (opts.lease.memoryVersion === "v2") {
+    const validated = validateV2Artifacts({ directory: stagingDir, snapshot: opts.snapshot });
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as StagingManifest;
+    const entries = (hashes: Record<string, string>) => Object.entries(hashes).sort(([a], [b]) => a.localeCompare(b));
+    const sources = [...opts.snapshot.sources].sort((a, b) => a.sourceId < b.sourceId ? -1 : a.sourceId > b.sourceId ? 1 : 0).map(source => [source.sourceId, source.extractionId,
+      evidencePath(source.sourceId, source.rolloutSlug), source.outputHash, source.cwd, source.workspaceKey]);
+    const notes = [...opts.snapshot.notes].sort((a, b) => a.noteId < b.noteId ? -1 : a.noteId > b.noteId ? 1 : 0).map(note => [note.noteId, notePath(note.noteId), note.textHash, note.scope]);
+    if (manifest.schemaVersion !== 1 || manifest.memoryVersion !== "v2" ||
+        manifest.selectionHash !== opts.snapshot.selectionHash || manifest.controlEpoch !== opts.snapshot.controlEpoch ||
+        manifest.promptHash !== opts.lease.promptHash || manifest.inputHash !== opts.inputHash ||
+        !manifest.fileHashes || JSON.stringify(entries(manifest.fileHashes)) !== JSON.stringify(entries(validated.fileHashes)) ||
+        !Array.isArray(manifest.sources) || JSON.stringify(manifest.sources.map(source =>
+          [source.sourceId, source.extractionId, source.path, source.outputHash, source.cwd, source.workspaceKey])) !== JSON.stringify(sources) ||
+        !Array.isArray(manifest.notes) || JSON.stringify(manifest.notes.map(note => [note.noteId, note.path, note.textHash, note.scope])) !== JSON.stringify(notes)) {
+      throw new Error("v2 publication manifest does not match validated selection");
+    }
+  }
   const generations = join(versionRoot, "generations");
   makeOwnedDirectory(generations, root);
   const path = join(generations, generationId);

@@ -2,9 +2,11 @@ import { constants, lstatSync, mkdirSync, openSync, closeSync, readFileSync, rea
 import { isAbsolute, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
+import type { MemoryVersion } from "../config.ts";
 import { Type } from "typebox";
 
-export const generatedOutput = (path: string): boolean => path === "MEMORY.md" || path === "memory_summary.md" || /^skills\/[a-z0-9][a-z0-9-]{0,63}\/SKILL\.md$/.test(path);
+export const generatedOutput = (path: string, memoryVersion: MemoryVersion = "v1"): boolean => path === "memory_summary.md" ||
+  (memoryVersion === "v1" && (path === "MEMORY.md" || /^skills\/[a-z0-9][a-z0-9-]{0,63}\/SKILL\.md$/.test(path)));
 
 /** Every existing component is inspected without following symbolic links. */
 export function safeWorkspacePath(directory: string, path: string, allowMissing = false): string {
@@ -87,7 +89,9 @@ function offset(value: unknown): number {
   return Number(value);
 }
 
-export function createWorkspaceTools(directory: string, options: { memoryVersion?: "v1"; responseBytes?: number } = {}): AgentTool[] {
+export function createWorkspaceTools(directory: string, options: { memoryVersion?: MemoryVersion; responseBytes?: number } = {}): AgentTool[] {
+  const memoryVersion = options.memoryVersion ?? "v1";
+  if (memoryVersion !== "v1" && memoryVersion !== "v2") throw new Error("invalid memory version");
   const responseBytes = options.responseBytes ?? 16_384;
   if (!Number.isInteger(responseBytes) || responseBytes < 256 || responseBytes > 16_384) throw new Error("invalid response byte cap");
   const result = (details: Record<string, unknown>) => {
@@ -114,7 +118,7 @@ export function createWorkspaceTools(directory: string, options: { memoryVersion
     },
   });
   const pathArg = Type.String({ minLength: 1 });
-  return [
+  const tools = [
     tool("workspace_list", "List bounded staged relative paths. Evidence and notes are read-only; absolute paths and symlinks are forbidden.", Type.Object({ path: Type.Optional(pathArg), cursor: Type.Optional(Type.String()), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })) }), (args) => {
       let files = workspaceInventory(directory);
       if (args.path !== undefined && args.path !== ".") {
@@ -146,15 +150,16 @@ export function createWorkspaceTools(directory: string, options: { memoryVersion
       });
       return paged(matches, offset(args.cursor), integer(args.maxResults, 20, 50));
     }),
-    tool("workspace_write", "Atomically replace MEMORY.md, memory_summary.md, or skills/<safe-lowercase-slug>/SKILL.md. Only prose outputs; evidence, notes, scripts and all other files are forbidden.", Type.Object({ path: pathArg, content: Type.String() }), (args) => {
-      if (typeof args.path !== "string" || !generatedOutput(args.path) || typeof args.content !== "string" || Buffer.byteLength(args.content) > 1024 * 1024) throw new Error("write outside output allowlist or exceeds byte cap");
+    tool("workspace_write", memoryVersion === "v2" ? "Atomically replace memory_summary.md only. Evidence, notes and all other staged files are read-only." : "Atomically replace MEMORY.md, memory_summary.md, or skills/<safe-lowercase-slug>/SKILL.md. Only prose outputs; evidence, notes, scripts and all other files are forbidden.", Type.Object({ path: pathArg, content: Type.String() }), (args) => {
+      if (typeof args.path !== "string" || !generatedOutput(args.path, memoryVersion) || typeof args.content !== "string" || Buffer.byteLength(args.content) > 1024 * 1024) throw new Error("write outside output allowlist or exceeds byte cap");
       atomicWorkspaceWrite(directory, args.path, args.content);
       return { path: args.path, written: true };
     }),
-    tool("workspace_delete", "Delete only optional skills/<safe-lowercase-slug>/SKILL.md prose outputs. Required summaries, handbook, evidence and notes cannot be deleted.", Type.Object({ path: pathArg }), (args) => {
+  ];
+  if (memoryVersion === "v1") tools.push(tool("workspace_delete", "Delete only optional skills/<safe-lowercase-slug>/SKILL.md prose outputs. Required summaries, handbook, evidence and notes cannot be deleted.", Type.Object({ path: pathArg }), (args) => {
       if (typeof args.path !== "string" || !args.path.startsWith("skills/") || !generatedOutput(args.path)) throw new Error("delete outside optional procedure allowlist");
       unlinkSync(safeWorkspacePath(directory, args.path));
       return { path: args.path, deleted: true };
-    }),
-  ];
+    }));
+  return tools;
 }

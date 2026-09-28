@@ -1,11 +1,15 @@
 import { readFileSync } from "node:fs";
 import type { MemoryReadView } from "./view.ts";
 
-const guidance = readFileSync(new URL("../../prompts/pi/v1/read_path.md", import.meta.url), "utf8");
+const guidance = {
+  v1: readFileSync(new URL("../../prompts/pi/v1/read_path.md", import.meta.url), "utf8"),
+  v2: readFileSync(new URL("../../prompts/pi/v2/read_path.md", import.meta.url), "utf8"),
+};
 
 export function renderMemorySection(view: MemoryReadView, cwd: string): string {
-  const applicability = view.applicability.includes(cwd) ? "includes the current workspace" : "check each task group's scope before applying";
-  return guidance
+  const applicability = view.applicability.includes(cwd) ? "includes the current workspace" :
+    view.memoryVersion === "v1" ? "check each task group's scope before applying" : "check each route's project scope before applying";
+  return guidance[view.memoryVersion]
     .replace("{{ memory_version }}", view.memoryVersion)
     .replace("{{ generation_id }}", JSON.stringify(view.generationId))
     .replace("{{ base_path }}", JSON.stringify(view.directory))

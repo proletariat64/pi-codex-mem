@@ -1,5 +1,9 @@
 # v1 Prompt Adaptations — Change Log
 
+The shared runtime renderer now replaces upstream `thread_id=` example labels with
+Pi `session_key=`. Its revision is included in the writer prompt hash; upstream files
+remain unchanged.
+
 Adapted prompts derived from `prompts/upstream/v1/` live in this directory. Every adapted file must be recorded here and in `UPSTREAM.md` (adaptation log): source file, adapted destination, and a description of every change.
 
 ## Issue #7 — consolidation and published-summary reading

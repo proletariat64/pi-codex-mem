@@ -34,6 +34,27 @@ test("writer tools restrict writes and deletion while reading Unicode evidence i
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test("v2 writer exposes only four tools and can replace only its compact summary", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "memory-v2-tools-"));
+  try {
+    mkdirSync(join(dir, "rollout_summaries"));
+    mkdirSync(join(dir, "notes"));
+    writeFileSync(join(dir, "rollout_summaries", "source.md"), "用户选择 TypeScript\n");
+    writeFileSync(join(dir, "notes", "note.md"), "Answer in Chinese.\n");
+    const tools = createWorkspaceTools(dir, { memoryVersion: "v2" });
+    assert.deepEqual(tools.map((tool) => tool.name), ["workspace_list", "workspace_read", "workspace_search", "workspace_write"]);
+    const write = tools.find((tool) => tool.name === "workspace_write")!;
+    await write.execute("write", { path: "memory_summary.md", content: "v1\n" });
+    assert.equal(readFileSync(join(dir, "memory_summary.md"), "utf8"), "v1\n");
+    for (const path of ["MEMORY.md", "raw_memories.md", "skills/safe/SKILL.md", "rollout_summaries/source.md", "notes/note.md", "manifest.json", "../memory_summary.md", "/tmp/memory_summary.md"]) {
+      await assert.rejects(write.execute("write", { path, content: "blocked" }));
+    }
+    const read = tools.find((tool) => tool.name === "workspace_read")!;
+    assert.match(JSON.stringify(await read.execute("read", { path: "notes/note.md" })), /Answer in Chinese/);
+    assert.doesNotMatch(write.description, /MEMORY\.md|skills/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("workspace pages enforce response byte caps and retain Unicode across paginated reads", async () => {
   const dir = mkdtempSync(join(tmpdir(), "memory-pages-"));
   try {

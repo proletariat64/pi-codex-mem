@@ -8,7 +8,7 @@ import { getPublishedGeneration } from "../store/consolidation.ts";
 import { validateSummaryFormat } from "../pipeline/artifacts.ts";
 
 export interface MemoryReadView {
-  memoryVersion: "v1";
+  memoryVersion: MemoryVersion;
   generationId: string;
   directory: string;
   controlEpoch: number;
@@ -23,7 +23,6 @@ const hash = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex")
 export function acquireReadView(input: {
   db: DatabaseSync; root: string; memoryVersion: MemoryVersion; now?: number; summaryBytes?: number; maxUnusedDays?: number;
 }): MemoryReadView | null {
-  if (input.memoryVersion !== "v1") return null;
   const started = performance.now();
   try {
     const generation = getPublishedGeneration(input.db, input.memoryVersion, input.now ?? Date.now(),
@@ -52,20 +51,22 @@ export function acquireReadView(input: {
       memoryVersion?: unknown; controlEpoch?: unknown; fileHashes?: Record<string, string>;
       sources?: Array<{ cwd?: unknown }>;
     };
-    if (manifest.memoryVersion !== "v1" || manifest.controlEpoch !== generation.controlEpoch || !manifest.fileHashes) return null;
+    if (manifest.memoryVersion !== input.memoryVersion || manifest.controlEpoch !== generation.controlEpoch || !manifest.fileHashes) return null;
     const maximum = Math.min(9_999, input.summaryBytes ?? 9_999);
     const summaryBytes = read("memory_summary.md", maximum);
     if (hash(summaryBytes) !== manifest.fileHashes["memory_summary.md"]) return null;
     const summary = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(summaryBytes);
     validateSummaryFormat(summary, maximum);
-    const handbook = lstatSync(join(expected, "MEMORY.md"));
-    if (handbook.isSymbolicLink() || !handbook.isFile()) return null;
+    if (input.memoryVersion === "v1") {
+      const handbook = lstatSync(join(expected, "MEMORY.md"));
+      if (handbook.isSymbolicLink() || !handbook.isFile()) return null;
+    }
     if (performance.now() - started > 200) return null;
     // Epoch/retention can change while reading files; do not serve a stale cache.
-    const latest = getPublishedGeneration(input.db, "v1", input.now ?? Date.now(),
+    const latest = getPublishedGeneration(input.db, input.memoryVersion, input.now ?? Date.now(),
       { maxUnusedDays: input.maxUnusedDays });
     if (latest?.generationId !== generation.generationId || latest.controlEpoch !== generation.controlEpoch) return null;
-    return { memoryVersion: "v1", generationId: generation.generationId, directory: expected,
+    return { memoryVersion: input.memoryVersion, generationId: generation.generationId, directory: expected,
       controlEpoch: generation.controlEpoch, summary, retentionDeadline: generation.retentionDeadline,
       applicability: [...new Set((manifest.sources ?? []).flatMap((source) => typeof source.cwd === "string" ? [source.cwd] : []))] };
   } catch { return null; }

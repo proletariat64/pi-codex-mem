@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import type { ConsolidationSnapshot } from "../store/consolidation.ts";
+import type { MemoryVersion } from "../config.ts";
 import { renderSelectedEvidence } from "./artifacts.ts";
 import { generatedOutput, readWorkspaceUtf8, safeWorkspacePath, workspaceInventory } from "./workspace-tools.ts";
 
@@ -12,7 +13,7 @@ export const notePath = (noteId: string): string => `notes/${safeId(noteId)}.md`
 
 export interface StagingManifest {
   schemaVersion: 1;
-  memoryVersion: "v1";
+  memoryVersion: MemoryVersion;
   selectionHash: string;
   controlEpoch: number;
   promptHash: string;
@@ -39,10 +40,16 @@ function priorFiles(directory: string | undefined, snapshot: ConsolidationSnapsh
   let manifest: StagingManifest | null = null;
   if (!directory) return { files, paths, manifest, valid: false };
   try {
+    manifest = JSON.parse(readWorkspaceUtf8(directory, "manifest.json")) as StagingManifest;
+    if (manifest.memoryVersion !== snapshot.memoryVersion) return { files, paths: [], manifest: null, valid: false };
     const inventory = workspaceInventory(directory);
     paths = inventory.filter((path) => path !== "manifest.json" && path !== "phase2_workspace_diff.md");
-    manifest = JSON.parse(readWorkspaceUtf8(directory, "manifest.json")) as StagingManifest;
-    if (manifest.schemaVersion !== 1 || manifest.memoryVersion !== "v1" || !manifest.fileHashes || !Array.isArray(manifest.sources) || !Array.isArray(manifest.notes)) {
+    if (snapshot.memoryVersion === "v2") {
+      const allowed = (path: string): boolean => path === "memory_summary.md" || /^(?:rollout_summaries|notes)\/[A-Za-z0-9_-]+\.md$/.test(path);
+      const filtered = paths.filter(allowed);
+      if (filtered.length !== paths.length) return { files, paths: filtered, manifest: null, valid: false };
+    }
+    if (manifest.schemaVersion !== 1 || !manifest.fileHashes || !Array.isArray(manifest.sources) || !Array.isArray(manifest.notes)) {
       return { files, paths, manifest: null, valid: false };
     }
     // Never read prior learning/evidence once its backing source/note or epoch is revoked.
@@ -98,12 +105,13 @@ export function workspaceDiff(prior: Map<string, string>, next: Map<string, stri
 
 export function buildStaging(options: { root: string; jobId: string; snapshot: ConsolidationSnapshot; promptHash: string; summaryBytes?: number; priorDir?: string }): StagedWorkspace {
   const { root, snapshot, promptHash } = options;
-  if (snapshot.memoryVersion !== "v1") throw new Error("v1 staging requires v1 snapshot");
+  const memoryVersion = snapshot.memoryVersion;
+  if (memoryVersion !== "v1" && memoryVersion !== "v2") throw new Error("invalid staging memory version");
   if (!/^[A-Za-z0-9_-]{1,160}$/.test(options.jobId)) throw new Error("unsafe staging job ID");
-  const directory = join(root, "versions", "v1", "staging", options.jobId);
+  const directory = join(root, "versions", memoryVersion, "staging", options.jobId);
   // Check each root-relative component before recursive creation.
-  safeWorkspacePath(root, `versions/v1/staging/${options.jobId}`, true);
-  mkdirSync(safeWorkspacePath(root, "versions/v1/staging", true), { recursive: true, mode: 0o700 });
+  safeWorkspacePath(root, `versions/${memoryVersion}/staging/${options.jobId}`, true);
+  mkdirSync(safeWorkspacePath(root, `versions/${memoryVersion}/staging`, true), { recursive: true, mode: 0o700 });
   mkdirSync(directory, { recursive: false, mode: 0o700 });
   const sources = [...snapshot.sources].sort((a, b) => a.sourceId < b.sourceId ? -1 : a.sourceId > b.sourceId ? 1 : 0);
   const notes = [...snapshot.notes].sort((a, b) => a.noteId < b.noteId ? -1 : a.noteId > b.noteId ? 1 : 0);
@@ -114,7 +122,7 @@ export function buildStaging(options: { root: string; jobId: string; snapshot: C
     files.set(path, renderSelectedEvidence(source));
     return { sourceId: source.sourceId, extractionId: source.extractionId, path, outputHash: source.outputHash, cwd: source.cwd, workspaceKey: source.workspaceKey };
   });
-  files.set("raw_memories.md", sources.map((source) => `# Source: ${source.sourceId}\nrollout_summary: ${evidencePath(source.sourceId, source.rolloutSlug)}\ncwd: ${source.cwd}\n\n${source.rawMemory ?? ""}\n`).join("\n"));
+  if (memoryVersion === "v1") files.set("raw_memories.md", sources.map((source) => `# Source: ${source.sourceId}\nrollout_summary: ${evidencePath(source.sourceId, source.rolloutSlug)}\ncwd: ${source.cwd}\n\n${source.rawMemory ?? ""}\n`).join("\n"));
   const noteManifest = notes.map((note) => {
     const relativePath = relative(resolve(root), resolve(root, note.textPath)).split("\\").join("/");
     const text = readWorkspaceUtf8(root, relativePath);
@@ -124,11 +132,20 @@ export function buildStaging(options: { root: string; jobId: string; snapshot: C
     files.set(path, text);
     return { noteId: note.noteId, path, textHash: note.textHash, scope: note.scope };
   });
-  const contentKey = textHash(JSON.stringify({ memoryVersion: "v1", selectionHash: snapshot.selectionHash, sourceHashes: sourceManifest, notes: noteManifest, promptHash, controlEpoch: snapshot.controlEpoch, summaryBytes: options.summaryBytes ?? 9999 }));
-  const prior = priorFiles(options.priorDir, snapshot, sourceManifest, noteManifest);
+  const contentKey = textHash(JSON.stringify({ memoryVersion, selectionHash: snapshot.selectionHash, sourceHashes: sourceManifest, notes: noteManifest, promptHash, controlEpoch: snapshot.controlEpoch, summaryBytes: options.summaryBytes ?? 9999 }));
+  let priorDir = options.priorDir;
+  if (priorDir) {
+    const priorRelative = relative(resolve(root), resolve(priorDir)).split("\\").join("/");
+    if (!new RegExp(`^versions/${memoryVersion}/(?:generations|staging)/[A-Za-z0-9_-]+$`).test(priorRelative)) priorDir = undefined;
+    else {
+      try { safeWorkspacePath(root, priorRelative); }
+      catch { priorDir = undefined; }
+    }
+  }
+  const prior = priorFiles(priorDir, snapshot, sourceManifest, noteManifest);
   const supportRetained = prior.valid;
-  if (supportRetained) for (const [path, text] of prior.files) if (generatedOutput(path)) files.set(path, text);
-  const outputHashes = Object.fromEntries([...files].filter(([path]) => generatedOutput(path)).map(([path, text]) => [path, textHash(text)]));
+  if (supportRetained) for (const [path, text] of prior.files) if (generatedOutput(path, memoryVersion)) files.set(path, text);
+  const outputHashes = Object.fromEntries([...files].filter(([path]) => generatedOutput(path, memoryVersion)).map(([path, text]) => [path, textHash(text)]));
   const inputHash = textHash(JSON.stringify({ contentKey, outputHashes }));
   const privacyFallback = Boolean(options.priorDir && !prior.valid);
   const diff = privacyFallback ? { text: changedPathIndex(prior.paths, prior.manifest?.fileHashes ?? {}, files), fallback: true } : workspaceDiff(prior.files, files);
@@ -137,11 +154,11 @@ export function buildStaging(options: { root: string; jobId: string; snapshot: C
     const absolute = safeWorkspacePath(directory, path, true);
     const parent = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : null;
     if (parent) mkdirSync(safeWorkspacePath(directory, parent, true), { recursive: true, mode: 0o700 });
-    writeFileSync(absolute, text, { flag: "wx", mode: generatedOutput(path) || path === "phase2_workspace_diff.md" ? 0o600 : 0o400 });
+    writeFileSync(absolute, text, { flag: "wx", mode: generatedOutput(path, memoryVersion) || path === "phase2_workspace_diff.md" ? 0o600 : 0o400 });
   }
-  const manifest: StagingManifest = { schemaVersion: 1, memoryVersion: "v1", selectionHash: snapshot.selectionHash, controlEpoch: snapshot.controlEpoch, promptHash, inputHash, contentKey, retentionDeadline: snapshot.retentionDeadline, sources: sourceManifest, notes: noteManifest, fileHashes: {}, ...(diff.fallback ? { diffFallbackReason: privacyFallback ? "privacy_or_retention" as const : "size" as const } : {}) };
+  const manifest: StagingManifest = { schemaVersion: 1, memoryVersion, selectionHash: snapshot.selectionHash, controlEpoch: snapshot.controlEpoch, promptHash, inputHash, contentKey, retentionDeadline: snapshot.retentionDeadline, sources: sourceManifest, notes: noteManifest, fileHashes: {}, ...(diff.fallback ? { diffFallbackReason: privacyFallback ? "privacy_or_retention" as const : "size" as const } : {}) };
   // Host-owned note IDs and applicability are available before the model writes claims.
   // Workspace tools can read the manifest but cannot replace it.
   writeFileSync(safeWorkspacePath(directory, "manifest.json", true), JSON.stringify(manifest, null, 2) + "\n", { flag: "wx", mode: 0o600 });
-  return { directory, inputHash, manifest, diffFallback: diff.fallback, unchanged: Boolean(supportRetained && prior.manifest?.contentKey === contentKey && files.has("MEMORY.md") && files.has("memory_summary.md")) };
+  return { directory, inputHash, manifest, diffFallback: diff.fallback, unchanged: Boolean(supportRetained && prior.manifest?.contentKey === contentKey && (memoryVersion === "v2" || files.has("MEMORY.md")) && files.has("memory_summary.md")) };
 }

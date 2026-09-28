@@ -15,7 +15,7 @@ const PATTERNS: RegExp[] = [
 ];
 
 /** Replace recognized secret shapes with [REDACTED]. */
-const SECRET_QUERY_KEY = /^(?:x-amz-(?:signature|credential|security-token|algorithm)|x-goog-(?:signature|credential)|signature|sig|se|sp|sv|token|access_token|auth|api[_-]?key|key)$/i;
+const SECRET_QUERY_KEY = /^(?:x-amz-(?:signature|credential|security-token|algorithm)|x-goog-(?:signature|credential)|signature|sharedaccesssignature|sig|se|sp|sv|token|(?:access|refresh|id|session)[_-]?token|client[_-]?secret|private[_-]?key|password|authorization|auth|api[_-]?key|key)$/i;
 
 export function redactSensitive(text: string): string {
   // Preserve the useful host/path but never persist signed or access-bearing

@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { chmodSync, existsSync, linkSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 /**
@@ -16,17 +16,26 @@ export function writeSnapshotFile(
 ): { path: string; hash: string } {
   const content = JSON.stringify(snapshot, null, 2) + "\n";
   const hash = createHash("sha256").update(content).digest("hex");
-  const dir = join(root, "sources", lineageKey);
+  const sources = join(root, "sources");
+  const dir = join(sources, lineageKey);
   const path = join(dir, `${revisionHash}.json`);
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  // Never follow an existing sources/lineage symlink into an unrelated tree.
+  if (existsSync(sources) && lstatSync(sources).isSymbolicLink()) throw new Error("sources symlink rejected");
+  mkdirSync(sources, { recursive: true, mode: 0o700 });
+  if (lstatSync(sources).isSymbolicLink()) throw new Error("sources symlink rejected");
+  if (existsSync(dir) && lstatSync(dir).isSymbolicLink()) throw new Error("lineage symlink rejected");
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  if (lstatSync(dir).isSymbolicLink()) throw new Error("lineage symlink rejected");
 
   if (existsSync(path)) {
+    if (lstatSync(path).isSymbolicLink()) throw new Error("snapshot symlink rejected");
     const existing = createHash("sha256").update(readFileSync(path)).digest("hex");
     if (existing !== hash) {
       throw new Error(`snapshot ${path} is immutable: content differs for the same revision hash`);
     }
     return { path, hash }; // idempotent rewrite
   }
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
   // Enforce privacy even for directories created by older configurations.
   chmodSync(root, 0o700);
   chmodSync(join(root, "sources"), 0o700);

@@ -1,5 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
-import { chmodSync, mkdirSync, realpathSync, unlinkSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, realpathSync, unlinkSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 import type { WorkspaceIdentity } from "../identity.ts";
 
@@ -30,7 +30,8 @@ export interface SnapshotRecord {
     sourceTime: number;
   };
   capturedAt: number;
-  privacyEdit?: boolean;
+  revokedSourceIds?: string[];
+  evidenceRemoved?: boolean;
 }
 
 const SCHEMA_VERSION = 2;
@@ -143,15 +144,58 @@ export function openStateDb(root: string): DatabaseSync {
     }
   }
   prunePrivacyRevoked(db, root);
+  sweepOrphanSnapshots(db, root);
   return db;
 }
 
+/**
+ * Crash after file creation but before SQLite commit leaves an unindexed
+ * snapshot. Writers hold the same BEGIN IMMEDIATE lock through file+DB
+ * publication, so this sweep cannot mistake an in-flight snapshot for an
+ * orphan. Only extension-shaped filenames under non-symlink directories
+ * are eligible for deletion.
+ */
+function sweepOrphanSnapshots(db: DatabaseSync, root: string): void {
+  const sources = join(root, "sources");
+  if (!existsSync(sources)) return;
+  if (lstatSync(sources).isSymbolicLink()) throw new Error("sources symlink rejected during orphan sweep");
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const paths = db.prepare("SELECT snapshot_path FROM source_revisions").all() as { snapshot_path: string }[];
+    const indexed = new Set(paths.map((row) => {
+      try { return realpathSync(row.snapshot_path); } catch { return resolve(row.snapshot_path); }
+    }));
+    for (const lineage of readdirSync(sources)) {
+      if (!/^[a-f0-9]{64}$/.test(lineage)) continue;
+      const dir = join(sources, lineage);
+      if (lstatSync(dir).isSymbolicLink()) throw new Error("lineage symlink rejected during orphan sweep");
+      if (!lstatSync(dir).isDirectory()) continue;
+      for (const name of readdirSync(dir)) {
+        const file = join(dir, name);
+        if (/^\.snapshot-[a-f0-9]{24}\.tmp$/.test(name)) {
+          unlinkSync(file); // interrupted atomic staging file
+        } else if (/^[a-f0-9]{64}\.json$/.test(name)) {
+          if (lstatSync(file).isSymbolicLink()) throw new Error("snapshot symlink rejected during orphan sweep");
+          if (!indexed.has(realpathSync(file))) unlinkSync(file);
+        }
+      }
+    }
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
+}
+
 /** Retry removal after a crash between DB revocation and filesystem cleanup. */
-function prunePrivacyRevoked(db: DatabaseSync, root: string): void {
+export function prunePrivacyRevoked(db: DatabaseSync, root: string): void {
   const rows = db.prepare("SELECT snapshot_path FROM source_revisions WHERE status = 'privacy_revoked'")
     .all() as { snapshot_path: string }[];
   if (rows.length === 0) return;
-  const sources = realpathSync(join(root, "sources"));
+  const sourceDir = join(root, "sources");
+  if (!existsSync(sourceDir)) return; // already removed by an earlier cleanup
+  if (lstatSync(sourceDir).isSymbolicLink()) throw new Error("sources symlink rejected during privacy cleanup");
+  const sources = realpathSync(sourceDir);
   for (const row of rows) {
     const path = resolve(row.snapshot_path);
     if (!/^[a-f0-9]{64}\.json$/.test(path.split(sep).at(-1) ?? "")) {
@@ -174,9 +218,9 @@ function blockBothViews(db: DatabaseSync, reason: string): void {
 }
 
 /** Transactionally record a captured snapshot (R01). Idempotent per revision. */
-export function recordSnapshot(db: DatabaseSync, rec: SnapshotRecord, root?: string): void {
-  if (rec.privacyEdit && !root) throw new Error("privacy revocation requires the owned memory root");
-  db.exec("BEGIN");
+export function recordSnapshot(db: DatabaseSync, rec: SnapshotRecord, root?: string, transactionOwned = false): void {
+  if (rec.revokedSourceIds?.length && !root) throw new Error("privacy revocation requires the owned memory root");
+  if (!transactionOwned) db.exec("BEGIN IMMEDIATE");
   try {
     db.prepare(
       `INSERT INTO workspaces (workspace_key, repo_key, checkout_key, cwd, git_branch, git_head, updated_at)
@@ -255,20 +299,21 @@ export function recordSnapshot(db: DatabaseSync, rec: SnapshotRecord, root?: str
     // brought back by branch reactivation).
     db.prepare("UPDATE source_revisions SET status = 'captured' WHERE source_id = ? AND status != 'privacy_revoked'")
       .run(rec.revision.sourceId);
-    if (rec.privacyEdit) {
-      db.prepare(
-        `UPDATE source_revisions SET status = 'privacy_revoked'
-         WHERE session_key = ? AND branch_id = ? AND source_id != ? AND status = 'superseded'`,
-      ).run(rec.session.sessionKey, rec.session.branchId, rec.revision.sourceId);
-      blockBothViews(db, "context_edit");
+    for (const sourceId of rec.revokedSourceIds ?? []) {
+      db.prepare("UPDATE source_revisions SET status = 'privacy_revoked' WHERE source_id = ? AND source_id != ?")
+        .run(sourceId, rec.revision.sourceId);
+    }
+    if (rec.revokedSourceIds?.length || rec.evidenceRemoved) {
+      blockBothViews(db, rec.revokedSourceIds?.length ? "context_edit" : "evidence_removed");
     }
 
-    db.exec("COMMIT");
-    if (rec.privacyEdit) prunePrivacyRevoked(db, root!);
+    if (!transactionOwned) db.exec("COMMIT");
   } catch (err) {
-    db.exec("ROLLBACK");
+    if (!transactionOwned) db.exec("ROLLBACK");
     throw err;
   }
+  // An external owner performs post-commit cleanup after its own COMMIT.
+  if (!transactionOwned && rec.revokedSourceIds?.length) prunePrivacyRevoked(db, root!);
 }
 
 /** §5.3: on session_tree, retire every head except the active one. */

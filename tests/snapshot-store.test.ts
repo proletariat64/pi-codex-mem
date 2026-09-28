@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openStateDb, recordSnapshot, retireOtherHeads, type SnapshotRecord } from "../src/store/db.ts";
@@ -59,6 +59,23 @@ test("writeSnapshotFile writes sources/<lineage>/<revision>.json with mode 0600"
   assert.match(hash, /^[0-9a-f]{64}$/);
   assert.equal(statSync(path).mode & 0o777, 0o600);
   assert.equal(statSync(join(root, "sources", "l".repeat(64))).mode & 0o777, 0o700);
+});
+
+test("a pre-existing sources symlink is rejected before any snapshot bytes escape", (t) => {
+  const root = makeRoot(t);
+  const outside = makeRoot(t);
+  symlinkSync(outside, join(root, "sources"), "dir");
+  assert.throws(() => writeSnapshotFile(root, "l".repeat(64), "v".repeat(64), { private: "value" }), /symlink|sources/i);
+  assert.deepEqual(readdirSync(outside), [], "outside remains untouched");
+});
+
+test("opening state removes an unindexed complete snapshot orphan after crash", (t) => {
+  const root = makeRoot(t);
+  const saved = writeSnapshotFile(root, "b".repeat(64), "a".repeat(64), { private: "crash orphan" });
+  assert.equal(existsSync(saved.path), true);
+  const db = openStateDb(root);
+  db.close();
+  assert.equal(existsSync(saved.path), false, "unindexed snapshot removed before it can be served");
 });
 
 test("snapshot files are immutable: same content ok, different content rejected (§7.1)", (t) => {

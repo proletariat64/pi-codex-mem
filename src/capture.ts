@@ -9,7 +9,7 @@ import {
   computeWorkspaceIdentity,
 } from "./identity.ts";
 import { applyContextEdits, normalizeEvidence, NORMALIZATION_POLICY_VERSION, type NormalizeLimits } from "./snapshot.ts";
-import { recordSnapshot } from "./store/db.ts";
+import { prunePrivacyRevoked, recordSnapshot } from "./store/db.ts";
 import { writeSnapshotFile } from "./store/snapshot-files.ts";
 
 /** Capture plain branch values immediately; never retain a pi context for queued work (§6.1). */
@@ -115,15 +115,40 @@ export function captureSettledSession(input: CaptureInput): CaptureResult {
      JOIN source_revisions r ON r.source_id = h.latest_revision
      WHERE h.session_key = ? AND h.branch_id = ?`,
   ).get(sessionKey, branchId) as { source_id: string; snapshot_path: string } | undefined;
-  let priorEditHash: string | undefined;
-  if (current) {
+  type PriorRow = { source_id: string; snapshot_path: string; session_key: string };
+  let priorRows: PriorRow[] = [];
+  if (edits.length) {
+    priorRows = input.db.prepare(
+      "SELECT source_id, snapshot_path, session_key FROM source_revisions WHERE status != 'privacy_revoked' AND source_id != ?",
+    ).all(sourceId) as PriorRow[];
+  } else if (current && current.source_id !== sourceId) {
+    priorRows = [{ ...current, session_key: sessionKey }];
+  }
+  const targetIds = new Set(edits.map((e) => (e as { targetId: string }).targetId));
+  const revokedSourceIds: string[] = [];
+  let evidenceRemoved = false;
+  for (const row of priorRows) {
+    let previous: { items: typeof normalized.items };
     try {
-      priorEditHash = (JSON.parse(readFileSync(current.snapshot_path, "utf8")) as { contextEditHash?: string }).contextEditHash;
+      previous = JSON.parse(readFileSync(row.snapshot_path, "utf8")) as { items: typeof normalized.items };
     } catch {
-      // Missing prior snapshot: treat an edit as privacy-sensitive.
+      // If an earlier selected snapshot is unavailable, the read side must
+      // not assume its generated conclusions remain valid.
+      if (row.source_id === current?.source_id) evidenceRemoved = true;
+      if (row.session_key === sessionKey && targetIds.size) revokedSourceIds.push(row.source_id);
+      continue;
+    }
+    const now = (prior: typeof normalized.items[number]) => normalized.items.find((item) =>
+      item.entryId === prior.entryId && item.role === prior.role && item.toolCallId === prior.toolCallId);
+    if (row.source_id === current?.source_id && previous.items.some((item) => now(item)?.text !== item.text)) {
+      evidenceRemoved = true;
+    }
+    // Context edits are branch-local for projection, but revocation of
+    // copied target text must cover every older snapshot containing it.
+    if (targetIds.size && previous.items.some((item) => targetIds.has(item.entryId) && now(item)?.text !== item.text)) {
+      revokedSourceIds.push(row.source_id);
     }
   }
-  const privacyEdit = Boolean(current && current.source_id !== sourceId && edits.length > 0 && priorEditHash !== contextEditHash);
   const existing = input.db.prepare("SELECT status FROM source_revisions WHERE source_id = ?")
     .get(sourceId) as { status: string } | undefined;
   if (existing?.status === "privacy_revoked") {
@@ -154,28 +179,41 @@ export function captureSettledSession(input: CaptureInput): CaptureResult {
       entryIds: normalized.omissions.map((item) => item.entryId),
     },
   };
-  const saved = writeSnapshotFile(input.root, lineageKey, revisionHash, snapshot);
-  recordSnapshot(input.db, {
-    workspace,
-    session: {
-      sessionKey,
-      path: file,
-      headerId: header.id,
-      parentKey: parent?.session_key ?? null,
-      branchId,
-      mode: input.mode,
-    },
-    revision: {
-      sourceId,
-      lineageKey,
-      revisionHash,
-      leafId: leaf,
-      snapshotPath: saved.path,
-      snapshotHash: saved.hash,
-      sourceTime,
-    },
-    capturedAt: Date.now(),
-    privacyEdit,
-  }, input.root);
+  // Hold the SQLite write lock across both file creation and row publication.
+  // Startup orphan cleanup takes the same lock, so it cannot remove a file
+  // that another process is about to index.
+  input.db.exec("BEGIN IMMEDIATE");
+  let saved: ReturnType<typeof writeSnapshotFile>;
+  try {
+    saved = writeSnapshotFile(input.root, lineageKey, revisionHash, snapshot);
+    recordSnapshot(input.db, {
+      workspace,
+      session: {
+        sessionKey,
+        path: file,
+        headerId: header.id,
+        parentKey: parent?.session_key ?? null,
+        branchId,
+        mode: input.mode,
+      },
+      revision: {
+        sourceId,
+        lineageKey,
+        revisionHash,
+        leafId: leaf,
+        snapshotPath: saved.path,
+        snapshotHash: saved.hash,
+        sourceTime,
+      },
+      capturedAt: Date.now(),
+      revokedSourceIds,
+      evidenceRemoved,
+    }, input.root, true);
+    input.db.exec("COMMIT");
+  } catch (err) {
+    input.db.exec("ROLLBACK");
+    throw err;
+  }
+  if (revokedSourceIds.length) prunePrivacyRevoked(input.db, input.root);
   return { status: "captured", sessionKey, branchId, sourceId, snapshotPath: saved.path };
 }

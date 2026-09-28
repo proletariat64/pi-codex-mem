@@ -157,6 +157,50 @@ test("context edit removes sensitive evidence, supersedes old revision, and neve
   db.close();
 });
 
+test("budget-driven removal of previously captured evidence blocks derived views", async (t) => {
+  const { cwd, memoryRoot } = makeSandbox(t);
+  const mock = makeMockPi(); memoryExtension(mock.pi);
+  const entries: unknown[] = [userEntry("u1", "a".repeat(700))];
+  const ctx = { cwd, hasUI: false, mode: "tui", sessionManager: fakeSessionManager(cwd, entries),
+    modelRegistry: { find: () => ({}), streamSimple: () => ({}) }, ui: { notify: () => {} } };
+  await mock.fire("session_start", { type: "session_start" }, ctx);
+  const path = join(memoryRoot, "config.json");
+  const config = JSON.parse(readFileSync(path, "utf8"));
+  writeFileSync(path, JSON.stringify({ ...config, limits: { ...config.limits, inputBytes: 1024 } }));
+  await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
+  entries.push({ ...userEntry("u2", "b".repeat(700)), parentId: "u1" });
+  await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
+  const { DatabaseSync } = await import("node:sqlite");
+  const db = new DatabaseSync(join(memoryRoot, "state.sqlite"));
+  assert.equal((db.prepare("SELECT control_epoch FROM store_state").get() as { control_epoch: number }).control_epoch, 1);
+  assert.deepEqual((db.prepare("SELECT read_blocked FROM pipeline_state").all() as { read_blocked: number }[]).map((r) => r.read_blocked), [1, 1]);
+  db.close();
+});
+
+test("privacy edit revokes copied ancestor evidence on previously selected branches", async (t) => {
+  const { cwd, memoryRoot } = makeSandbox(t);
+  const mock = makeMockPi(); memoryExtension(mock.pi);
+  const entries: unknown[] = [userEntry("u1", "a private preference")];
+  const ctx = { cwd, hasUI: false, mode: "tui", sessionManager: fakeSessionManager(cwd, entries),
+    modelRegistry: { find: () => ({}), streamSimple: () => ({}) }, ui: { notify: () => {} } };
+  await mock.fire("session_start", { type: "session_start" }, ctx);
+  await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
+  await mock.fire("session_tree", { type: "session_tree", newLeafId: "u1", oldLeafId: "u1" }, ctx);
+  entries.push({ ...userEntry("u2", "new branch evidence"), parentId: "u1" });
+  await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
+  assert.equal(snapshotFiles(memoryRoot).length, 2);
+  entries.push({ type: "context_edit", id: "e1", parentId: "u2", targetId: "u1", replacement: null, timestamp: new Date().toISOString() });
+  await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
+  const files = snapshotFiles(memoryRoot);
+  assert.equal(files.length, 1, "both prior branches are erased from the extension store");
+  assert.ok(!readFileSync(files[0]!, "utf8").includes("a private preference"));
+  const { DatabaseSync } = await import("node:sqlite");
+  const db = new DatabaseSync(join(memoryRoot, "state.sqlite"));
+  const statuses = db.prepare("SELECT status FROM source_revisions").all() as { status: string }[];
+  assert.deepEqual(statuses.map((r) => r.status).sort(), ["captured", "privacy_revoked", "privacy_revoked"]);
+  db.close();
+});
+
 test("pre-compaction ancestry is captured but the derived summary is not counted twice (T07)", async (t) => {
   const { cwd, memoryRoot } = makeSandbox(t);
   const mock = makeMockPi(); memoryExtension(mock.pi);

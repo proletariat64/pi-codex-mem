@@ -88,19 +88,22 @@ test("own pi_memory messages and other extensions' custom messages excluded (§7
 });
 
 test("signed access URLs lose credential query while retaining safe path", () => {
-  const out = normalizeEvidence([userMsg("u1", "Download https://example.org/data?X-Amz-Signature=secret123&X-Amz-Credential=owner and read https://example.org/docs")]);
+  const out = normalizeEvidence([userMsg("u1", "Download https://example.org/data?X-Amz-Signature=secret123&X-Amz-Credential=owner and read https://example.org/docs plus https://example.org/callback?client_secret=abc123")]);
   assert.match(out.items[0]!.text, /https:\/\/example.org\/data\[REDACTED signed URL query\]/);
   assert.ok(!out.items[0]!.text.includes("secret123"));
+  assert.ok(!out.items[0]!.text.includes("abc123"));
   assert.match(out.items[0]!.text, /https:\/\/example.org\/docs/);
 });
 
-test("short user choice keeps its adjacent assistant question under a tight total budget", () => {
-  const out = normalizeEvidence([
-    assistantMsg("q1", [{ type: "text", text: "Should I use option 1 or option 2?" }]),
-    userMsg("a1", "use option 1"),
-    assistantMsg("other", [{ type: "text", text: "a long unrelated conclusion that should lose priority" }]),
-  ], { limits: { itemBytes: 256, toolResultBytes: 256, totalBytes: 54 } });
-  assert.deepEqual(out.items.map((i) => i.sourceId), ["q1", "a1"]);
+test("short user replies keep their adjacent assistant question under a tight budget", () => {
+  for (const reply of ["use option 1", "2", "sure"]) {
+    const out = normalizeEvidence([
+      assistantMsg("q1", [{ type: "text", text: "Should I use option 1 or option 2?" }]),
+      userMsg("a1", reply),
+      assistantMsg("other", [{ type: "text", text: "a long unrelated conclusion that should lose priority" }]),
+    ], { limits: { itemBytes: 256, toolResultBytes: 256, totalBytes: 54 } });
+    assert.deepEqual(out.items.map((i) => i.sourceId), ["q1", "a1"], reply);
+  }
 });
 
 test("redaction precedes truncation so cut-off secret prefixes cannot leak", () => {
@@ -109,6 +112,17 @@ test("redaction precedes truncation so cut-off secret prefixes cannot leak", () 
     { limits: { itemBytes: 40, toolResultBytes: 40, totalBytes: 100 } });
   assert.ok(!out.items[0]!.text.includes("sk-"));
   assert.ok(Buffer.byteLength(out.items[0]!.text, "utf8") <= 40);
+});
+
+test("own pi_memory tool calls and retrieval results cannot reinforce memory (T15)", () => {
+  const out = normalizeEvidence([
+    assistantMsg("a1", [{ type: "toolCall", id: "m1", name: "pi_memory_search", arguments: { query: "old memory" } }]),
+    toolResultMsg("r1", "retrieved prior private guidance"),
+    userMsg("u1", "fresh user evidence"),
+  ].map((e) => e.id === "r1" ? { ...e, message: { ...e.message, toolName: "pi_memory_search" } } as typeof e : e));
+  assert.deepEqual(out.items.map((i) => i.sourceId), ["u1"]);
+  assert.ok(out.omissions.some((o) => o.entryId === "a1" && o.reason.includes("own-memory")));
+  assert.ok(out.omissions.some((o) => o.entryId === "r1" && o.reason.includes("own-memory")));
 });
 
 test("assistant prose and tool calls retain distinct roles and bounds", () => {

@@ -162,6 +162,10 @@ export function normalizeEvidence(
           ? claimedOrigin : "unknown";
         candidates.push({ ...base, role: "user", text: t.text, origin, isError: false, truncated: t.truncated });
       } else if (m.role === "assistant") {
+        if (blocks.some((b) => b.type === "toolCall" && (b.name === "pi_memory" || b.name?.startsWith("pi_memory_")))) {
+          omissions.push({ entryId: e.id, reason: "own-memory-tool-call-excluded" });
+          continue;
+        }
         const visible = blocks.filter((b) => b.type !== "toolCall");
         const text = renderBlocks(visible, "assistant").join("\n");
         if (text) {
@@ -177,6 +181,10 @@ export function normalizeEvidence(
           omissions.push({ entryId: e.id, reason: blocks.some((b) => b.type === "thinking") ? "reasoning-excluded" : "empty-after-filtering" });
         }
       } else if (m.role === "toolResult") {
+        if (m.toolName === "pi_memory" || m.toolName?.startsWith("pi_memory_")) {
+          omissions.push({ entryId: e.id, reason: "own-memory-tool-result-excluded" });
+          continue;
+        }
         const text = renderBlocks(blocks, "tool").join("\n");
         if (text === "") {
           omissions.push({ entryId: e.id, reason: "empty-after-filtering" });
@@ -223,8 +231,7 @@ export function normalizeEvidence(
       if (selected.has(item)) continue;
       const index = candidates.indexOf(item);
       const previous = candidates[index - 1];
-      const dependsOnQuestion = item.role === "user" && item.text.length <= 128 &&
-        /^\s*(?:use|choose|pick|option\s+\d|yes\b|no\b|the\s+(?:first|second)|that one)\b/i.test(item.text) &&
+      const dependsOnQuestion = item.role === "user" && Buffer.byteLength(item.text, "utf8") <= 128 &&
         previous && (previous.role === "assistant" || previous.role === "user") && previous.text.includes("?");
       // A short reply without its adjacent question would invent certainty
       // about what was chosen. Select the pair or omit the reply (§7.3).

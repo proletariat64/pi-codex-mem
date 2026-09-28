@@ -1,6 +1,6 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
-import type { MemoryVersion, ModelRef } from "../config.ts";
+import type { MemoryConfig, MemoryVersion, ModelRef } from "../config.ts";
 
 const LEASE_MS = 180_000;
 const MAX_NETWORK_ATTEMPTS = 3;
@@ -28,9 +28,18 @@ export interface ExtractionResult {
   outcome: "succeeded" | "no_output";
 }
 
+/** A changed effective extraction configuration starts a fresh retry epoch. */
+export function extractionConfigEpoch(config: MemoryConfig): string {
+  return createHash("sha256").update(JSON.stringify({ model: config.models.extract,
+    enabled: config.enabled, generate: config.generate, version: config.version,
+    dualWrite: config.dualWrite, captureModes: config.captureModes,
+    excludedWorkspaces: config.excludedWorkspaces, limits: config.limits,
+    timezone: config.timezone })).digest("hex");
+}
+
 /** Enqueue once per immutable source revision, version and prompt hash. */
 export function enqueueExtraction(db: DatabaseSync, item: {
-  sourceId: string; memoryVersion: MemoryVersion; promptHash: string; now: number;
+  sourceId: string; memoryVersion: MemoryVersion; promptHash: string; now: number; configEpoch?: string;
 }): void {
   db.exec("BEGIN IMMEDIATE");
   try {
@@ -41,12 +50,19 @@ export function enqueueExtraction(db: DatabaseSync, item: {
     ).get(item.sourceId);
     if (source) {
       db.prepare(
-        `INSERT OR IGNORE INTO jobs
-         (job_id, source_id, memory_version, kind, work_key, prompt_hash, status, due_at, created_at, updated_at)
-         VALUES (?, ?, ?, 'extract', ?, ?, 'queued', ?, ?, ?)`,
+        `INSERT INTO jobs
+         (job_id, source_id, memory_version, kind, work_key, prompt_hash, config_epoch,
+          status, due_at, created_at, updated_at)
+         VALUES (?, ?, ?, 'extract', ?, ?, ?, 'queued', ?, ?, ?)
+         ON CONFLICT(work_key) DO UPDATE SET
+           config_epoch = excluded.config_epoch, status = 'queued', attempt_count = 0,
+           due_at = excluded.due_at, error_code = NULL, owner = NULL,
+           lease_expires_at = NULL, fence = jobs.fence + 1, updated_at = excluded.updated_at
+         WHERE jobs.status IN ('queued', 'retry_wait', 'blocked', 'cancelled')
+           AND jobs.config_epoch != excluded.config_epoch`,
       ).run(randomUUID(), item.sourceId, item.memoryVersion,
         JSON.stringify(["extract", item.sourceId, item.memoryVersion, item.promptHash]),
-        item.promptHash, item.now, item.now, item.now);
+        item.promptHash, item.configEpoch ?? "", item.now, item.now, item.now);
     }
     db.exec("COMMIT");
   } catch (err) {
@@ -159,12 +175,13 @@ export function deferExtractionForBudget(db: DatabaseSync, job: LeasedJob,
 }
 
 /** Pause after an in-flight request when foreground work resumed. Keep consumed attempts. */
-export function pauseExtraction(db: DatabaseSync, job: LeasedJob, now: number): boolean {
+export function pauseExtraction(db: DatabaseSync, job: LeasedJob, now: number,
+  reason: "foreground_active" | "configuration_changed"): boolean {
   return db.prepare(
-    `UPDATE jobs SET status = 'retry_wait', due_at = ?, error_code = 'foreground_active',
+    `UPDATE jobs SET status = 'retry_wait', due_at = ?, error_code = ?,
        owner = NULL, lease_expires_at = NULL, updated_at = ?
      WHERE job_id = ? AND status = 'leased' AND owner = ? AND fence = ? AND lease_expires_at > ?`,
-  ).run(now, now, job.jobId, job.owner, job.fence, now).changes === 1;
+  ).run(now, reason, now, job.jobId, job.owner, job.fence, now).changes === 1;
 }
 
 /** Retry transient failures with bounded backoff; never mutate another lease's job. */

@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openStateDb, recordSnapshot, type SnapshotRecord } from "../src/store/db.ts";
@@ -58,6 +59,49 @@ test("one durable v1 job is leased once; an expired lease fences the late respon
   assert.equal(commitExtraction(reopened, second, accepted(), NOW + 181_002), true);
   assert.equal((reopened.prepare("SELECT COUNT(*) AS n FROM extractions").get() as { n: number }).n, 1);
   assert.deepEqual(claimDueExtractions(reopened, { owner: "three", now: NOW + 400_000, limit: 2 }), []);
+});
+
+test("privacy revocation deletes derived extraction text in the same transaction", (t) => {
+  const { root, db, record } = fixture(t);
+  enqueueExtraction(db, { sourceId: SOURCE_ID, memoryVersion: "v1", promptHash: PROMPT_HASH, now: NOW });
+  const [job] = claimDueExtractions(db, { owner: "one", now: NOW, limit: 1 });
+  assert.ok(job);
+  assert.equal(commitExtraction(db, job, { ...accepted(), rawMemory: "private decision" }, NOW + 1), true);
+  recordSnapshot(db, { ...record, revision: { ...record.revision, sourceId: "edited-source",
+    revisionHash: "e".repeat(64), leafId: "edited-leaf" }, capturedAt: NOW + 2,
+    revokedSourceIds: [SOURCE_ID] }, root);
+  assert.equal((db.prepare("SELECT status FROM source_revisions WHERE source_id = ?")
+    .get(SOURCE_ID) as { status: string }).status, "privacy_revoked");
+  assert.equal((db.prepare("SELECT COUNT(*) AS n FROM extractions WHERE source_id = ?")
+    .get(SOURCE_ID) as { n: number }).n, 0);
+});
+
+test("startup purges legacy extraction rows for already privacy-revoked sources", (t) => {
+  const { root, db } = fixture(t);
+  enqueueExtraction(db, { sourceId: SOURCE_ID, memoryVersion: "v1", promptHash: PROMPT_HASH, now: NOW });
+  const [job] = claimDueExtractions(db, { owner: "old", now: NOW, limit: 1 });
+  assert.ok(job);
+  assert.equal(commitExtraction(db, job, { ...accepted(), rawMemory: "private historical text" }, NOW + 1), true);
+  db.prepare("UPDATE source_revisions SET status = 'privacy_revoked' WHERE source_id = ?").run(SOURCE_ID);
+  db.close();
+  const reopened = openStateDb(root);
+  t.after(() => reopened.close());
+  assert.equal((reopened.prepare("SELECT COUNT(*) AS n FROM extractions").get() as { n: number }).n, 0);
+});
+
+test("schema 5 jobs upgrade to configuration epochs without losing durable work", (t) => {
+  const { root, db } = fixture(t);
+  enqueueExtraction(db, { sourceId: SOURCE_ID, memoryVersion: "v1", promptHash: PROMPT_HASH, now: NOW });
+  db.close();
+  const legacy = new DatabaseSync(join(root, "state.sqlite"));
+  legacy.exec("ALTER TABLE jobs DROP COLUMN config_epoch");
+  legacy.prepare("DELETE FROM schema_migrations WHERE version = 6").run();
+  legacy.close();
+  const upgraded = openStateDb(root);
+  t.after(() => upgraded.close());
+  assert.deepEqual({ ...upgraded.prepare("SELECT status, config_epoch FROM jobs").get() },
+    { status: "queued", config_epoch: "" });
+  assert.equal((upgraded.prepare("SELECT MAX(version) AS v FROM schema_migrations").get() as { v: number }).v, 6);
 });
 
 test("a conflicting extraction is never reported as a successful commit", (t) => {

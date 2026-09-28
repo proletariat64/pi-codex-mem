@@ -152,6 +152,39 @@ test("two invalid model replies block without a third request", async (t) => {
   assert.equal((db.prepare("SELECT COUNT(*) AS n FROM extractions").get() as { n: number }).n, 0);
 });
 
+test("budget deferral after a spent invalid call retains its attempt and resumes next local day", async (t) => {
+  const { db, job, root } = setup(t);
+  const first = fakePort([response("not JSON")]);
+  const deferred = await runV1Extraction({ db, root, job, modelRef, port: first.port, now: NOW + 1,
+    timezone: "UTC", limits: { ...limits, dailyRequests: 1 }, signal: new AbortController().signal });
+  assert.deepEqual(deferred, { status: "budget_deferred", reason: "request_budget" });
+  assert.equal(first.calls.length, 1);
+  assert.equal((db.prepare("SELECT attempt_count FROM jobs").get() as { attempt_count: number }).attempt_count, 1);
+  const tomorrow = Date.UTC(2024, 0, 3, 0);
+  const [next] = claimDueExtractions(db, { owner: "tomorrow", now: tomorrow, limit: 1 });
+  assert.ok(next);
+  const second = fakePort([response('{"raw_memory":"decision","rollout_summary":"summary","rollout_slug":"decision"}')]);
+  assert.deepEqual(await runV1Extraction({ db, root, job: next, modelRef, port: second.port, now: tomorrow + 1,
+    timezone: "UTC", limits: { ...limits, dailyRequests: 1 }, signal: new AbortController().signal }),
+  { status: "succeeded" });
+  assert.equal((db.prepare("SELECT attempt_count FROM jobs").get() as { attempt_count: number }).attempt_count, 2);
+});
+
+test("after three spent network calls invalid JSON blocks without stranding lease or reserving a fourth", async (t) => {
+  const { db, job, root } = setup(t);
+  const first = fakePort([response("not JSON"), { stopReason: "error", text: "", errorMessage: "503 temporary" }]);
+  assert.deepEqual(await runV1Extraction({ db, root, job, modelRef, port: first.port, now: NOW + 1,
+    timezone: "UTC", limits, signal: new AbortController().signal }), { status: "retry_wait" });
+  const [last] = claimDueExtractions(db, { owner: "last", now: NOW + 300_002, limit: 1 });
+  assert.ok(last);
+  const final = fakePort([response("still not JSON")]);
+  assert.deepEqual(await runV1Extraction({ db, root, job: last, modelRef, port: final.port, now: NOW + 300_003,
+    timezone: "UTC", limits, signal: new AbortController().signal }), { status: "blocked" });
+  assert.equal(final.calls.length, 1);
+  assert.equal((db.prepare("SELECT status FROM jobs").get() as { status: string }).status, "blocked");
+  assert.equal((db.prepare("SELECT COUNT(*) AS n FROM budget_reservations").get() as { n: number }).n, 3);
+});
+
 test("provider-error or aborted result never enters JSON repair", async (t) => {
   for (const stopReason of ["error", "aborted"] as const) {
     const { db, job, root } = setup(t);
@@ -162,6 +195,37 @@ test("provider-error or aborted result never enters JSON repair", async (t) => {
     assert.equal(calls.length, 1);
     assert.equal((db.prepare("SELECT COUNT(*) AS n FROM extractions").get() as { n: number }).n, 0);
   }
+});
+
+test("a blocked missing model resumes only after its persisted configuration epoch changes", async (t) => {
+  const { db, job, root } = setup(t);
+  const missing = fakePort([]);
+  missing.port.resolve = () => undefined;
+  assert.deepEqual(await runV1Extraction({ db, root, job, modelRef, port: missing.port, now: NOW + 1,
+    timezone: "UTC", limits, signal: new AbortController().signal }), { status: "blocked" });
+  enqueueExtraction(db, { sourceId, memoryVersion: "v1", promptHash: job.promptHash, now: NOW + 2 });
+  assert.deepEqual(claimDueExtractions(db, { owner: "same-model", now: NOW + 3, limit: 1 }), []);
+  enqueueExtraction(db, { sourceId, memoryVersion: "v1", promptHash: job.promptHash,
+    configEpoch: "new-model-epoch", now: NOW + 4 });
+  const [next] = claimDueExtractions(db, { owner: "changed-model", now: NOW + 5, limit: 1 });
+  assert.ok(next);
+  const available = fakePort([response('{"raw_memory":"decision","rollout_summary":"summary","rollout_slug":"decision"}')]);
+  assert.deepEqual(await runV1Extraction({ db, root, job: next, modelRef, port: available.port, now: NOW + 6,
+    timezone: "UTC", limits, signal: new AbortController().signal }), { status: "succeeded" });
+  assert.equal((db.prepare("SELECT attempt_count FROM jobs").get() as { attempt_count: number }).attempt_count, 1);
+});
+
+test("provider error with zero reported usage conservatively charges the reservation", async (t) => {
+  const { db, job, root } = setup(t);
+  const { port } = fakePort([{ stopReason: "error", text: "", errorMessage: "503 temporary",
+    usage: { input: 0, output: 0 } }]);
+  assert.deepEqual(await runV1Extraction({ db, root, job, modelRef, port, now: NOW + 1,
+    timezone: "UTC", limits, signal: new AbortController().signal }), { status: "retry_wait" });
+  const row = db.prepare("SELECT actual_input, actual_output, call_count FROM budget_usage")
+    .get() as { actual_input: number; actual_output: number; call_count: number };
+  assert.ok(row.actual_input > 0);
+  assert.equal(row.actual_output, 6_000);
+  assert.equal(row.call_count, 1);
 });
 
 test("authentication failure blocks rather than hot-retrying or repairing JSON", async (t) => {
@@ -195,4 +259,5 @@ test("exhausted daily budget defers work without making a model request", async 
   assert.deepEqual(result, { status: "budget_deferred", reason: "input_budget" });
   assert.equal(calls.length, 0);
   assert.equal((db.prepare("SELECT status FROM jobs").get() as { status: string }).status, "retry_wait");
+  assert.equal((db.prepare("SELECT attempt_count FROM jobs").get() as { attempt_count: number }).attempt_count, 0);
 });

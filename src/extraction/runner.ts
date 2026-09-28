@@ -46,7 +46,7 @@ export interface V1RunInput {
   /** Production supplies Date.now; tests keep a deterministic clock. */
   clock?: () => number;
   /** Recheck between network requests; an in-flight call is allowed to finish. */
-  canStartRequest?: () => boolean;
+  canStartRequest?: () => "ready" | "foreground_active" | "configuration_changed";
 }
 
 export type V1RunResult =
@@ -129,7 +129,8 @@ function fitV1Context(source: V1RequestInput, model: ResolvedMemoryModel,
 
 function usableUsage(usage: MemoryResponse["usage"]): { input: number; output: number } | undefined {
   if (!usage || !Number.isSafeInteger(usage.input) || usage.input < 0 ||
-      !Number.isSafeInteger(usage.output) || usage.output < 0) return undefined;
+      !Number.isSafeInteger(usage.output) || usage.output < 0 ||
+      (usage.input === 0 && usage.output === 0)) return undefined;
   return usage;
 }
 
@@ -215,10 +216,11 @@ export async function runV1Extraction(input: V1RunInput): Promise<V1RunResult> {
       failExtraction(input.db, input.job, "cancelled", "aborted", clock());
       return { status: "cancelled" };
     }
-    if (input.canStartRequest && !input.canStartRequest()) {
+    const eligibility = input.canStartRequest?.() ?? "ready";
+    if (eligibility !== "ready") {
       const changed = attempt === 0
-        ? deferExtractionForBudget(input.db, input.job, "foreground_active", clock(), clock())
-        : pauseExtraction(input.db, input.job, clock());
+        ? deferExtractionForBudget(input.db, input.job, eligibility, clock(), clock())
+        : pauseExtraction(input.db, input.job, clock(), eligibility);
       return { status: changed ? "retry_wait" : "superseded" };
     }
     const userText = request.userPrompt + repair;
@@ -232,6 +234,13 @@ export async function runV1Extraction(input: V1RunInput): Promise<V1RunResult> {
       const changed = failExtraction(input.db, input.job, "blocked", "repair_context_too_small", clock());
       return { status: changed ? "blocked" : "superseded" };
     }
+    // A repair is a distinct network attempt. Claim it before reserving the
+    // shared budget; if the budget denies the call, deferral refunds this
+    // unspent attempt rather than the previous, already-spent request.
+    if (attempt > 0 && !reserveRepairAttempt(input.db, input.job, clock())) {
+      const changed = failExtraction(input.db, input.job, "blocked", "repair_unavailable", clock());
+      return { status: changed ? "blocked" : "superseded" };
+    }
     const reservationId = randomUUID();
     const budget = reserveModelCall(input.db, {
       id: reservationId, now: clock(), timezone: input.timezone,
@@ -243,10 +252,6 @@ export async function runV1Extraction(input: V1RunInput): Promise<V1RunResult> {
       const deferred = deferExtractionForBudget(input.db, input.job, budget.reason, clock(),
         nextLocalDayTime(clock(), input.timezone));
       return deferred ? { status: "budget_deferred", reason: budget.reason } : { status: "superseded" };
-    }
-    if (attempt > 0 && !reserveRepairAttempt(input.db, input.job, clock())) {
-      reconcileModelCall(input.db, reservationId, undefined);
-      return { status: "superseded" };
     }
     let response: MemoryResponse;
     try {
@@ -283,7 +288,7 @@ export async function runV1Extraction(input: V1RunInput): Promise<V1RunResult> {
       }, clock());
       return { status: accepted ? parsed.outcome : "superseded" };
     }
-    if (attempt === 1) {
+    if (attempt === 1 || input.job.attemptCount >= 3) {
       const changed = failExtraction(input.db, input.job, "blocked", "invalid_schema", clock());
       return { status: changed ? "blocked" : "superseded" };
     }

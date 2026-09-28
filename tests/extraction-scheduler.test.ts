@@ -135,6 +135,24 @@ test("foreground work beginning mid-request pauses the repair until settlement",
   assert.equal((fx.db.prepare("SELECT outcome FROM extractions").get() as { outcome: string }).outcome, "succeeded");
 });
 
+test("configuration changes during a model call prevent a paid repair request", async (t) => {
+  const fx = setup(t);
+  fx.config.schedule.minIdleMinutes = 0;
+  let finish: ((reply: { stopReason: "stop"; text: string }) => void) | undefined;
+  const first = new Promise<{ stopReason: "stop"; text: string }>((resolve) => { finish = resolve; });
+  let requests = 0;
+  fx.port.request = async () => { requests++; return first; };
+  const running = fx.scheduler.runPass();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  fx.config.generate = false;
+  assert.ok(finish);
+  finish({ stopReason: "stop", text: "invalid JSON" });
+  assert.deepEqual(await running, [{ status: "retry_wait" }]);
+  assert.equal(requests, 1);
+  assert.equal((fx.db.prepare("SELECT error_code FROM jobs").get() as { error_code: string }).error_code,
+    "configuration_changed");
+});
+
 test("shutdown aborts the owned model request before the store is closed", async (t) => {
   const fx = setup(t);
   fx.config.schedule.minIdleMinutes = 0;

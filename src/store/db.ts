@@ -36,7 +36,7 @@ export interface SnapshotRecord {
   evidenceRemoved?: boolean;
 }
 
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 
 const MIGRATION_1 = `
 CREATE TABLE schema_migrations (
@@ -193,6 +193,8 @@ CREATE TABLE budget_reservations (
 );
 `;
 
+const MIGRATION_6 = `ALTER TABLE jobs ADD COLUMN config_epoch TEXT NOT NULL DEFAULT '';`;
+
 export function openStateDb(root: string): DatabaseSync {
   mkdirSync(root, { recursive: true, mode: 0o700 });
   chmodSync(root, 0o700);
@@ -241,6 +243,10 @@ export function openStateDb(root: string): DatabaseSync {
       if (current < 5) {
         db.exec(MIGRATION_5);
         db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(5, Date.now());
+      }
+      if (current < 6) {
+        db.exec(MIGRATION_6);
+        db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(6, Date.now());
       }
       db.exec("COMMIT");
     } catch (err) {
@@ -295,6 +301,17 @@ function sweepOrphanSnapshots(db: DatabaseSync, root: string): void {
 
 /** Retry removal after a crash between DB revocation and filesystem cleanup. */
 export function prunePrivacyRevoked(db: DatabaseSync, root: string): void {
+  // Also purge derived text created before the current revocation policy.
+  // Keep the source/job tombstone for provenance and failed late-write fences.
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    db.exec(`DELETE FROM extractions WHERE source_id IN
+      (SELECT source_id FROM source_revisions WHERE status = 'privacy_revoked')`);
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
   const rows = db.prepare("SELECT snapshot_path FROM source_revisions WHERE status = 'privacy_revoked'")
     .all() as { snapshot_path: string }[];
   if (rows.length === 0) return;
@@ -437,6 +454,8 @@ export function recordSnapshot(db: DatabaseSync, rec: SnapshotRecord, root?: str
     }
     for (const sourceId of rec.revokedSourceIds ?? []) {
       db.prepare("UPDATE source_revisions SET status = 'privacy_revoked' WHERE source_id = ? AND source_id != ?")
+        .run(sourceId, rec.revision.sourceId);
+      db.prepare("DELETE FROM extractions WHERE source_id = ? AND source_id != ?")
         .run(sourceId, rec.revision.sourceId);
     }
     if (rec.revokedSourceIds?.length || rec.evidenceRemoved || rec.privacyPolicyChanged) {

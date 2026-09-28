@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import type { MemoryConfig } from "../config.ts";
-import { claimDueExtractions, enqueueExtraction, recoverExpiredExtractions } from "../store/jobs.ts";
+import { claimDueExtractions, enqueueExtraction, extractionConfigEpoch, recoverExpiredExtractions } from "../store/jobs.ts";
 import { runV1Extraction, type MemoryModelPort, type V1RunResult } from "./runner.ts";
 import { v1PromptHash } from "./v1.ts";
 
@@ -31,7 +31,7 @@ export interface ExtractionSchedulerOptions {
 }
 
 /** Enroll active, previously captured snapshots after restart or configuration changes. */
-export function enqueueActiveV1(db: DatabaseSync, now: number): void {
+export function enqueueActiveV1(db: DatabaseSync, now: number, config: MemoryConfig): void {
   const rows = db.prepare(
     `SELECT r.source_id FROM source_revisions r JOIN branch_heads h
      ON h.session_key = r.session_key AND h.branch_id = r.branch_id
@@ -39,7 +39,8 @@ export function enqueueActiveV1(db: DatabaseSync, now: number): void {
   ).all() as { source_id: string }[];
   const promptHash = v1PromptHash();
   for (const row of rows) enqueueExtraction(db, {
-    sourceId: row.source_id, memoryVersion: "v1", promptHash, now,
+    sourceId: row.source_id, memoryVersion: "v1", promptHash,
+    configEpoch: extractionConfigEpoch(config), now,
   });
 }
 
@@ -58,9 +59,9 @@ export class ExtractionScheduler {
   trigger(): void {
     if (this.stopped) return;
     const cfg = this.options.config();
-    if (cfg && (cfg.version === "v1" || cfg.dualWrite)) {
+    if (cfg?.enabled && cfg.generate && (cfg.version === "v1" || cfg.dualWrite)) {
       recoverExpiredExtractions(this.options.db, this.options.now());
-      enqueueActiveV1(this.options.db, this.options.now());
+      enqueueActiveV1(this.options.db, this.options.now(), cfg);
     }
     this.schedule();
   }
@@ -77,12 +78,14 @@ export class ExtractionScheduler {
     if (this.stopped || this.running || !this.options.isForegroundIdle()) return [];
     const cfg = this.options.config();
     const port = this.options.modelPort();
-    if (!cfg || !port || (cfg.version !== "v1" && !cfg.dualWrite) || !cfg.models.extract) return [];
+    if (!cfg || !cfg.enabled || !cfg.generate || !port ||
+        (cfg.version !== "v1" && !cfg.dualWrite) || !cfg.models.extract) return [];
     this.timer?.cancel();
     this.timer = null;
     this.running = true;
     try {
-      enqueueActiveV1(this.options.db, this.options.now());
+      enqueueActiveV1(this.options.db, this.options.now(), cfg);
+      const configEpoch = extractionConfigEpoch(cfg);
       const now = this.options.now();
       const jobs = claimDueExtractions(this.options.db, { owner: randomUUID(), now,
         limit: cfg.schedule.maxExtractionsPerPass, slots: cfg.schedule.extractionConcurrency,
@@ -93,7 +96,14 @@ export class ExtractionScheduler {
         this.controllers.add(controller);
         const task = runV1Extraction({ db: this.options.db, root: this.options.root,
           job, modelRef: cfg.models.extract!, port, now, clock: this.options.now,
-          canStartRequest: () => !this.stopped && this.options.isForegroundIdle(),
+          canStartRequest: () => {
+            if (this.stopped || !this.options.isForegroundIdle()) return "foreground_active";
+            const latest = this.options.config();
+            if (!latest || !latest.enabled || !latest.generate ||
+                (latest.version !== "v1" && !latest.dualWrite) ||
+                extractionConfigEpoch(latest) !== configEpoch) return "configuration_changed";
+            return "ready";
+          },
           timezone: cfg.timezone, limits: {
             outputBytes: cfg.limits.extractionOutputBytes,
             dailyInputTokens: cfg.limits.dailyInputTokens,
@@ -126,8 +136,8 @@ export class ExtractionScheduler {
     this.timer = null;
     if (this.stopped || this.running || !this.options.isForegroundIdle()) return;
     const cfg = this.options.config();
-    if (!cfg || !cfg.models.extract || (cfg.version !== "v1" && !cfg.dualWrite) ||
-        !this.options.modelPort()) return;
+    if (!cfg || !cfg.enabled || !cfg.generate || !cfg.models.extract ||
+        (cfg.version !== "v1" && !cfg.dualWrite) || !this.options.modelPort()) return;
     const now = this.options.now();
     const minimum = cfg.schedule.minIdleMinutes * 60_000;
     const rows = this.options.db.prepare(

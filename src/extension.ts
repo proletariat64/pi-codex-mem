@@ -26,7 +26,7 @@ import {
   type HostCapabilities,
 } from "./pi/compat.ts";
 import { runDoctor, type DoctorInput } from "./doctor.ts";
-import { clearProcessActivity, enqueueExtraction, recordProcessActivity } from "./store/jobs.ts";
+import { clearProcessActivity, enqueueExtraction, extractionConfigEpoch, recordProcessActivity } from "./store/jobs.ts";
 import { createRegistryModelPort } from "./extraction/model-port.ts";
 import { ExtractionScheduler } from "./extraction/scheduler.ts";
 import { v1PromptHash } from "./extraction/v1.ts";
@@ -350,7 +350,8 @@ export default function (pi: ExtensionAPI) {
       if (state.capture.status === "captured" && config.config.generate &&
           (config.config.version === "v1" || config.config.dualWrite)) {
         enqueueExtraction(state.db, { sourceId: state.capture.sourceId,
-          memoryVersion: "v1", promptHash: v1PromptHash(), now: Date.now() });
+          memoryVersion: "v1", promptHash: v1PromptHash(),
+          configEpoch: extractionConfigEpoch(config.config), now: Date.now() });
       }
     } catch (err) {
       state.captureError = `capture failed: ${(err as Error).message}`;
@@ -361,6 +362,10 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_start", (_event, ctx) => markForegroundActive(ctx));
   pi.on("agent_settled", (_event, ctx) => {
     captureNow(ctx);
+    // A brand-new memory root only creates its store on first capture.
+    // Construct the scheduler now, before the settled transition arms its timer.
+    try { ensureScheduler(ctx); }
+    catch (err) { state.captureError = `scheduler startup failed: ${(err as Error).message}`; }
     markForegroundSettled();
   });
   pi.on("session_before_compact", (_event, ctx) => captureNow(ctx));

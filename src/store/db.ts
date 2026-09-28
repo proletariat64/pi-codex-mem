@@ -31,10 +31,12 @@ export interface SnapshotRecord {
   };
   capturedAt: number;
   revokedSourceIds?: string[];
+  privacyTargets?: { entryId: string; allowedHashes: string }[];
+  privacyPolicyChanged?: boolean;
   evidenceRemoved?: boolean;
 }
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 const MIGRATION_1 = `
 CREATE TABLE schema_migrations (
@@ -104,6 +106,14 @@ CREATE TABLE pipeline_state (
 INSERT INTO pipeline_state (memory_version) VALUES ('v1'), ('v2');
 `;
 
+const MIGRATION_3 = `
+CREATE TABLE privacy_edit_targets (
+  entry_id TEXT PRIMARY KEY,
+  allowed_hashes TEXT NOT NULL,
+  applied_at INTEGER NOT NULL
+);
+`;
+
 export function openStateDb(root: string): DatabaseSync {
   mkdirSync(root, { recursive: true, mode: 0o700 });
   chmodSync(root, 0o700);
@@ -135,6 +145,10 @@ export function openStateDb(root: string): DatabaseSync {
       if (current < 2) {
         db.exec(MIGRATION_2);
         db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(2, Date.now());
+      }
+      if (current < 3) {
+        db.exec(MIGRATION_3);
+        db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(3, Date.now());
       }
       db.exec("COMMIT");
     } catch (err) {
@@ -299,12 +313,18 @@ export function recordSnapshot(db: DatabaseSync, rec: SnapshotRecord, root?: str
     // brought back by branch reactivation).
     db.prepare("UPDATE source_revisions SET status = 'captured' WHERE source_id = ? AND status != 'privacy_revoked'")
       .run(rec.revision.sourceId);
+    for (const target of rec.privacyTargets ?? []) {
+      db.prepare(
+        `INSERT INTO privacy_edit_targets (entry_id, allowed_hashes, applied_at) VALUES (?, ?, ?)
+         ON CONFLICT (entry_id) DO UPDATE SET allowed_hashes = excluded.allowed_hashes, applied_at = excluded.applied_at`,
+      ).run(target.entryId, target.allowedHashes, rec.capturedAt);
+    }
     for (const sourceId of rec.revokedSourceIds ?? []) {
       db.prepare("UPDATE source_revisions SET status = 'privacy_revoked' WHERE source_id = ? AND source_id != ?")
         .run(sourceId, rec.revision.sourceId);
     }
-    if (rec.revokedSourceIds?.length || rec.evidenceRemoved) {
-      blockBothViews(db, rec.revokedSourceIds?.length ? "context_edit" : "evidence_removed");
+    if (rec.revokedSourceIds?.length || rec.evidenceRemoved || rec.privacyPolicyChanged) {
+      blockBothViews(db, rec.revokedSourceIds?.length || rec.privacyPolicyChanged ? "context_edit" : "evidence_removed");
     }
 
     if (!transactionOwned) db.exec("COMMIT");

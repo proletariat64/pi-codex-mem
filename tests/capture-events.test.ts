@@ -157,6 +157,36 @@ test("context edit removes sensitive evidence, supersedes old revision, and neve
   db.close();
 });
 
+test("a fork cannot recapture an ancestor entry after a privacy removal", async (t) => {
+  const { cwd, memoryRoot } = makeSandbox(t);
+  const mock = makeMockPi(); memoryExtension(mock.pi);
+  const parentEntries: unknown[] = [userEntry("u1", "removed across copies")];
+  const parent = fakeSessionManager(cwd, parentEntries);
+  const ctx = { cwd, hasUI: false, mode: "tui", sessionManager: parent,
+    modelRegistry: { find: () => ({}), streamSimple: () => ({}) }, ui: { notify: () => {} } };
+  await mock.fire("session_start", { type: "session_start" }, ctx);
+  await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
+  const fork = { ...fakeSessionManager(cwd, [userEntry("u1", "removed across copies")], "fork"),
+    getSessionFile: () => join(cwd, "fork.jsonl"),
+    getHeader: () => ({ type: "session", id: "fork", parentSession: parent.getSessionFile(), timestamp: new Date(0).toISOString(), cwd }) };
+  await mock.fire("session_start", { type: "session_start" }, { ...ctx, sessionManager: fork });
+  await mock.fire("agent_settled", { type: "agent_settled" }, { ...ctx, sessionManager: fork });
+  parentEntries.push({ type: "context_edit", id: "e1", parentId: "u1", targetId: "u1", replacement: null, timestamp: new Date().toISOString() });
+  await mock.fire("session_start", { type: "session_start" }, ctx);
+  await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
+  await mock.fire("session_start", { type: "session_start" }, { ...ctx, sessionManager: fork });
+  await mock.fire("agent_settled", { type: "agent_settled" }, { ...ctx, sessionManager: fork });
+  for (const file of snapshotFiles(memoryRoot)) {
+    assert.ok(!readFileSync(file, "utf8").includes("removed across copies"), "revoked ancestor cannot be recaptured");
+  }
+  parentEntries.push({ type: "context_edit", id: "e2", parentId: "e1", targetId: "u1",
+    replacement: { content: [{ type: "text", text: "user-approved replacement" }] }, timestamp: new Date().toISOString() });
+  await mock.fire("session_start", { type: "session_start" }, ctx);
+  await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
+  assert.ok(snapshotFiles(memoryRoot).some((file) => readFileSync(file, "utf8").includes("user-approved replacement")),
+    "an explicit replacement can restore approved content without restoring old raw text");
+});
+
 test("budget-driven removal of previously captured evidence blocks derived views", async (t) => {
   const { cwd, memoryRoot } = makeSandbox(t);
   const mock = makeMockPi(); memoryExtension(mock.pi);
@@ -281,6 +311,17 @@ test("excluded parent workspace suppresses capture in a descendant but not a sib
   await mock.fire("session_start", { type: "session_start" }, siblingContext);
   await mock.fire("agent_settled", { type: "agent_settled" }, siblingContext);
   assert.equal(snapshotFiles(memoryRoot).length, 1);
+});
+
+test("legacy lock blocks capture even when config.json already exists", async (t) => {
+  const { cwd, memoryRoot } = makeSandbox(t);
+  const mock = makeMockPi(); memoryExtension(mock.pi);
+  const ctx = { cwd, hasUI: false, mode: "tui", sessionManager: fakeSessionManager(cwd, [userEntry("u1", "must not capture")]),
+    modelRegistry: { find: () => ({}), streamSimple: () => ({}) }, ui: { notify: () => {} } };
+  await mock.fire("session_start", { type: "session_start" }, ctx);
+  mkdirSync(join(memoryRoot, "config.json.lock"));
+  await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
+  assert.deepEqual(snapshotFiles(memoryRoot), []);
 });
 
 test("enabled=false captures nothing", async (t) => {

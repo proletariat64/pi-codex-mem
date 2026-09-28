@@ -165,7 +165,7 @@ export default function (pi: ExtensionAPI) {
       });
       // On resume, a different selected leaf may be active before any new
       // agent_settled event. Revoke stale heads before future reads (§5.3).
-      if (state.compat.supported && existsSync(join(root, "state.sqlite"))) {
+      if (state.compat.supported && !legacyLockPath(root) && storeSchemaState(root) === "current") {
         try {
           state.db = openStateDb(root);
           const header = ctx.sessionManager.getHeader();
@@ -211,7 +211,7 @@ export default function (pi: ExtensionAPI) {
 
   function captureNow(ctx: ExtensionContext): void {
     const root = resolveMemoryRoot();
-    if (!state.compat?.supported || rootPointsIntoForeignMemory(root)) return;
+    if (!state.compat?.supported || rootPointsIntoForeignMemory(root) || legacyLockPath(root)) return;
     // §6.3: captureModes is independent of generate (which only controls
     // model calls). Explicit read/off flags must not write new evidence.
     const config = loadConfig(root, { create: false });
@@ -246,11 +246,11 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_tree", (_event, ctx) => {
     const root = resolveMemoryRoot();
-    if (!state.compat?.supported || rootPointsIntoForeignMemory(root)) return;
+    if (!state.compat?.supported || rootPointsIntoForeignMemory(root) || legacyLockPath(root)) return;
     try {
       // A resumed session can navigate before its first settlement. Reopen
-      // an existing store rather than leaving the old head eligible.
-      if (!state.db && existsSync(join(root, "state.sqlite"))) state.db = openStateDb(root);
+      // an initialized store rather than leaving the old head eligible.
+      if (!state.db && storeSchemaState(root) === "current") state.db = openStateDb(root);
       if (!state.db) return;
       const header = ctx.sessionManager.getHeader();
       const file = ctx.sessionManager.getSessionFile();

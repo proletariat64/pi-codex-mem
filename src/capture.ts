@@ -51,9 +51,53 @@ export function captureSettledSession(input: CaptureInput): CaptureResult {
   // getBranch() is authoritative. Copy immediately, before any I/O can
   // interleave another extension event with the current branch snapshot.
   const branch = structuredClone(input.reader.getBranch());
+  // Serialize the policy read, cross-branch revocation scan, file creation,
+  // and DB publication. No concurrent writer can race an edit between scan
+  // and commit, and startup cleanup takes this same write lock.
+  input.db.exec("BEGIN IMMEDIATE");
+  let locked: { result: CaptureResult; revokedSourceIds: string[] };
+  try {
+    locked = captureBranch(input, file, header, leaf, branch);
+    input.db.exec("COMMIT");
+  } catch (err) {
+    input.db.exec("ROLLBACK");
+    throw err;
+  }
+  if (locked.revokedSourceIds.length) prunePrivacyRevoked(input.db, input.root);
+  return locked.result;
+}
+
+function captureBranch(
+  input: CaptureInput, file: string, header: SessionHeader, leaf: string, branch: SessionEntry[],
+): { result: CaptureResult; revokedSourceIds: string[] } {
   const edits = branch.filter((e) => e.type === "context_edit");
   const edited = applyContextEdits(branch);
   const normalized = normalizeEvidence(edited, { limits: input.limits });
+  const targetIds = new Set(edits.map((e) => (e as { targetId: string }).targetId));
+  const restrictions = new Map<string, string[]>();
+  for (const row of input.db.prepare("SELECT entry_id, allowed_hashes FROM privacy_edit_targets")
+    .all() as { entry_id: string; allowed_hashes: string }[]) {
+    try {
+      const allowed: unknown = JSON.parse(row.allowed_hashes);
+      restrictions.set(row.entry_id, Array.isArray(allowed) && allowed.every((value) => typeof value === "string") ? allowed : []);
+    } catch {
+      // A damaged policy must never silently permit previously removed text.
+      restrictions.set(row.entry_id, []);
+    }
+  }
+  const itemHash = (item: typeof normalized.items[number]) => hash(`${item.role}:${item.toolCallId ?? ""}:${item.text}`);
+  normalized.items = normalized.items.filter((item) => {
+    const allowed = restrictions.get(item.entryId);
+    if (!allowed || targetIds.has(item.entryId) || allowed.includes(itemHash(item))) return true;
+    normalized.omissions.push({ entryId: item.entryId, reason: "privacy-edit-target-excluded" });
+    return false;
+  });
+  const privacyTargets = [...targetIds].map((entryId) => ({
+    entryId,
+    allowedHashes: JSON.stringify(normalized.items.filter((item) => item.entryId === entryId).map(itemHash)),
+  }));
+  const privacyPolicyChanged = privacyTargets.some((target) =>
+    target.allowedHashes !== JSON.stringify(restrictions.get(target.entryId) ?? null));
   const workspace = computeWorkspaceIdentity(input.cwd);
   const sessionKey = computeSessionKey(input.agentDir, file, header.id);
 
@@ -124,7 +168,6 @@ export function captureSettledSession(input: CaptureInput): CaptureResult {
   } else if (current && current.source_id !== sourceId) {
     priorRows = [{ ...current, session_key: sessionKey }];
   }
-  const targetIds = new Set(edits.map((e) => (e as { targetId: string }).targetId));
   const revokedSourceIds: string[] = [];
   let evidenceRemoved = false;
   for (const row of priorRows) {
@@ -152,7 +195,7 @@ export function captureSettledSession(input: CaptureInput): CaptureResult {
   const existing = input.db.prepare("SELECT status FROM source_revisions WHERE source_id = ?")
     .get(sourceId) as { status: string } | undefined;
   if (existing?.status === "privacy_revoked") {
-    return { status: "skipped", reason: "projection contains privacy-revoked evidence" };
+    return { result: { status: "skipped", reason: "projection contains privacy-revoked evidence" }, revokedSourceIds: [] };
   }
   const parsedSourceTime = Date.parse(branch.at(-1)?.timestamp ?? header.timestamp);
   const sourceTime = Number.isFinite(parsedSourceTime) ? parsedSourceTime : 0;
@@ -179,41 +222,31 @@ export function captureSettledSession(input: CaptureInput): CaptureResult {
       entryIds: normalized.omissions.map((item) => item.entryId),
     },
   };
-  // Hold the SQLite write lock across both file creation and row publication.
-  // Startup orphan cleanup takes the same lock, so it cannot remove a file
-  // that another process is about to index.
-  input.db.exec("BEGIN IMMEDIATE");
-  let saved: ReturnType<typeof writeSnapshotFile>;
-  try {
-    saved = writeSnapshotFile(input.root, lineageKey, revisionHash, snapshot);
-    recordSnapshot(input.db, {
-      workspace,
-      session: {
-        sessionKey,
-        path: file,
-        headerId: header.id,
-        parentKey: parent?.session_key ?? null,
-        branchId,
-        mode: input.mode,
-      },
-      revision: {
-        sourceId,
-        lineageKey,
-        revisionHash,
-        leafId: leaf,
-        snapshotPath: saved.path,
-        snapshotHash: saved.hash,
-        sourceTime,
-      },
-      capturedAt: Date.now(),
-      revokedSourceIds,
-      evidenceRemoved,
-    }, input.root, true);
-    input.db.exec("COMMIT");
-  } catch (err) {
-    input.db.exec("ROLLBACK");
-    throw err;
-  }
-  if (revokedSourceIds.length) prunePrivacyRevoked(input.db, input.root);
-  return { status: "captured", sessionKey, branchId, sourceId, snapshotPath: saved.path };
+  const saved = writeSnapshotFile(input.root, lineageKey, revisionHash, snapshot);
+  recordSnapshot(input.db, {
+    workspace,
+    session: {
+      sessionKey,
+      path: file,
+      headerId: header.id,
+      parentKey: parent?.session_key ?? null,
+      branchId,
+      mode: input.mode,
+    },
+    revision: {
+      sourceId,
+      lineageKey,
+      revisionHash,
+      leafId: leaf,
+      snapshotPath: saved.path,
+      snapshotHash: saved.hash,
+      sourceTime,
+    },
+    capturedAt: Date.now(),
+    revokedSourceIds,
+    privacyTargets,
+    privacyPolicyChanged,
+    evidenceRemoved,
+  }, input.root, true);
+  return { result: { status: "captured", sessionKey, branchId, sourceId, snapshotPath: saved.path }, revokedSourceIds };
 }

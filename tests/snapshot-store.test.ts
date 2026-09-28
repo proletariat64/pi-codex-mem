@@ -78,6 +78,19 @@ test("opening state removes an unindexed complete snapshot orphan after crash", 
   assert.equal(existsSync(saved.path), false, "unindexed snapshot removed before it can be served");
 });
 
+test("a committed snapshot remains indexed and readable across reopening state", (t) => {
+  const root = makeRoot(t);
+  const db = openStateDb(root);
+  const saved = writeSnapshotFile(root, "b".repeat(64), "a".repeat(64), { safe: true });
+  recordSnapshot(db, rec({ revision: { ...rec().revision, lineageKey: "b".repeat(64),
+    revisionHash: "a".repeat(64), snapshotPath: saved.path, snapshotHash: saved.hash } }));
+  db.close();
+  const reopened = openStateDb(root);
+  assert.equal(existsSync(saved.path), true, "sweep must preserve a durable, committed file");
+  assert.equal((reopened.prepare("SELECT snapshot_hash FROM source_revisions").get() as { snapshot_hash: string }).snapshot_hash, saved.hash);
+  reopened.close();
+});
+
 test("snapshot files are immutable: same content ok, different content rejected (§7.1)", (t) => {
   const root = makeRoot(t);
   writeSnapshotFile(root, "l".repeat(64), "v".repeat(64), { a: 1 });

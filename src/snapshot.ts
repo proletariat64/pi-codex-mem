@@ -232,7 +232,7 @@ export function normalizeEvidence(
       const index = candidates.indexOf(item);
       const previous = candidates[index - 1];
       const dependsOnQuestion = item.role === "user" && Buffer.byteLength(item.text, "utf8") <= 128 &&
-        previous && (previous.role === "assistant" || previous.role === "user") && previous.text.includes("?");
+        previous && (previous.role === "assistant" || previous.role === "user") && /[?？]/u.test(previous.text);
       // A short reply without its adjacent question would invent certainty
       // about what was chosen. Select the pair or omit the reply (§7.3).
       const group = dependsOnQuestion && !selected.has(previous) ? [previous, item] : [item];

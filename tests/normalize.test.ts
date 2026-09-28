@@ -104,6 +104,12 @@ test("short user replies keep their adjacent assistant question under a tight bu
     ], { limits: { itemBytes: 256, toolResultBytes: 256, totalBytes: 54 } });
     assert.deepEqual(out.items.map((i) => i.sourceId), ["q1", "a1"], reply);
   }
+  const chinese = normalizeEvidence([
+    assistantMsg("q2", [{ type: "text", text: "选一还是二？" }]),
+    userMsg("a2", "一"),
+    assistantMsg("other", [{ type: "text", text: "x".repeat(29) }]),
+  ], { limits: { itemBytes: 256, toolResultBytes: 256, totalBytes: 32 } });
+  assert.deepEqual(chinese.items.map((i) => i.sourceId), ["q2", "a2"]);
 });
 
 test("redaction precedes truncation so cut-off secret prefixes cannot leak", () => {

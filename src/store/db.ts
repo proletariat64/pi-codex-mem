@@ -31,12 +31,12 @@ export interface SnapshotRecord {
   };
   capturedAt: number;
   revokedSourceIds?: string[];
-  privacyTargets?: { entryId: string; allowedHashes: string }[];
+  privacyTargets?: { entryId: string; allowedHashes: string; editId: string; editTime: number }[];
   privacyPolicyChanged?: boolean;
   evidenceRemoved?: boolean;
 }
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 const MIGRATION_1 = `
 CREATE TABLE schema_migrations (
@@ -114,6 +114,11 @@ CREATE TABLE privacy_edit_targets (
 );
 `;
 
+const MIGRATION_4 = `
+ALTER TABLE privacy_edit_targets ADD COLUMN edit_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE privacy_edit_targets ADD COLUMN edit_time INTEGER NOT NULL DEFAULT 0;
+`;
+
 export function openStateDb(root: string): DatabaseSync {
   mkdirSync(root, { recursive: true, mode: 0o700 });
   chmodSync(root, 0o700);
@@ -149,6 +154,10 @@ export function openStateDb(root: string): DatabaseSync {
       if (current < 3) {
         db.exec(MIGRATION_3);
         db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(3, Date.now());
+      }
+      if (current < 4) {
+        db.exec(MIGRATION_4);
+        db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(4, Date.now());
       }
       db.exec("COMMIT");
     } catch (err) {
@@ -315,9 +324,12 @@ export function recordSnapshot(db: DatabaseSync, rec: SnapshotRecord, root?: str
       .run(rec.revision.sourceId);
     for (const target of rec.privacyTargets ?? []) {
       db.prepare(
-        `INSERT INTO privacy_edit_targets (entry_id, allowed_hashes, applied_at) VALUES (?, ?, ?)
-         ON CONFLICT (entry_id) DO UPDATE SET allowed_hashes = excluded.allowed_hashes, applied_at = excluded.applied_at`,
-      ).run(target.entryId, target.allowedHashes, rec.capturedAt);
+        `INSERT INTO privacy_edit_targets (entry_id, allowed_hashes, applied_at, edit_id, edit_time)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT (entry_id) DO UPDATE SET
+           allowed_hashes = excluded.allowed_hashes, applied_at = excluded.applied_at,
+           edit_id = excluded.edit_id, edit_time = excluded.edit_time`,
+      ).run(target.entryId, target.allowedHashes, rec.capturedAt, target.editId, target.editTime);
     }
     for (const sourceId of rec.revokedSourceIds ?? []) {
       db.prepare("UPDATE source_revisions SET status = 'privacy_revoked' WHERE source_id = ? AND source_id != ?")

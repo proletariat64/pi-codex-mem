@@ -166,12 +166,14 @@ test("a fork cannot recapture an ancestor entry after a privacy removal", async 
     modelRegistry: { find: () => ({}), streamSimple: () => ({}) }, ui: { notify: () => {} } };
   await mock.fire("session_start", { type: "session_start" }, ctx);
   await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
-  const fork = { ...fakeSessionManager(cwd, [userEntry("u1", "removed across copies")], "fork"),
+  const olderSiblingEdit = { type: "context_edit", id: "b-old-edit", parentId: "u1", targetId: "u1",
+    replacement: { content: [{ type: "text", text: "removed across copies" }] }, timestamp: "2024-01-01T00:00:00.000Z" };
+  const fork = { ...fakeSessionManager(cwd, [userEntry("u1", "removed across copies"), olderSiblingEdit], "fork"),
     getSessionFile: () => join(cwd, "fork.jsonl"),
     getHeader: () => ({ type: "session", id: "fork", parentSession: parent.getSessionFile(), timestamp: new Date(0).toISOString(), cwd }) };
   await mock.fire("session_start", { type: "session_start" }, { ...ctx, sessionManager: fork });
   await mock.fire("agent_settled", { type: "agent_settled" }, { ...ctx, sessionManager: fork });
-  parentEntries.push({ type: "context_edit", id: "e1", parentId: "u1", targetId: "u1", replacement: null, timestamp: new Date().toISOString() });
+  parentEntries.push({ type: "context_edit", id: "e1", parentId: "u1", targetId: "u1", replacement: null, timestamp: "2024-01-02T00:00:00.000Z" });
   await mock.fire("session_start", { type: "session_start" }, ctx);
   await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
   await mock.fire("session_start", { type: "session_start" }, { ...ctx, sessionManager: fork });
@@ -180,11 +182,16 @@ test("a fork cannot recapture an ancestor entry after a privacy removal", async 
     assert.ok(!readFileSync(file, "utf8").includes("removed across copies"), "revoked ancestor cannot be recaptured");
   }
   parentEntries.push({ type: "context_edit", id: "e2", parentId: "e1", targetId: "u1",
-    replacement: { content: [{ type: "text", text: "user-approved replacement" }] }, timestamp: new Date().toISOString() });
+    replacement: { content: [{ type: "text", text: "user-approved replacement" }] }, timestamp: "2024-01-03T00:00:00.000Z" });
   await mock.fire("session_start", { type: "session_start" }, ctx);
   await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
   assert.ok(snapshotFiles(memoryRoot).some((file) => readFileSync(file, "utf8").includes("user-approved replacement")),
     "an explicit replacement can restore approved content without restoring old raw text");
+  await mock.fire("session_start", { type: "session_start" }, { ...ctx, sessionManager: fork });
+  await mock.fire("agent_settled", { type: "agent_settled" }, { ...ctx, sessionManager: fork });
+  assert.ok(snapshotFiles(memoryRoot).some((file) => readFileSync(file, "utf8").includes("user-approved replacement")),
+    "replaying an older sibling edit cannot revoke a newer approved replacement");
+  assert.ok(snapshotFiles(memoryRoot).every((file) => !readFileSync(file, "utf8").includes("removed across copies")));
 });
 
 test("budget-driven removal of previously captured evidence blocks derived views", async (t) => {
@@ -244,6 +251,32 @@ test("pre-compaction ancestry is captured but the derived summary is not counted
   assert.deepEqual(snapshot.items.map((item: { sourceId: string }) => item.sourceId), ["u1"]);
   assert.equal(snapshot.omissionsManifest.count, 1);
   assert.deepEqual(snapshot.omissionsManifest.entryIds, ["c1"]);
+});
+
+test("fork copies the ancestor evidence key from an older retained parent revision", async (t) => {
+  const { cwd, memoryRoot } = makeSandbox(t);
+  const mock = makeMockPi(); memoryExtension(mock.pi);
+  const entries: unknown[] = [userEntry("u1", "A".repeat(700))];
+  const parent = fakeSessionManager(cwd, entries);
+  const ctx = { cwd, hasUI: false, mode: "tui", sessionManager: parent,
+    modelRegistry: { find: () => ({}), streamSimple: () => ({}) }, ui: { notify: () => {} } };
+  await mock.fire("session_start", { type: "session_start" }, ctx);
+  const configPath = join(memoryRoot, "config.json");
+  const cfg = JSON.parse(readFileSync(configPath, "utf8"));
+  writeFileSync(configPath, JSON.stringify({ ...cfg, limits: { ...cfg.limits, inputBytes: 1024 } }));
+  await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
+  entries.push({ ...userEntry("u2", "B".repeat(700)), parentId: "u1" });
+  await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
+  const fork = { ...fakeSessionManager(cwd, [userEntry("u1", "A".repeat(700))], "fork"),
+    getSessionFile: () => join(cwd, "fork.jsonl"),
+    getHeader: () => ({ type: "session", id: "fork", parentSession: parent.getSessionFile(), timestamp: new Date(0).toISOString(), cwd }) };
+  await mock.fire("session_start", { type: "session_start" }, { ...ctx, sessionManager: fork });
+  await mock.fire("agent_settled", { type: "agent_settled" }, { ...ctx, sessionManager: fork });
+  const snapshots = snapshotFiles(memoryRoot).map((file) => JSON.parse(readFileSync(file, "utf8")));
+  const first = snapshots.find((s) => s.sessionPath === parent.getSessionFile() && s.leafId === "u1");
+  const copied = snapshots.find((s) => s.sessionPath === fork.getSessionFile());
+  assert.ok(first && copied);
+  assert.equal(copied.items[0].evidenceKey, first.items[0].evidenceKey);
 });
 
 test("forked session receives a distinct session identity (T09)", async (t) => {

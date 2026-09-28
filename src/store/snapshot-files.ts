@@ -1,6 +1,11 @@
 import { createHash, randomBytes } from "node:crypto";
-import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+
+function syncDirectory(path: string): void {
+  const fd = openSync(path, "r");
+  try { fsyncSync(fd); } finally { closeSync(fd); }
+}
 
 /**
  * Immutable snapshot files (spec §12.1): sources/<lineage-key>/<revision>.json
@@ -34,26 +39,37 @@ export function writeSnapshotFile(
     if (existing !== hash) {
       throw new Error(`snapshot ${path} is immutable: content differs for the same revision hash`);
     }
+    syncDirectory(dir); // also makes a recovered pre-commit link durable
     return { path, hash }; // idempotent rewrite
   }
   // Enforce privacy even for directories created by older configurations.
   chmodSync(root, 0o700);
   chmodSync(join(root, "sources"), 0o700);
   chmodSync(dir, 0o700);
+  // Persist the newly created sources/ and lineage/ directory entries.
+  syncDirectory(root);
+  syncDirectory(sources);
   const temp = join(dir, `.snapshot-${randomBytes(12).toString("hex")}.tmp`);
   try {
     writeFileSync(temp, content, { mode: 0o600, flag: "wx" });
-    // A complete temp file becomes visible atomically; link never replaces
+    const fd = openSync(temp, "r");
+    try { fsyncSync(fd); } finally { closeSync(fd); }
+    // A complete, durable temp file becomes visible atomically; link never replaces
     // a pre-existing immutable revision, even across competing processes.
     try {
       linkSync(temp, path);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+      if (lstatSync(path).isSymbolicLink()) throw new Error("snapshot symlink rejected");
       const existing = createHash("sha256").update(readFileSync(path)).digest("hex");
       if (existing !== hash) throw new Error(`snapshot ${path} is immutable: content differs for the same revision hash`);
     }
   } finally {
     if (existsSync(temp)) unlinkSync(temp);
   }
+  // The file and its directory entry are both stable before SQLite commits
+  // the referencing row. If this fails, the caller rolls back and sweep can
+  // remove the unindexed file on next startup.
+  syncDirectory(dir);
   return { path, hash };
 }

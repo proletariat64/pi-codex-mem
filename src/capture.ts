@@ -51,54 +51,73 @@ export function captureSettledSession(input: CaptureInput): CaptureResult {
   // getBranch() is authoritative. Copy immediately, before any I/O can
   // interleave another extension event with the current branch snapshot.
   const branch = structuredClone(input.reader.getBranch());
-  // Serialize the policy read, cross-branch revocation scan, file creation,
-  // and DB publication. No concurrent writer can race an edit between scan
-  // and commit, and startup cleanup takes this same write lock.
-  input.db.exec("BEGIN IMMEDIATE");
-  let locked: { result: CaptureResult; revokedSourceIds: string[] };
-  try {
-    locked = captureBranch(input, file, header, leaf, branch);
-    input.db.exec("COMMIT");
-  } catch (err) {
-    input.db.exec("ROLLBACK");
-    throw err;
+  // Potentially slow normalization and Git probes happen before taking the
+  // SQLite writer lock; the branch values are already copied and immutable.
+  const edits = branch.filter((e) => e.type === "context_edit");
+  const normalized = normalizeEvidence(applyContextEdits(branch), { limits: input.limits });
+  const workspace = computeWorkspaceIdentity(input.cwd);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const outcome = captureBranch(input, file, header, leaf, branch, edits, normalized, workspace);
+    if (!outcome) continue; // another connection committed during preparation
+    if (outcome.revokedSourceIds.length) prunePrivacyRevoked(input.db, input.root);
+    return outcome.result;
   }
-  if (locked.revokedSourceIds.length) prunePrivacyRevoked(input.db, input.root);
-  return locked.result;
+  throw new Error("capture state changed concurrently; retry at the next settlement");
 }
 
 function captureBranch(
   input: CaptureInput, file: string, header: SessionHeader, leaf: string, branch: SessionEntry[],
-): { result: CaptureResult; revokedSourceIds: string[] } {
-  const edits = branch.filter((e) => e.type === "context_edit");
-  const edited = applyContextEdits(branch);
-  const normalized = normalizeEvidence(edited, { limits: input.limits });
-  const targetIds = new Set(edits.map((e) => (e as { targetId: string }).targetId));
-  const restrictions = new Map<string, string[]>();
-  for (const row of input.db.prepare("SELECT entry_id, allowed_hashes FROM privacy_edit_targets")
-    .all() as { entry_id: string; allowed_hashes: string }[]) {
+  edits: SessionEntry[], baseNormalized: ReturnType<typeof normalizeEvidence>,
+  workspace: ReturnType<typeof computeWorkspaceIdentity>,
+): { result: CaptureResult; revokedSourceIds: string[] } | null {
+  // PRAGMA data_version detects commits by other connections, including new
+  // branches, revocations, and policy updates. Retry the whole DB read if it
+  // changes before we acquire BEGIN IMMEDIATE; no slow scan holds that lock.
+  const dataVersion = (input.db.prepare("PRAGMA data_version").get() as { data_version: number }).data_version;
+  const normalized = structuredClone(baseNormalized);
+  type EditIdentity = { id: string; time: number };
+  const latestEdits = new Map<string, EditIdentity>();
+  for (const edit of edits) {
+    const target = (edit as { targetId: string }).targetId;
+    const parsed = Date.parse(edit.timestamp);
+    latestEdits.set(target, { id: edit.id, time: Number.isFinite(parsed) ? parsed : 0 });
+  }
+  type EditPolicy = EditIdentity & { allowed: string[] };
+  const restrictions = new Map<string, EditPolicy>();
+  for (const row of input.db.prepare("SELECT entry_id, allowed_hashes, edit_id, edit_time FROM privacy_edit_targets")
+    .all() as { entry_id: string; allowed_hashes: string; edit_id: string; edit_time: number }[]) {
+    let allowed: string[] = [];
     try {
-      const allowed: unknown = JSON.parse(row.allowed_hashes);
-      restrictions.set(row.entry_id, Array.isArray(allowed) && allowed.every((value) => typeof value === "string") ? allowed : []);
+      const parsed: unknown = JSON.parse(row.allowed_hashes);
+      if (Array.isArray(parsed) && parsed.every((value) => typeof value === "string")) allowed = parsed;
     } catch {
       // A damaged policy must never silently permit previously removed text.
-      restrictions.set(row.entry_id, []);
     }
+    restrictions.set(row.entry_id, { allowed, id: row.edit_id, time: row.edit_time });
   }
   const itemHash = (item: typeof normalized.items[number]) => hash(`${item.role}:${item.toolCallId ?? ""}:${item.text}`);
+  const mayApplyEdit = (entryId: string): boolean => {
+    const edit = latestEdits.get(entryId);
+    const prior = restrictions.get(entryId);
+    return Boolean(edit && (!prior || edit.time > prior.time || edit.id === prior.id));
+  };
   normalized.items = normalized.items.filter((item) => {
-    const allowed = restrictions.get(item.entryId);
-    if (!allowed || targetIds.has(item.entryId) || allowed.includes(itemHash(item))) return true;
+    const prior = restrictions.get(item.entryId);
+    if (!prior || prior.allowed.includes(itemHash(item)) || mayApplyEdit(item.entryId)) return true;
     normalized.omissions.push({ entryId: item.entryId, reason: "privacy-edit-target-excluded" });
     return false;
   });
-  const privacyTargets = [...targetIds].map((entryId) => ({
-    entryId,
-    allowedHashes: JSON.stringify(normalized.items.filter((item) => item.entryId === entryId).map(itemHash)),
-  }));
+  const privacyTargets: { entryId: string; editId: string; editTime: number; allowedHashes: string }[] = [];
+  for (const [entryId, edit] of latestEdits) {
+    if (!mayApplyEdit(entryId)) continue;
+    privacyTargets.push({
+      entryId, editId: edit.id, editTime: edit.time,
+      allowedHashes: JSON.stringify(normalized.items.filter((item) => item.entryId === entryId).map(itemHash)),
+    });
+  }
+  const revocableTargetIds = new Set(privacyTargets.map((target) => target.entryId));
   const privacyPolicyChanged = privacyTargets.some((target) =>
-    target.allowedHashes !== JSON.stringify(restrictions.get(target.entryId) ?? null));
-  const workspace = computeWorkspaceIdentity(input.cwd);
+    target.allowedHashes !== JSON.stringify(restrictions.get(target.entryId)?.allowed ?? null));
   const sessionKey = computeSessionKey(input.agentDir, file, header.id);
 
   // Reuse an active branch when its selected leaf remains on this ancestry.
@@ -120,23 +139,29 @@ function captureBranch(
     ? input.db.prepare("SELECT session_key FROM sessions WHERE path = ? ORDER BY last_activity_at DESC LIMIT 1")
       .get(header.parentSession) as { session_key: string } | undefined
     : undefined;
-  const parentHead = parent && input.db.prepare(
-    `SELECT r.snapshot_path FROM branch_heads h JOIN source_revisions r ON r.source_id = h.latest_revision
-     WHERE h.session_key = ? AND h.state = 'active' AND r.status = 'captured' LIMIT 1`,
-  ).get(parent.session_key) as { snapshot_path: string } | undefined;
-  let ancestorKeys = new Map<string, string>();
-  if (parentHead) {
+  const parentRevisions = parent ? input.db.prepare(
+    `SELECT r.snapshot_path FROM source_revisions r
+     JOIN branch_heads h ON h.session_key = r.session_key AND h.branch_id = r.branch_id
+     WHERE r.session_key = ? AND h.state = 'active' AND r.status IN ('captured', 'superseded')
+     ORDER BY r.captured_at DESC`,
+  ).all(parent.session_key) as { snapshot_path: string }[] : [];
+  const needed = new Set(normalized.items.map((item) => `${item.entryId}:${item.role}:${item.toolCallId ?? ""}`));
+  const ancestorKeys = new Map<string, string>();
+  for (const revision of parentRevisions) {
     try {
-      const prior = JSON.parse(readFileSync(parentHead.snapshot_path, "utf8")) as {
+      const prior = JSON.parse(readFileSync(revision.snapshot_path, "utf8")) as {
         sessionKey: string;
         items: { entryId: string; role: string; toolCallId?: string; evidenceKey?: string }[];
       };
-      ancestorKeys = new Map(prior.items.map((item) => [
-        `${item.entryId}:${item.role}:${item.toolCallId ?? ""}`,
-        item.evidenceKey ?? hash(`${prior.sessionKey}:${item.entryId}:${item.role}:${item.toolCallId ?? ""}`),
-      ]));
+      for (const item of prior.items) {
+        const entry = `${item.entryId}:${item.role}:${item.toolCallId ?? ""}`;
+        if (needed.has(entry) && !ancestorKeys.has(entry)) {
+          ancestorKeys.set(entry, item.evidenceKey ?? hash(`${prior.sessionKey}:${entry}`));
+        }
+      }
+      if (ancestorKeys.size === needed.size) break;
     } catch {
-      // Parent absent/pruned: provenance is not asserted without evidence.
+      // Pruned parent revision: continue to older retained ancestry.
     }
   }
   for (const item of normalized.items) {
@@ -161,7 +186,7 @@ function captureBranch(
   ).get(sessionKey, branchId) as { source_id: string; snapshot_path: string } | undefined;
   type PriorRow = { source_id: string; snapshot_path: string; session_key: string };
   let priorRows: PriorRow[] = [];
-  if (edits.length) {
+  if (revocableTargetIds.size) {
     priorRows = input.db.prepare(
       "SELECT source_id, snapshot_path, session_key FROM source_revisions WHERE status != 'privacy_revoked' AND source_id != ?",
     ).all(sourceId) as PriorRow[];
@@ -178,7 +203,7 @@ function captureBranch(
       // If an earlier selected snapshot is unavailable, the read side must
       // not assume its generated conclusions remain valid.
       if (row.source_id === current?.source_id) evidenceRemoved = true;
-      if (row.session_key === sessionKey && targetIds.size) revokedSourceIds.push(row.source_id);
+      if (row.session_key === sessionKey && revocableTargetIds.size) revokedSourceIds.push(row.source_id);
       continue;
     }
     const now = (prior: typeof normalized.items[number]) => normalized.items.find((item) =>
@@ -188,7 +213,7 @@ function captureBranch(
     }
     // Context edits are branch-local for projection, but revocation of
     // copied target text must cover every older snapshot containing it.
-    if (targetIds.size && previous.items.some((item) => targetIds.has(item.entryId) && now(item)?.text !== item.text)) {
+    if (revocableTargetIds.size && previous.items.some((item) => revocableTargetIds.has(item.entryId) && now(item)?.text !== item.text)) {
       revokedSourceIds.push(row.source_id);
     }
   }
@@ -222,31 +247,43 @@ function captureBranch(
       entryIds: normalized.omissions.map((item) => item.entryId),
     },
   };
-  const saved = writeSnapshotFile(input.root, lineageKey, revisionHash, snapshot);
-  recordSnapshot(input.db, {
-    workspace,
-    session: {
-      sessionKey,
-      path: file,
-      headerId: header.id,
-      parentKey: parent?.session_key ?? null,
-      branchId,
-      mode: input.mode,
-    },
-    revision: {
-      sourceId,
-      lineageKey,
-      revisionHash,
-      leafId: leaf,
-      snapshotPath: saved.path,
-      snapshotHash: saved.hash,
-      sourceTime,
-    },
-    capturedAt: Date.now(),
-    revokedSourceIds,
-    privacyTargets,
-    privacyPolicyChanged,
-    evidenceRemoved,
-  }, input.root, true);
+  input.db.exec("BEGIN IMMEDIATE");
+  let saved: ReturnType<typeof writeSnapshotFile>;
+  try {
+    if ((input.db.prepare("PRAGMA data_version").get() as { data_version: number }).data_version !== dataVersion) {
+      input.db.exec("ROLLBACK");
+      return null;
+    }
+    saved = writeSnapshotFile(input.root, lineageKey, revisionHash, snapshot);
+    recordSnapshot(input.db, {
+      workspace,
+      session: {
+        sessionKey,
+        path: file,
+        headerId: header.id,
+        parentKey: parent?.session_key ?? null,
+        branchId,
+        mode: input.mode,
+      },
+      revision: {
+        sourceId,
+        lineageKey,
+        revisionHash,
+        leafId: leaf,
+        snapshotPath: saved.path,
+        snapshotHash: saved.hash,
+        sourceTime,
+      },
+      capturedAt: Date.now(),
+      revokedSourceIds,
+      privacyTargets,
+      privacyPolicyChanged,
+      evidenceRemoved,
+    }, input.root, true);
+    input.db.exec("COMMIT");
+  } catch (err) {
+    input.db.exec("ROLLBACK");
+    throw err;
+  }
   return { result: { status: "captured", sessionKey, branchId, sourceId, snapshotPath: saved.path }, revokedSourceIds };
 }

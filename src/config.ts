@@ -333,25 +333,45 @@ export function updateConfig(
 /** Locks are held for milliseconds; anything older is a crashed holder. */
 const LOCK_STALE_MS = 30_000;
 
-/** Atomic lock via mkdir; breaks locks abandoned by crashed processes. */
-function acquireLock(lockDir: string): boolean {
+/** Atomic lock via mkdir; breaks locks abandoned by crashed processes. Exported for concurrency tests. */
+export function acquireLock(lockDir: string): boolean {
   try {
     mkdirSync(lockDir);
     return true;
   } catch {
-    // fall through to staleness check
+    // exists — maybe stale
   }
   try {
     const held = statSync(lockDir);
-    if (Date.now() - held.mtimeMs > LOCK_STALE_MS) {
-      rmSync(lockDir, { recursive: true, force: true });
+    if (Date.now() - held.mtimeMs <= LOCK_STALE_MS) return false;
+    // Break the stale lock without a TOCTOU race: move it aside atomically
+    // and verify the moved directory is the SAME inode we statted. If it
+    // isn't, we grabbed someone's fresh live lock — put it back and yield.
+    const trash = `${lockDir}.stale-${process.pid}`;
+    rmSync(trash, { recursive: true, force: true });
+    try {
+      renameSync(lockDir, trash);
+    } catch {
+      return false; // another breaker moved it first
+    }
+    if (statSync(trash).ino !== held.ino) {
+      try {
+        renameSync(trash, lockDir); // restore the live lock we disturbed
+      } catch {
+        // a third process already claimed the path; the lock survives as trash
+      }
+      return false;
+    }
+    rmSync(trash, { recursive: true, force: true });
+    try {
       mkdirSync(lockDir);
       return true;
+    } catch {
+      return false; // another breaker won the recreate
     }
   } catch {
-    // lost a staleness race — the other breaker now holds it
+    return false;
   }
-  return false;
 }
 
 /** Synchronous short sleep for lock contention backoff (ms). */

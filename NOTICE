@@ -1,0 +1,13 @@
+Pi Memory
+Copyright (c) 2026 the pi-memory contributors
+
+This project adapts prompt templates and design behavior from OpenAI Codex CLI
+(https://github.com/openai/codex), pinned to commit
+1cc7e2361237ce7244430ee1d581c77f95c57ac8.
+
+The Codex material is licensed under the Apache License, Version 2.0.
+A copy of that license is included at prompts/upstream/LICENSE.codex.
+See UPSTREAM.md for the complete list of vendored files, their content
+hashes, and the record of every adaptation.
+
+This project is not an official OpenAI product, nor an official pi product.

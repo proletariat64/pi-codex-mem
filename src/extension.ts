@@ -367,7 +367,7 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  function captureNow(ctx: ExtensionContext): void {
+  function captureNow(ctx: ExtensionContext, options?: { busyTimeoutMs?: number }): void {
     const root = resolveMemoryRoot();
     if (!state.compat?.supported || rootPointsIntoForeignMemory(root) || legacyLockPath(root)) return;
     // §6.3: captureModes is independent of generate (which only controls
@@ -382,7 +382,7 @@ export default function (pi: ExtensionAPI) {
         state.capture = { status: "ephemeral", reason: "persistent session header/path/leaf unavailable" };
         return;
       }
-      state.db ??= openStateDb(root);
+      state.db ??= openStateDb(root, options);
       state.capture = captureSettledSession({
         root, agentDir: getAgentDir(), cwd: ctx.cwd, mode: ctx.mode,
         reader: ctx.sessionManager, db: state.db,
@@ -449,8 +449,11 @@ export default function (pi: ExtensionAPI) {
     await scheduler?.stop();
     scheduler = null;
     try {
-      if (state.db) clearProcessActivity(state.db, activityOwner);
-      captureNow(ctx);
+      if (state.db) {
+        state.db.exec("PRAGMA busy_timeout = 100");
+        clearProcessActivity(state.db, activityOwner);
+      }
+      captureNow(ctx, { busyTimeoutMs: 100 });
     } finally {
       cancelPrivacyCleanup();
       runtimePort = null;

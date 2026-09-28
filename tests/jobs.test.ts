@@ -111,6 +111,56 @@ test("startup vacuums legacy bytes already deleted with secure_delete off", (t) 
   if (existsSync(wal)) assert.equal(readFileSync(wal).includes(Buffer.from(marker)), false);
 });
 
+test("upgrade vacuums deleted legacy bytes even when no privacy tombstone remains", (t) => {
+  const { root, db } = fixture(t);
+  db.exec("DROP TABLE privacy_scrub_state");
+  db.prepare("DELETE FROM schema_migrations WHERE version = 7").run();
+  db.exec("PRAGMA secure_delete = OFF");
+  enqueueExtraction(db, { sourceId: SOURCE_ID, memoryVersion: "v1", promptHash: PROMPT_HASH, now: NOW });
+  const [job] = claimDueExtractions(db, { owner: "old", now: NOW, limit: 1 });
+  assert.ok(job);
+  const marker = "PRIVATE_NO_TOMBSTONE_e38c_UNIQUE";
+  assert.equal(commitExtraction(db, job, { ...accepted(), rawMemory: marker }, NOW + 1), true);
+  db.prepare("DELETE FROM extractions WHERE source_id = ?").run(SOURCE_ID);
+  db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
+  db.close();
+  const databasePath = join(root, "state.sqlite");
+  assert.equal(readFileSync(databasePath).includes(Buffer.from(marker)), true);
+  const reopened = openStateDb(root);
+  t.after(() => reopened.close());
+  assert.equal(readFileSync(databasePath).includes(Buffer.from(marker)), false);
+  assert.equal((reopened.prepare("SELECT legacy_vacuum_pending FROM privacy_scrub_state")
+    .get() as { legacy_vacuum_pending: number }).legacy_vacuum_pending, 0);
+});
+
+test("legacy free-space scrub retries if a reader blocks its final WAL checkpoint", (t) => {
+  const { root, db } = fixture(t);
+  db.exec("DROP TABLE privacy_scrub_state");
+  db.prepare("DELETE FROM schema_migrations WHERE version = 7").run();
+  db.exec("PRAGMA secure_delete = OFF");
+  enqueueExtraction(db, { sourceId: SOURCE_ID, memoryVersion: "v1", promptHash: PROMPT_HASH, now: NOW });
+  const [job] = claimDueExtractions(db, { owner: "old", now: NOW, limit: 1 });
+  assert.ok(job);
+  const marker = "PRIVATE_CHECKPOINT_RETRY_f415_UNIQUE";
+  assert.equal(commitExtraction(db, job, { ...accepted(), rawMemory: marker }, NOW + 1), true);
+  db.prepare("DELETE FROM extractions WHERE source_id = ?").run(SOURCE_ID);
+  db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
+  db.close();
+  const databasePath = join(root, "state.sqlite");
+  assert.equal(readFileSync(databasePath).includes(Buffer.from(marker)), true);
+  const reader = new DatabaseSync(databasePath, { readOnly: true });
+  t.after(() => { if (reader.isOpen) reader.close(); });
+  reader.exec("BEGIN");
+  reader.prepare("SELECT source_id FROM source_revisions").get();
+  assert.throws(() => openStateDb(root, { busyTimeoutMs: 100 }), /privacy WAL cleanup deferred/);
+  reader.exec("ROLLBACK"); reader.close();
+  const recovered = openStateDb(root);
+  t.after(() => recovered.close());
+  assert.equal(readFileSync(databasePath).includes(Buffer.from(marker)), false);
+  const wal = databasePath + "-wal";
+  if (existsSync(wal)) assert.equal(readFileSync(wal).includes(Buffer.from(marker)), false);
+});
+
 test("schema 5 jobs upgrade to configuration epochs without losing durable work", (t) => {
   const { root, db } = fixture(t);
   enqueueExtraction(db, { sourceId: SOURCE_ID, memoryVersion: "v1", promptHash: PROMPT_HASH, now: NOW });

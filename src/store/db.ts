@@ -206,7 +206,11 @@ CREATE TABLE privacy_scrub_state (
 INSERT INTO privacy_scrub_state (singleton, legacy_vacuum_pending) VALUES (1, 1);
 `;
 
-export function openStateDb(root: string): DatabaseSync {
+export function openStateDb(root: string, options?: { busyTimeoutMs?: number }): DatabaseSync {
+  const busyTimeout = options?.busyTimeoutMs ?? 5_000;
+  if (!Number.isSafeInteger(busyTimeout) || busyTimeout < 0 || busyTimeout > 5_000) {
+    throw new Error("invalid SQLite busy timeout");
+  }
   mkdirSync(root, { recursive: true, mode: 0o700 });
   chmodSync(root, 0o700);
   const path = join(root, "state.sqlite");
@@ -219,7 +223,7 @@ export function openStateDb(root: string): DatabaseSync {
   chmodSync(path, 0o600);
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
-  db.exec("PRAGMA busy_timeout = 5000");
+  db.exec(`PRAGMA busy_timeout = ${busyTimeout}`);
   // Privacy revocation must overwrite deleted payload cells, not only unlink
   // their logical rows. WAL is truncated after the removal commits below.
   db.exec("PRAGMA secure_delete = ON");
@@ -339,12 +343,9 @@ export function prunePrivacyRevoked(db: DatabaseSync, root: string): void {
     .all() as { snapshot_path: string }[];
   const legacy = db.prepare("SELECT legacy_vacuum_pending FROM privacy_scrub_state WHERE singleton = 1")
     .get() as { legacy_vacuum_pending: number };
-  if (rows.length === 0) {
-    if (legacy.legacy_vacuum_pending) {
-      db.prepare("UPDATE privacy_scrub_state SET legacy_vacuum_pending = 0 WHERE singleton = 1").run();
-    }
-    return;
-  }
+  // Even without a surviving tombstone, a pre-secure-delete row may have
+  // left plaintext in SQLite free space. Run the one-time upgrade VACUUM.
+  if (rows.length === 0 && !legacy.legacy_vacuum_pending) return;
   const sourceDir = join(root, "sources");
   if (existsSync(sourceDir)) {
     if (lstatSync(sourceDir).isSymbolicLink()) throw new Error("sources symlink rejected during privacy cleanup");
@@ -375,7 +376,6 @@ export function prunePrivacyRevoked(db: DatabaseSync, root: string): void {
       }
       throw err;
     }
-    db.prepare("UPDATE privacy_scrub_state SET legacy_vacuum_pending = 0 WHERE singleton = 1").run();
   }
   // Secure-delete rewrites live database pages; old WAL frames may still
   // contain the superseded extraction. Do not report privacy cleanup as
@@ -383,6 +383,11 @@ export function prunePrivacyRevoked(db: DatabaseSync, root: string): void {
   const checkpoint = db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get() as
     { busy: number; log: number; checkpointed: number } | undefined;
   if (!checkpoint || checkpoint.busy !== 0) throw new Error("privacy WAL cleanup deferred: active SQLite reader");
+  // Do not clear the upgrade marker until the old main DB AND WAL are gone.
+  // A busy reader can delay truncation even after VACUUM succeeded.
+  if (legacy.legacy_vacuum_pending) {
+    db.prepare("UPDATE privacy_scrub_state SET legacy_vacuum_pending = 0 WHERE singleton = 1").run();
+  }
 }
 
 function blockBothViews(db: DatabaseSync, reason: string): void {

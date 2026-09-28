@@ -10,7 +10,8 @@ import {
   pauseExtraction, reconcileModelCall, renewExtractionLease, reserveModelCall, reserveRepairAttempt,
   type LeasedJob,
 } from "../store/jobs.ts";
-import { parseV1Output, renderV1Request, v1EvidenceLine, type V1RequestInput } from "./v1.ts";
+import { parseV1Output, renderV1Request, v1EvidenceLine } from "./v1.ts";
+import { parseV2Output, renderV2Request, type V2RequestInput } from "./v2.ts";
 
 export interface ResolvedMemoryModel {
   provider: string;
@@ -41,12 +42,17 @@ export interface V1RunInput {
   port: MemoryModelPort;
   now: number;
   timezone: string;
-  limits: { outputBytes: number; dailyInputTokens: number; dailyOutputTokens: number; dailyRequests: number };
+  limits: { outputBytes: number; dailyInputTokens: number; dailyOutputTokens: number; dailyRequests: number;
+    v2RolloutSummaryBytes?: number };
   signal: AbortSignal;
   /** Production supplies Date.now; tests keep a deterministic clock. */
   clock?: () => number;
   /** Recheck between network requests; an in-flight call is allowed to finish. */
   canStartRequest?: () => "ready" | "foreground_active" | "configuration_changed";
+}
+
+export interface V2RunInput extends V1RunInput {
+  limits: V1RunInput["limits"] & { v2RolloutSummaryBytes: number };
 }
 
 export type V1RunResult =
@@ -56,13 +62,14 @@ export type V1RunResult =
 const digest = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
 
 /** Only read the immutable, hashed source snapshot inside the owned store. */
-function readSource(input: V1RunInput): V1RequestInput {
+function readSource(input: V1RunInput): V2RequestInput {
   const row = input.db.prepare(
-    `SELECT r.snapshot_path, r.snapshot_hash, w.cwd FROM source_revisions r
+    `SELECT r.snapshot_path, r.snapshot_hash, w.cwd, w.git_branch FROM source_revisions r
      JOIN sessions s ON s.session_key = r.session_key
      JOIN workspaces w ON w.workspace_key = s.workspace_key
      WHERE r.source_id = ? AND r.status = 'captured'`,
-  ).get(input.job.sourceId) as { snapshot_path: string; snapshot_hash: string; cwd: string } | undefined;
+  ).get(input.job.sourceId) as { snapshot_path: string; snapshot_hash: string; cwd: string;
+    git_branch: string | null } | undefined;
   if (!row) throw new Error("source_unavailable_for_version");
   const path = resolve(row.snapshot_path);
   const sources = join(input.root, "sources");
@@ -81,7 +88,7 @@ function readSource(input: V1RunInput): V1RequestInput {
   }
   const snapshot = parsed as { schemaVersion?: unknown; sourceId?: unknown; items?: unknown;
     sessionKey?: unknown; branchId?: unknown; leafId?: unknown; workspaceKey?: unknown;
-    omissionsManifest?: unknown } | null;
+    workspace?: unknown; omissionsManifest?: unknown } | null;
   if (!snapshot || snapshot.schemaVersion !== 1 || snapshot.sourceId !== input.job.sourceId ||
       !Array.isArray(snapshot.items) || snapshot.items.some((item) =>
         !item || typeof item !== "object" || typeof item.entryId !== "string" ||
@@ -95,9 +102,18 @@ function readSource(input: V1RunInput): V1RequestInput {
     throw new Error("source_unavailable_for_version");
   }
   const asString = (value: unknown) => typeof value === "string" ? value : undefined;
+  // Captured scope is immutable; the workspaces row may have changed branch
+  // since this revision was enrolled. Older snapshots without scope fall back.
+  const scope = snapshot.workspace && typeof snapshot.workspace === "object" &&
+    !Array.isArray(snapshot.workspace) ? snapshot.workspace as { cwdReal?: unknown; gitBranch?: unknown } : null;
+  const cwd = typeof scope?.cwdReal === "string" ? scope.cwdReal : row.cwd;
+  let gitBranch = row.git_branch;
+  if (typeof scope?.gitBranch === "string") gitBranch = scope.gitBranch;
+  else if (scope?.gitBranch === null) gitBranch = null;
   // SAFETY: every field consumed by the renderer is checked above; the
   // snapshot hash also matches the immutable DB reference.
-  return { snapshotPath: path, cwd: row.cwd, items: snapshot.items as V1RequestInput["items"],
+  return { snapshotPath: path, cwd, gitBranch,
+    items: snapshot.items as V2RequestInput["items"],
     manifest: { sourceId: input.job.sourceId, sessionKey: asString(snapshot.sessionKey),
       branchId: asString(snapshot.branchId), leafId: asString(snapshot.leafId),
       workspaceKey: asString(snapshot.workspaceKey),
@@ -106,10 +122,11 @@ function readSource(input: V1RunInput): V1RequestInput {
 }
 
 /** Select by the shared user → assistant → tool tier, newest within a tier. */
-function fitV1Context(source: V1RequestInput, model: ResolvedMemoryModel,
-  outputTokens: number): ReturnType<typeof renderV1Request> | null {
+function fitContext(source: V2RequestInput, model: ResolvedMemoryModel,
+  outputTokens: number, version: "v1" | "v2"): ReturnType<typeof renderV1Request> | null {
+  const render = version === "v1" ? renderV1Request : renderV2Request;
   const maxBytes = Math.floor((model.contextWindow - outputTokens - 1_024) * 0.7);
-  const base = renderV1Request({ ...source, items: [] });
+  const base = render({ ...source, items: [] });
   const baseBytes = Buffer.byteLength(base.systemPrompt + base.userPrompt, "utf8");
   if (baseBytes + 80 > maxBytes) return null;
   let remaining = maxBytes - baseBytes - 80; // reserve for the explicit omissions marker
@@ -121,7 +138,7 @@ function fitV1Context(source: V1RequestInput, model: ResolvedMemoryModel,
     const bytes = Buffer.byteLength(v1EvidenceLine(item), "utf8") + 1;
     if (bytes <= remaining) { selected.add(index); remaining -= bytes; }
   }
-  const request = renderV1Request({ ...source,
+  const request = render({ ...source,
     items: source.items.filter((_item, index) => selected.has(index)),
     omittedForContext: source.items.length - selected.size });
   return Buffer.byteLength(request.systemPrompt + request.userPrompt, "utf8") <= maxBytes ? request : null;
@@ -181,10 +198,10 @@ async function requestWithLease(input: V1RunInput, model: ResolvedMemoryModel,
   }
 }
 
-/** One v1 job through the captured model port, with budget and fencing gates. */
-export async function runV1Extraction(input: V1RunInput): Promise<V1RunResult> {
+/** Shared budget/fencing gates with a version-specific pinned prompt and parser. */
+async function runExtraction(input: V1RunInput, version: "v1" | "v2"): Promise<V1RunResult> {
   const clock = () => input.clock?.() ?? input.now;
-  if (input.job.memoryVersion !== "v1") {
+  if (input.job.memoryVersion !== version) {
     const changed = failExtraction(input.db, input.job, "blocked", "unsupported_version", clock());
     return { status: changed ? "blocked" : "superseded" };
   }
@@ -193,7 +210,7 @@ export async function runV1Extraction(input: V1RunInput): Promise<V1RunResult> {
     failExtraction(input.db, input.job, "blocked", "model_not_found", clock());
     return { status: "blocked" };
   }
-  let source: V1RequestInput;
+  let source: V2RequestInput;
   try {
     source = readSource(input);
   } catch {
@@ -201,7 +218,7 @@ export async function runV1Extraction(input: V1RunInput): Promise<V1RunResult> {
     return { status: "blocked" };
   }
   const outputTokens = Math.min(6_000, model.maxTokens);
-  const request = fitV1Context(source, model, outputTokens);
+  const request = fitContext(source, model, outputTokens, version);
   if (!request) {
     failExtraction(input.db, input.job, "blocked", "context_too_small", clock());
     return { status: "blocked" };
@@ -276,15 +293,21 @@ export async function runV1Extraction(input: V1RunInput): Promise<V1RunResult> {
         clock(), { retryAfterMs: retryAfterMs(response.errorMessage) });
       return { status: changed ? kind === "transient" ? "retry_wait" : "blocked" : "superseded" };
     }
-    const parsed = response.stopReason === "stop"
-      ? parseV1Output(response.text, input.limits.outputBytes)
-      : { ok: false as const, reason: `unexpected stop reason ${response.stopReason}` };
+    let parsed: ReturnType<typeof parseV1Output> | ReturnType<typeof parseV2Output>;
+    if (response.stopReason !== "stop") {
+      parsed = { ok: false, reason: `unexpected stop reason ${response.stopReason}` };
+    } else if (version === "v1") {
+      parsed = parseV1Output(response.text, input.limits.outputBytes);
+    } else {
+      parsed = parseV2Output(response.text, input.limits.outputBytes, input.limits.v2RolloutSummaryBytes ?? 9_000);
+    }
     if (parsed.ok) {
       const accepted = commitExtraction(input.db, input.job, {
-        memoryVersion: "v1", promptHash: request.promptHash, model: input.modelRef,
-        rawMemory: parsed.output.raw_memory, rolloutSummary: parsed.output.rollout_summary,
-        rolloutSlug: parsed.output.rollout_slug, outputHash: parsed.outputHash,
-        usage: usage ?? estimate, outcome: parsed.outcome,
+        memoryVersion: version, promptHash: request.promptHash, model: input.modelRef,
+        rawMemory: "raw_memory" in parsed.output ? parsed.output.raw_memory : null,
+        rolloutSummary: parsed.output.rollout_summary, rolloutSlug: parsed.output.rollout_slug,
+        outputHash: parsed.outputHash, usage: usage ?? estimate, outcome: parsed.outcome,
+        truncation: "truncation" in parsed ? parsed.truncation : undefined,
       }, clock());
       return { status: accepted ? parsed.outcome : "superseded" };
     }
@@ -292,8 +315,16 @@ export async function runV1Extraction(input: V1RunInput): Promise<V1RunResult> {
       const changed = failExtraction(input.db, input.job, "blocked", "invalid_schema", clock());
       return { status: changed ? "blocked" : "superseded" };
     }
-    repair = `\n\nRepair the prior JSON response. Return ONLY the three required v1 string fields. Error: ${parsed.reason}. ` +
+    repair = `\n\nRepair the prior JSON response. Return ONLY the ${version === "v1" ? "three required v1" : "two required v2"} string fields. Error: ${parsed.reason}. ` +
       `Prior response: ${truncateUtf8(response.text, 4096).text}`;
   }
-  throw new Error("unreachable v1 repair limit");
+  throw new Error("unreachable extraction repair limit");
+}
+
+export function runV1Extraction(input: V1RunInput): Promise<V1RunResult> {
+  return runExtraction(input, "v1");
+}
+
+export function runV2Extraction(input: V2RunInput): Promise<V1RunResult> {
+  return runExtraction(input, "v2");
 }

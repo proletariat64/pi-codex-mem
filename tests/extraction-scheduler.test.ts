@@ -91,6 +91,69 @@ test("no-output watermark prevents repeated model calls at startup", async (t) =
   assert.equal((fx.db.prepare("SELECT status FROM jobs").get() as { status: string }).status, "no_output");
 });
 
+test("switching to v2 enrolls the same captured source without reusing v1's no-output watermark", async (t) => {
+  const fx = setup(t);
+  fx.config.schedule.minIdleMinutes = 0;
+  fx.port.request = async (_model, context) => { fx.calls.push(context); return { stopReason: "stop",
+    text: context.systemPrompt?.includes("You are part of an agent memory system")
+      ? '{"rollout_summary":"Decision retained in v2","rollout_slug":"decision"}'
+      : '{"raw_memory":"","rollout_summary":"","rollout_slug":""}' }; };
+  fx.scheduler.trigger();
+  assert.deepEqual(await fx.scheduler.runPass(), [{ status: "no_output" }]);
+  fx.config.version = "v2";
+  fx.scheduler.trigger();
+  assert.deepEqual(await fx.scheduler.runPass(), [{ status: "succeeded" }]);
+  assert.equal(fx.calls.length, 2);
+  assert.deepEqual(fx.db.prepare("SELECT memory_version, outcome, raw_memory FROM extractions ORDER BY memory_version").all()
+    .map((row) => ({ ...row })), [
+    { memory_version: "v1", outcome: "no_output", raw_memory: "" },
+    { memory_version: "v2", outcome: "succeeded", raw_memory: null },
+  ]);
+});
+
+test("dual writing extracts each version once within a shared two-job pass", async (t) => {
+  const fx = setup(t);
+  fx.config.schedule.minIdleMinutes = 0;
+  fx.config.dualWrite = true;
+  fx.port.request = async (_model, context) => { fx.calls.push(context); return { stopReason: "stop",
+    text: context.systemPrompt?.includes("You are part of an agent memory system")
+      ? '{"rollout_summary":"Separate v2 history","rollout_slug":"history"}'
+      : '{"raw_memory":"v1 learning","rollout_summary":"v1 history","rollout_slug":"history"}' }; };
+  fx.scheduler.trigger();
+  assert.deepEqual(await fx.scheduler.runPass(), [{ status: "succeeded" }, { status: "succeeded" }]);
+  assert.equal(fx.calls.length, 2);
+  assert.deepEqual(fx.db.prepare("SELECT memory_version FROM extractions ORDER BY memory_version").all()
+    .map((row) => row.memory_version), ["v1", "v2"]);
+  assert.equal((fx.db.prepare("SELECT SUM(call_count) AS n FROM budget_usage").get() as { n: number }).n, 2);
+  fx.scheduler.trigger();
+  assert.deepEqual(await fx.scheduler.runPass(), []);
+  assert.equal(fx.calls.length, 2);
+});
+
+test("a v1 provider failure cannot suppress successful v2 dual-write work", async (t) => {
+  const fx = setup(t);
+  fx.config.schedule.minIdleMinutes = 0;
+  fx.config.dualWrite = true;
+  let failV1 = true;
+  fx.port.request = async (_model, context) => { fx.calls.push(context);
+    if (context.systemPrompt?.includes("You are part of an agent memory system")) return {
+      stopReason: "stop", text: '{"rollout_summary":"Independent v2 history","rollout_slug":"history"}',
+    };
+    if (failV1) return { stopReason: "error", text: "", errorMessage: "503 temporary" };
+    return { stopReason: "stop", text: '{"raw_memory":"v1 lesson","rollout_summary":"history","rollout_slug":"history"}' };
+  };
+  fx.scheduler.trigger();
+  assert.deepEqual(await fx.scheduler.runPass(), [{ status: "retry_wait" }, { status: "succeeded" }]);
+  assert.deepEqual(fx.db.prepare("SELECT memory_version FROM extractions").all().map((row) => row.memory_version), ["v2"]);
+  assert.equal((fx.db.prepare("SELECT SUM(call_count) AS n FROM budget_usage").get() as { n: number }).n, 2);
+  failV1 = false;
+  fx.setNow(NOW + 60_001);
+  assert.deepEqual(await fx.scheduler.runPass(), [{ status: "succeeded" }]);
+  assert.deepEqual(fx.db.prepare("SELECT memory_version FROM extractions ORDER BY memory_version").all()
+    .map((row) => row.memory_version), ["v1", "v2"]);
+  assert.equal(fx.calls.length, 3);
+});
+
 test("active foreground and another process's session heartbeat defer new requests", async (t) => {
   const fx = setup(t);
   fx.setNow(NOW + 40_000);

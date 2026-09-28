@@ -28,8 +28,10 @@ import {
 import { runDoctor, type DoctorInput } from "./doctor.ts";
 import { clearProcessActivity, enqueueExtraction, extractionConfigEpoch, recordProcessActivity } from "./store/jobs.ts";
 import { createRegistryModelPort } from "./extraction/model-port.ts";
-import { ExtractionScheduler } from "./extraction/scheduler.ts";
+import { ExtractionScheduler, targetVersions } from "./extraction/scheduler.ts";
 import { v1PromptHash } from "./extraction/v1.ts";
+import { v2PromptHash } from "./extraction/v2.ts";
+import type { MemoryVersion } from "./config.ts";
 
 const EXTENSION_VERSION = "0.1.0";
 
@@ -393,11 +395,12 @@ export default function (pi: ExtensionAPI) {
         },
       });
       state.captureError = null;
-      if (state.capture.status === "captured" && config.config.generate &&
-          (config.config.version === "v1" || config.config.dualWrite)) {
-        enqueueExtraction(state.db, { sourceId: state.capture.sourceId,
-          memoryVersion: "v1", promptHash: v1PromptHash(),
-          configEpoch: extractionConfigEpoch(config.config), now: Date.now() });
+      if (state.capture.status === "captured" && config.config.generate) {
+        for (const version of targetVersions(config.config)) {
+          enqueueExtraction(state.db, { sourceId: state.capture.sourceId,
+            memoryVersion: version, promptHash: version === "v1" ? v1PromptHash() : v2PromptHash(),
+            configEpoch: extractionConfigEpoch(config.config), now: Date.now() });
+        }
       }
     } catch (err) {
       if (!notePrivacyCleanupFailure(err, root)) {
@@ -558,10 +561,10 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
-  function extractionStatusLine(root: string): string {
+  function extractionStatusLine(root: string, version: MemoryVersion): string {
     const storePath = join(root, "state.sqlite");
     if (!state.db && (storeSchemaState(root) !== "current" || lstatSync(storePath).isSymbolicLink())) {
-      return "v1 extraction: not queued";
+      return `${version} extraction: not queued`;
     }
     const db = state.db ?? new DatabaseSync(storePath, { readOnly: true });
     try {
@@ -569,17 +572,17 @@ export default function (pi: ExtensionAPI) {
         `SELECT j.status, j.error_code, j.due_at FROM jobs j
          JOIN source_revisions r ON r.source_id = j.source_id
          JOIN branch_heads h ON h.session_key = r.session_key AND h.branch_id = r.branch_id
-         WHERE j.kind = 'extract' AND j.memory_version = 'v1'
+         WHERE j.kind = 'extract' AND j.memory_version = ?
            AND h.state = 'active' AND h.latest_revision = r.source_id
          ORDER BY j.updated_at DESC LIMIT 1`,
-      ).get() as { status: string; error_code: string | null; due_at: number } | undefined;
-      if (!row) return "v1 extraction: not queued";
+      ).get(version) as { status: string; error_code: string | null; due_at: number } | undefined;
+      if (!row) return `${version} extraction: not queued`;
       const outcome = row.status === "leased" ? "extracting" : row.status === "succeeded" ? "extracted" : row.status;
       const reason = row.error_code ? ` — ${row.error_code}` : "";
       const due = row.status === "retry_wait" ? ` (next due ${new Date(row.due_at).toISOString()})` : "";
-      return `v1 extraction: ${outcome}${reason}${due}`;
+      return `${version} extraction: ${outcome}${reason}${due}`;
     } catch {
-      return "v1 extraction: store unavailable";
+      return `${version} extraction: store unavailable`;
     } finally {
       if (!state.db) db.close();
     }
@@ -616,7 +619,8 @@ export default function (pi: ExtensionAPI) {
           : state.capture?.status === "ephemeral"
             ? "capture: ephemeral (no persistent session)"
             : "capture: pending settlement",
-        extractionStatusLine(root),
+        extractionStatusLine(root, "v1"),
+        extractionStatusLine(root, "v2"),
         ...(state.captureError ? [`capture error: ${state.captureError}`] : []),
       );
     }
@@ -657,9 +661,6 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     if (!ctx.isIdle() || !foregroundIdle) { report("foreground session is busy", "warning"); return; }
-    if (cfg.config.version !== "v1" && !cfg.config.dualWrite) {
-      report("v1 is not a configured generation target", "warning"); return;
-    }
     if (!cfg.config.models.extract) {
       report("blocked: no extraction model configured", "warning"); return;
     }

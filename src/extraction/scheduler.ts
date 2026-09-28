@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
-import type { MemoryConfig } from "../config.ts";
+import type { MemoryConfig, MemoryVersion } from "../config.ts";
 import { claimDueExtractions, enqueueExtraction, extractionConfigEpoch, recoverExpiredExtractions } from "../store/jobs.ts";
-import { runV1Extraction, type MemoryModelPort, type V1RunResult } from "./runner.ts";
+import { runV1Extraction, runV2Extraction, type MemoryModelPort, type V1RunResult } from "./runner.ts";
 import { v1PromptHash } from "./v1.ts";
+import { v2PromptHash } from "./v2.ts";
 
 interface TimerHandle { cancel(): void }
 export interface SchedulerTimer {
@@ -31,17 +32,24 @@ export interface ExtractionSchedulerOptions {
 }
 
 /** Enroll active, previously captured snapshots after restart or configuration changes. */
-export function enqueueActiveV1(db: DatabaseSync, now: number, config: MemoryConfig): void {
+export function targetVersions(config: MemoryConfig): MemoryVersion[] {
+  if (!config.dualWrite) return [config.version];
+  return [config.version, config.version === "v1" ? "v2" : "v1"];
+}
+
+export function enqueueActiveExtractions(db: DatabaseSync, now: number, config: MemoryConfig): void {
   const rows = db.prepare(
     `SELECT r.source_id FROM source_revisions r JOIN branch_heads h
      ON h.session_key = r.session_key AND h.branch_id = r.branch_id
      WHERE r.status = 'captured' AND h.state = 'active' AND h.latest_revision = r.source_id`,
   ).all() as { source_id: string }[];
-  const promptHash = v1PromptHash();
-  for (const row of rows) enqueueExtraction(db, {
-    sourceId: row.source_id, memoryVersion: "v1", promptHash,
-    configEpoch: extractionConfigEpoch(config), now,
-  });
+  for (const version of targetVersions(config)) {
+    const promptHash = version === "v1" ? v1PromptHash() : v2PromptHash();
+    for (const row of rows) enqueueExtraction(db, {
+      sourceId: row.source_id, memoryVersion: version, promptHash,
+      configEpoch: extractionConfigEpoch(config), now,
+    });
+  }
 }
 
 /** One-shot scheduling at the earliest eligible due/idle/busy/lease boundary. */
@@ -51,6 +59,7 @@ export class ExtractionScheduler {
   private stopped = false;
   private running = false;
   private backoffUntil = 0;
+  private nextVersion: MemoryVersion | null = null;
   private readonly controllers = new Set<AbortController>();
   private readonly inFlight = new Set<Promise<V1RunResult>>();
 
@@ -59,9 +68,9 @@ export class ExtractionScheduler {
   trigger(): void {
     if (this.stopped) return;
     const cfg = this.options.config();
-    if (cfg?.enabled && cfg.generate && (cfg.version === "v1" || cfg.dualWrite)) {
+    if (cfg?.enabled && cfg.generate) {
       recoverExpiredExtractions(this.options.db, this.options.now());
-      enqueueActiveV1(this.options.db, this.options.now(), cfg);
+      enqueueActiveExtractions(this.options.db, this.options.now(), cfg);
     }
     this.schedule();
   }
@@ -78,38 +87,43 @@ export class ExtractionScheduler {
     if (this.stopped || this.running || !this.options.isForegroundIdle()) return [];
     const cfg = this.options.config();
     const port = this.options.modelPort();
-    if (!cfg || !cfg.enabled || !cfg.generate || !port ||
-        (cfg.version !== "v1" && !cfg.dualWrite) || !cfg.models.extract) return [];
+    if (!cfg || !cfg.enabled || !cfg.generate || !port || !cfg.models.extract) return [];
+    const modelRef = cfg.models.extract;
     this.timer?.cancel();
     this.timer = null;
     this.running = true;
     try {
-      enqueueActiveV1(this.options.db, this.options.now(), cfg);
+      enqueueActiveExtractions(this.options.db, this.options.now(), cfg);
       const configEpoch = extractionConfigEpoch(cfg);
       const now = this.options.now();
       const jobs = claimDueExtractions(this.options.db, { owner: randomUUID(), now,
         limit: cfg.schedule.maxExtractionsPerPass, slots: cfg.schedule.extractionConcurrency,
+        versions: targetVersions(cfg), preferredVersion: this.nextVersion ?? cfg.version,
         minIdleMs: force ? 0 : cfg.schedule.minIdleMinutes * 60_000,
         maxAgeMs: cfg.schedule.maxSourceAgeDays * 86_400_000 });
+      const last = jobs.at(-1);
+      if (cfg.dualWrite && last) this.nextVersion = last.memoryVersion === "v1" ? "v2" : "v1";
       const tasks = jobs.map((job) => {
         const controller = new AbortController();
         this.controllers.add(controller);
-        const task = runV1Extraction({ db: this.options.db, root: this.options.root,
-          job, modelRef: cfg.models.extract!, port, now, clock: this.options.now,
+        const input = { db: this.options.db, root: this.options.root,
+          job, modelRef, port, now, clock: this.options.now,
           canStartRequest: () => {
-            if (this.stopped || !this.options.isForegroundIdle()) return "foreground_active";
+            if (this.stopped || !this.options.isForegroundIdle()) return "foreground_active" as const;
             const latest = this.options.config();
             if (!latest || !latest.enabled || !latest.generate ||
-                (latest.version !== "v1" && !latest.dualWrite) ||
-                extractionConfigEpoch(latest) !== configEpoch) return "configuration_changed";
-            return "ready";
+                !targetVersions(latest).includes(job.memoryVersion) ||
+                extractionConfigEpoch(latest) !== configEpoch) return "configuration_changed" as const;
+            return "ready" as const;
           },
           timezone: cfg.timezone, limits: {
             outputBytes: cfg.limits.extractionOutputBytes,
+            v2RolloutSummaryBytes: cfg.limits.v2RolloutSummaryBytes,
             dailyInputTokens: cfg.limits.dailyInputTokens,
             dailyOutputTokens: cfg.limits.dailyOutputTokens,
             dailyRequests: cfg.limits.dailyRequests,
-          }, signal: controller.signal });
+          }, signal: controller.signal };
+        const task = job.memoryVersion === "v2" ? runV2Extraction(input) : runV1Extraction(input);
         this.inFlight.add(task);
         void task.finally(() => {
           this.inFlight.delete(task);
@@ -136,8 +150,7 @@ export class ExtractionScheduler {
     this.timer = null;
     if (this.stopped || this.running || !this.options.isForegroundIdle()) return;
     const cfg = this.options.config();
-    if (!cfg || !cfg.enabled || !cfg.generate || !cfg.models.extract ||
-        (cfg.version !== "v1" && !cfg.dualWrite) || !this.options.modelPort()) return;
+    if (!cfg || !cfg.enabled || !cfg.generate || !cfg.models.extract || !this.options.modelPort()) return;
     const now = this.options.now();
     const minimum = cfg.schedule.minIdleMinutes * 60_000;
     const rows = this.options.db.prepare(
@@ -147,10 +160,12 @@ export class ExtractionScheduler {
        FROM jobs j JOIN source_revisions r ON r.source_id = j.source_id
        JOIN sessions s ON s.session_key = r.session_key
        JOIN branch_heads h ON h.session_key = r.session_key AND h.branch_id = r.branch_id
-       WHERE j.kind = 'extract' AND j.memory_version = 'v1' AND j.status IN ('queued', 'retry_wait')
-         AND j.attempt_count < 3 AND r.status = 'captured' AND h.state = 'active'
+       WHERE j.kind = 'extract' AND j.memory_version IN (?, ?)
+         AND j.status IN ('queued', 'retry_wait') AND j.attempt_count < 3
+         AND r.status = 'captured' AND h.state = 'active'
          AND h.latest_revision = r.source_id AND r.source_time >= ?`,
-    ).all(now, now - cfg.schedule.maxSourceAgeDays * 86_400_000) as {
+    ).all(now, cfg.version, cfg.dualWrite ? (cfg.version === "v1" ? "v2" : "v1") : cfg.version,
+      now - cfg.schedule.maxSourceAgeDays * 86_400_000) as {
       due_at: number; source_time: number; last_activity_at: number; session_key: string; busy_until: number | null;
     }[];
     const leases = this.options.db.prepare(

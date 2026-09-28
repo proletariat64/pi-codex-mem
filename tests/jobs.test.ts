@@ -37,7 +37,25 @@ function accepted(memoryVersion: "v1" | "v2" = "v1") {
   return { memoryVersion, promptHash: PROMPT_HASH, model: { provider: "mock", modelId: "extract" },
     rawMemory: memoryVersion === "v1" ? "decision" : null,
     rolloutSummary: "summary", rolloutSlug: "decision", outputHash: "o".repeat(64),
-    usage: { input: 20, output: 10 }, outcome: "succeeded" as const };
+    usage: { input: 20, output: 10 }, outcome: "succeeded" as const,
+    truncation: memoryVersion === "v2" ? { truncated: false, originalBytes: 7, acceptedBytes: 7 } : undefined };
+}
+
+function downgradeToSchema6(db: DatabaseSync): void {
+  db.exec("ALTER TABLE extractions DROP COLUMN accepted_bytes");
+  db.exec("ALTER TABLE extractions DROP COLUMN original_bytes");
+  db.exec("ALTER TABLE extractions DROP COLUMN truncated");
+  db.exec("DROP TABLE privacy_scrub_state");
+  db.prepare("DELETE FROM schema_migrations WHERE version >= 7").run();
+}
+
+function commitLegacyText(db: DatabaseSync, job: LeasedJob, text: string): void {
+  db.prepare(
+    `INSERT INTO extractions (extraction_id, source_id, memory_version, prompt_hash, job_id,
+       raw_memory, rollout_summary, rollout_slug, model_provider, model_id, output_hash,
+       outcome, usage_input, usage_output, created_at)
+     VALUES (?, ?, 'v1', ?, ?, ?, 'summary', 'legacy', 'mock', 'extract', ?, 'succeeded', 1, 1, ?)`,
+  ).run("legacy-extraction", SOURCE_ID, PROMPT_HASH, job.jobId, text, "o".repeat(64), NOW + 1);
 }
 
 test("one durable v1 job is leased once; an expired lease fences the late response after restart", (t) => {
@@ -59,6 +77,34 @@ test("one durable v1 job is leased once; an expired lease fences the late respon
   assert.equal(commitExtraction(reopened, second, accepted(), NOW + 181_002), true);
   assert.equal((reopened.prepare("SELECT COUNT(*) AS n FROM extractions").get() as { n: number }).n, 1);
   assert.deepEqual(claimDueExtractions(reopened, { owner: "three", now: NOW + 400_000, limit: 2 }), []);
+});
+
+test("v1 no-output leaves v2 independent, and v2 stores NULL raw memory with truncation metadata", (t) => {
+  const { db } = fixture(t);
+  enqueueExtraction(db, { sourceId: SOURCE_ID, memoryVersion: "v1", promptHash: PROMPT_HASH, now: NOW });
+  const [v1] = claimDueExtractions(db, { owner: "v1", now: NOW, limit: 1 });
+  assert.ok(v1);
+  assert.equal(v1.memoryVersion, "v1");
+  assert.equal(commitExtraction(db, v1, { ...accepted(), rawMemory: "", rolloutSummary: "",
+    rolloutSlug: "", outcome: "no_output" }, NOW + 1), true);
+  enqueueExtraction(db, { sourceId: SOURCE_ID, memoryVersion: "v2", promptHash: "b".repeat(64), now: NOW + 2 });
+  const [v2] = claimDueExtractions(db, { owner: "v2", now: NOW + 2, limit: 1 });
+  assert.ok(v2);
+  assert.equal(v2.memoryVersion, "v2");
+  const summary = "Decision retained\n[... remainder omitted ...]";
+  const result = { ...accepted("v2"), promptHash: v2.promptHash, rolloutSummary: summary,
+    truncation: { truncated: true, originalBytes: 9_230, acceptedBytes: Buffer.byteLength(summary, "utf8") } };
+  assert.equal(commitExtraction(db, v2, { ...result, memoryVersion: "v1" }, NOW + 3), false);
+  assert.equal(commitExtraction(db, v2, { ...result, rawMemory: "v1 leak" }, NOW + 3), false);
+  assert.equal(commitExtraction(db, v2, result, NOW + 3), true);
+  const row = db.prepare("SELECT raw_memory, truncated, original_bytes, accepted_bytes FROM extractions WHERE memory_version = 'v2'")
+    .get() as { raw_memory: string | null; truncated: number; original_bytes: number; accepted_bytes: number };
+  assert.deepEqual({ ...row }, { raw_memory: null, truncated: 1, original_bytes: 9_230,
+    accepted_bytes: Buffer.byteLength(summary, "utf8") });
+  assert.deepEqual(claimDueExtractions(db, { owner: "again", now: NOW + 4, limit: 2 }), []);
+  assert.throws(() => db.prepare(
+    `UPDATE extractions SET raw_memory = 'not allowed' WHERE memory_version = 'v2'`,
+  ).run(), /CHECK constraint failed/);
 });
 
 test("privacy revocation deletes derived extraction text in the same transaction", (t) => {
@@ -86,16 +132,13 @@ test("startup vacuums legacy bytes already deleted with secure_delete off", (t) 
   const { root, db } = fixture(t);
   // Simulate a pre-upgrade store that already deleted a revoked SQL row but
   // retained its bytes in SQLite free space before secure_delete was enabled.
-  if (db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'privacy_scrub_state'").get()) {
-    db.exec("DROP TABLE privacy_scrub_state");
-    db.prepare("DELETE FROM schema_migrations WHERE version = 7").run();
-  }
+  downgradeToSchema6(db);
   db.exec("PRAGMA secure_delete = OFF");
   enqueueExtraction(db, { sourceId: SOURCE_ID, memoryVersion: "v1", promptHash: PROMPT_HASH, now: NOW });
   const [job] = claimDueExtractions(db, { owner: "old", now: NOW, limit: 1 });
   assert.ok(job);
   const marker = "PRIVATE_LEGACY_EXTRACTION_b53d87_UNIQUE";
-  assert.equal(commitExtraction(db, job, { ...accepted(), rawMemory: marker }, NOW + 1), true);
+  commitLegacyText(db, job, marker);
   db.prepare("UPDATE source_revisions SET status = 'privacy_revoked' WHERE source_id = ?").run(SOURCE_ID);
   db.prepare("DELETE FROM extractions WHERE source_id = ?").run(SOURCE_ID);
   db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
@@ -113,14 +156,13 @@ test("startup vacuums legacy bytes already deleted with secure_delete off", (t) 
 
 test("upgrade vacuums deleted legacy bytes even when no privacy tombstone remains", (t) => {
   const { root, db } = fixture(t);
-  db.exec("DROP TABLE privacy_scrub_state");
-  db.prepare("DELETE FROM schema_migrations WHERE version = 7").run();
+  downgradeToSchema6(db);
   db.exec("PRAGMA secure_delete = OFF");
   enqueueExtraction(db, { sourceId: SOURCE_ID, memoryVersion: "v1", promptHash: PROMPT_HASH, now: NOW });
   const [job] = claimDueExtractions(db, { owner: "old", now: NOW, limit: 1 });
   assert.ok(job);
   const marker = "PRIVATE_NO_TOMBSTONE_e38c_UNIQUE";
-  assert.equal(commitExtraction(db, job, { ...accepted(), rawMemory: marker }, NOW + 1), true);
+  commitLegacyText(db, job, marker);
   db.prepare("DELETE FROM extractions WHERE source_id = ?").run(SOURCE_ID);
   db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
   db.close();
@@ -135,14 +177,13 @@ test("upgrade vacuums deleted legacy bytes even when no privacy tombstone remain
 
 test("legacy free-space scrub retries if a reader blocks its final WAL checkpoint", (t) => {
   const { root, db } = fixture(t);
-  db.exec("DROP TABLE privacy_scrub_state");
-  db.prepare("DELETE FROM schema_migrations WHERE version = 7").run();
+  downgradeToSchema6(db);
   db.exec("PRAGMA secure_delete = OFF");
   enqueueExtraction(db, { sourceId: SOURCE_ID, memoryVersion: "v1", promptHash: PROMPT_HASH, now: NOW });
   const [job] = claimDueExtractions(db, { owner: "old", now: NOW, limit: 1 });
   assert.ok(job);
   const marker = "PRIVATE_CHECKPOINT_RETRY_f415_UNIQUE";
-  assert.equal(commitExtraction(db, job, { ...accepted(), rawMemory: marker }, NOW + 1), true);
+  commitLegacyText(db, job, marker);
   db.prepare("DELETE FROM extractions WHERE source_id = ?").run(SOURCE_ID);
   db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
   db.close();
@@ -167,14 +208,35 @@ test("schema 5 jobs upgrade to configuration epochs without losing durable work"
   db.close();
   const legacy = new DatabaseSync(join(root, "state.sqlite"));
   legacy.exec("ALTER TABLE jobs DROP COLUMN config_epoch");
-  legacy.exec("DROP TABLE privacy_scrub_state");
+  downgradeToSchema6(legacy);
   legacy.prepare("DELETE FROM schema_migrations WHERE version >= 6").run();
   legacy.close();
   const upgraded = openStateDb(root);
   t.after(() => upgraded.close());
   assert.deepEqual({ ...upgraded.prepare("SELECT status, config_epoch FROM jobs").get() },
     { status: "queued", config_epoch: "" });
-  assert.equal((upgraded.prepare("SELECT MAX(version) AS v FROM schema_migrations").get() as { v: number }).v, 7);
+  assert.equal((upgraded.prepare("SELECT MAX(version) AS v FROM schema_migrations").get() as { v: number }).v, 8);
+});
+
+test("schema 7 migration preserves existing v1 output while adding v2 truncation metadata", (t) => {
+  const { root, db } = fixture(t);
+  enqueueExtraction(db, { sourceId: SOURCE_ID, memoryVersion: "v1", promptHash: PROMPT_HASH, now: NOW });
+  const [job] = claimDueExtractions(db, { owner: "legacy", now: NOW, limit: 1 });
+  assert.ok(job);
+  assert.equal(commitExtraction(db, job, accepted(), NOW + 1), true);
+  db.close();
+  const legacy = new DatabaseSync(join(root, "state.sqlite"));
+  legacy.exec("ALTER TABLE extractions DROP COLUMN accepted_bytes");
+  legacy.exec("ALTER TABLE extractions DROP COLUMN original_bytes");
+  legacy.exec("ALTER TABLE extractions DROP COLUMN truncated");
+  legacy.prepare("DELETE FROM schema_migrations WHERE version = 8").run();
+  legacy.close();
+  const migrated = openStateDb(root);
+  t.after(() => migrated.close());
+  const row = migrated.prepare("SELECT raw_memory, truncated, original_bytes, accepted_bytes FROM extractions")
+    .get() as { raw_memory: string; truncated: number; original_bytes: number; accepted_bytes: number };
+  assert.deepEqual({ ...row }, { raw_memory: "decision", truncated: 0, original_bytes: 0, accepted_bytes: 0 });
+  assert.equal((migrated.prepare("SELECT MAX(version) AS v FROM schema_migrations").get() as { v: number }).v, 8);
 });
 
 test("a conflicting extraction is never reported as a successful commit", (t) => {

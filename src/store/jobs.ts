@@ -26,6 +26,7 @@ export interface ExtractionResult {
   outputHash: string;
   usage: { input: number; output: number };
   outcome: "succeeded" | "no_output";
+  truncation?: { truncated: boolean; originalBytes: number; acceptedBytes: number };
 }
 
 /** A changed effective extraction configuration starts a fresh retry epoch. */
@@ -102,7 +103,12 @@ export function recoverExpiredExtractions(db: DatabaseSync, now: number): void {
 /** Claim bounded store-wide slots without holding SQLite open during provider I/O. */
 export function claimDueExtractions(db: DatabaseSync, opts: {
   owner: string; now: number; limit: number; slots?: number; minIdleMs?: number; maxAgeMs?: number;
+  versions?: readonly MemoryVersion[]; preferredVersion?: MemoryVersion;
 }): LeasedJob[] {
+  if (opts.versions && (opts.versions.length < 1 || opts.versions.length > 2 ||
+      opts.versions.some((version) => version !== "v1" && version !== "v2"))) {
+    throw new Error("invalid extraction target versions");
+  }
   db.exec("BEGIN IMMEDIATE");
   try {
     recoverExpired(db, opts.now);
@@ -110,19 +116,25 @@ export function claimDueExtractions(db: DatabaseSync, opts: {
       .get(opts.now) as { n: number }).n;
     const capacity = Math.max(0, Math.min(opts.limit, (opts.slots ?? 2) - active));
     const candidates = db.prepare(
-      `SELECT j.job_id, j.source_id, j.memory_version, j.prompt_hash
-       FROM jobs j JOIN source_revisions r ON r.source_id = j.source_id
-       JOIN sessions s ON s.session_key = r.session_key
-       JOIN branch_heads h ON h.session_key = r.session_key AND h.branch_id = r.branch_id
-       WHERE j.kind = 'extract' AND j.status IN ('queued', 'retry_wait') AND j.due_at <= ?
-         AND j.attempt_count < ? AND r.status = 'captured' AND h.state = 'active'
-         AND h.latest_revision = r.source_id AND s.last_activity_at <= ?
-         AND r.source_time >= ?
-         AND NOT EXISTS (SELECT 1 FROM process_activity p WHERE p.session_key = r.session_key
-           AND p.activity_state = 'active' AND p.expires_at > ?)
-       ORDER BY j.due_at, j.created_at, j.job_id LIMIT ?`,
+      `SELECT job_id, source_id, memory_version, prompt_hash FROM (
+         SELECT j.job_id, j.source_id, j.memory_version, j.prompt_hash, j.due_at, j.created_at,
+           ROW_NUMBER() OVER (PARTITION BY j.memory_version ORDER BY j.due_at, j.created_at, j.job_id) AS version_rank
+         FROM jobs j JOIN source_revisions r ON r.source_id = j.source_id
+         JOIN sessions s ON s.session_key = r.session_key
+         JOIN branch_heads h ON h.session_key = r.session_key AND h.branch_id = r.branch_id
+         WHERE j.kind = 'extract' AND j.status IN ('queued', 'retry_wait') AND j.due_at <= ?
+           AND j.attempt_count < ? AND r.status = 'captured' AND h.state = 'active'
+           AND h.latest_revision = r.source_id AND s.last_activity_at <= ?
+           AND r.source_time >= ?
+           AND (? = 0 OR j.memory_version = ? OR j.memory_version = ?)
+           AND NOT EXISTS (SELECT 1 FROM process_activity p WHERE p.session_key = r.session_key
+             AND p.activity_state = 'active' AND p.expires_at > ?)
+       ) ORDER BY version_rank, CASE WHEN memory_version = ? THEN 0 ELSE 1 END,
+         due_at, created_at, job_id LIMIT ?`,
     ).all(opts.now, MAX_NETWORK_ATTEMPTS, opts.now - (opts.minIdleMs ?? 0),
-      opts.maxAgeMs === undefined ? 0 : opts.now - opts.maxAgeMs, opts.now, capacity) as {
+      opts.maxAgeMs === undefined ? 0 : opts.now - opts.maxAgeMs,
+      opts.versions ? 1 : 0, opts.versions?.[0] ?? "", opts.versions?.[1] ?? "",
+      opts.now, opts.preferredVersion ?? "v1", capacity) as {
       job_id: string; source_id: string; memory_version: MemoryVersion; prompt_hash: string;
     }[];
     const jobs: LeasedJob[] = [];
@@ -226,9 +238,15 @@ export function failExtraction(
 /** Accept a result only for the still-active revision and exact leased fence. */
 export function commitExtraction(db: DatabaseSync, job: LeasedJob, result: ExtractionResult, now: number): boolean {
   const allEmpty = (result.rawMemory ?? "") === "" && result.rolloutSummary === "" && result.rolloutSlug === "";
+  const meta = result.truncation;
   if (result.memoryVersion !== job.memoryVersion || result.promptHash !== job.promptHash ||
-      (job.memoryVersion === "v1" && result.rawMemory === null) ||
-      (job.memoryVersion === "v2" && result.rawMemory !== null) ||
+      (job.memoryVersion === "v1" && (result.rawMemory === null || meta !== undefined)) ||
+      (job.memoryVersion === "v2" && (result.rawMemory !== null || !meta ||
+        !Number.isSafeInteger(meta.originalBytes) || !Number.isSafeInteger(meta.acceptedBytes) ||
+        meta.acceptedBytes < 0 || meta.originalBytes < meta.acceptedBytes ||
+        meta.acceptedBytes > 9_000 ||
+        meta.acceptedBytes !== Buffer.byteLength(result.rolloutSummary, "utf8") ||
+        meta.truncated !== (meta.originalBytes > meta.acceptedBytes))) ||
       (result.outcome === "no_output") !== allEmpty) return false;
   db.exec("BEGIN IMMEDIATE");
   try {
@@ -257,12 +275,13 @@ export function commitExtraction(db: DatabaseSync, job: LeasedJob, result: Extra
       `INSERT OR IGNORE INTO extractions
        (extraction_id, source_id, memory_version, prompt_hash, job_id, raw_memory,
         rollout_summary, rollout_slug, model_provider, model_id, output_hash,
-        outcome, usage_input, usage_output, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        outcome, usage_input, usage_output, truncated, original_bytes, accepted_bytes, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(randomUUID(), job.sourceId, job.memoryVersion, job.promptHash, job.jobId,
       result.rawMemory, result.rolloutSummary, result.rolloutSlug, result.model.provider,
       result.model.modelId, result.outputHash, result.outcome, result.usage.input,
-      result.usage.output, now).changes;
+      result.usage.output, meta?.truncated ? 1 : 0, meta?.originalBytes ?? 0, meta?.acceptedBytes ?? 0,
+      now).changes;
     if (inserted !== 1) {
       db.exec("ROLLBACK");
       return false;

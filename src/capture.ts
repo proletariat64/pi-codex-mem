@@ -75,14 +75,18 @@ function captureBranch(
   // changes before we acquire BEGIN IMMEDIATE; no slow scan holds that lock.
   const dataVersion = (input.db.prepare("PRAGMA data_version").get() as { data_version: number }).data_version;
   const normalized = structuredClone(baseNormalized);
-  type EditIdentity = { id: string; time: number };
+  type EditIdentity = { id: string; time: number; position: number; removal: boolean };
   const latestEdits = new Map<string, EditIdentity>();
+  const positions = new Map(branch.map((entry, index) => [entry.id, index]));
   for (const edit of edits) {
     const target = (edit as { targetId: string }).targetId;
     const parsed = Date.parse(edit.timestamp);
-    latestEdits.set(target, { id: edit.id, time: Number.isFinite(parsed) ? parsed : 0 });
+    latestEdits.set(target, {
+      id: edit.id, time: Number.isFinite(parsed) ? parsed : 0,
+      position: positions.get(edit.id)!, removal: (edit as { replacement: unknown }).replacement === null,
+    });
   }
-  type EditPolicy = EditIdentity & { allowed: string[] };
+  type EditPolicy = { id: string; time: number; allowed: string[] };
   const restrictions = new Map<string, EditPolicy>();
   for (const row of input.db.prepare("SELECT entry_id, allowed_hashes, edit_id, edit_time FROM privacy_edit_targets")
     .all() as { entry_id: string; allowed_hashes: string; edit_id: string; edit_time: number }[]) {
@@ -98,8 +102,14 @@ function captureBranch(
   const itemHash = (item: typeof normalized.items[number]) => hash(`${item.role}:${item.toolCallId ?? ""}:${item.text}`);
   const mayApplyEdit = (entryId: string): boolean => {
     const edit = latestEdits.get(entryId);
+    if (!edit) return false;
     const prior = restrictions.get(entryId);
-    return Boolean(edit && (!prior || edit.time > prior.time || edit.id === prior.id));
+    if (!prior || edit.id === prior.id) return true;
+    // A prior accepted edit on this selected ancestry is causally before the
+    // latest branch-local edit, irrespective of wall-clock corrections. A
+    // sibling replacement cannot override privacy just by replaying later.
+    const priorPosition = positions.get(prior.id);
+    return (priorPosition !== undefined && priorPosition < edit.position) || edit.removal;
   };
   normalized.items = normalized.items.filter((item) => {
     const prior = restrictions.get(item.entryId);

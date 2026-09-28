@@ -203,7 +203,7 @@ test("a fork cannot recapture an ancestor entry after a privacy removal", async 
     assert.ok(!readFileSync(file, "utf8").includes("removed across copies"), "revoked ancestor cannot be recaptured");
   }
   parentEntries.push({ type: "context_edit", id: "e2", parentId: "e1", targetId: "u1",
-    replacement: { content: [{ type: "text", text: "user-approved replacement" }] }, timestamp: "2024-01-03T00:00:00.000Z" });
+    replacement: { content: [{ type: "text", text: "user-approved replacement" }] }, timestamp: "2024-01-01T00:00:00.000Z" });
   await mock.fire("session_start", { type: "session_start" }, ctx);
   await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
   assert.ok(snapshotFiles(memoryRoot).some((file) => readFileSync(file, "utf8").includes("user-approved replacement")),
@@ -213,6 +213,27 @@ test("a fork cannot recapture an ancestor entry after a privacy removal", async 
   assert.ok(snapshotFiles(memoryRoot).some((file) => readFileSync(file, "utf8").includes("user-approved replacement")),
     "replaying an older sibling edit cannot revoke a newer approved replacement");
   assert.ok(snapshotFiles(memoryRoot).every((file) => !readFileSync(file, "utf8").includes("removed across copies")));
+});
+
+test("later same-branch privacy removal wins even when its timestamp goes backward", async (t) => {
+  const { cwd, memoryRoot } = makeSandbox(t);
+  const mock = makeMockPi(); memoryExtension(mock.pi);
+  const entries: unknown[] = [userEntry("u1", "must be erased")];
+  const ctx = { cwd, hasUI: false, mode: "tui", sessionManager: fakeSessionManager(cwd, entries),
+    modelRegistry: { find: () => ({}), streamSimple: () => ({}) }, ui: { notify: () => {} } };
+  await mock.fire("session_start", { type: "session_start" }, ctx);
+  await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
+  entries.push({ type: "context_edit", id: "e1", parentId: "u1", targetId: "u1",
+    replacement: { content: [{ type: "text", text: "first approved text" }] }, timestamp: "2025-01-02T00:00:00.000Z" });
+  await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
+  entries.push({ type: "context_edit", id: "e2", parentId: "e1", targetId: "u1", replacement: null,
+    timestamp: "2024-01-01T00:00:00.000Z" });
+  await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
+  assert.ok(snapshotFiles(memoryRoot).every((file) => !readFileSync(file, "utf8").includes("first approved text")));
+  const { DatabaseSync } = await import("node:sqlite");
+  const db = new DatabaseSync(join(memoryRoot, "state.sqlite"));
+  assert.equal((db.prepare("SELECT allowed_hashes FROM privacy_edit_targets WHERE entry_id = 'u1'").get() as { allowed_hashes: string }).allowed_hashes, "[]");
+  db.close();
 });
 
 test("budget-driven removal of previously captured evidence blocks derived views", async (t) => {

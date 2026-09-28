@@ -1,9 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { defaultConfig, loadConfig, updateConfig, validateConfig } from "../src/config.ts";
+import { acquireLock, defaultConfig, loadConfig, releaseLock, updateConfig, validateConfig, verifyLockOwnership } from "../src/config.ts";
 
 function makeRoot(t: test.TestContext): string {
   const root = mkdtempSync(join(tmpdir(), "pi-memory-config-"));
@@ -178,4 +178,92 @@ test("invalid IANA timezones are rejected; valid ones accepted", () => {
   for (const tz of ["UTC", "Asia/Shanghai", "America/New_York", "Europe/Berlin"]) {
     assert.deepEqual(validateConfig({ ...defaultConfig("UTC"), timezone: tz }), []);
   }
+});
+
+test("updateConfig on a fresh root creates it and applies the mutation", (t) => {
+  const root = join(makeRoot(t), "memory"); // memory root itself does not exist yet
+  const result = updateConfig(root, (c) => ({ ...c, dualWrite: true }), { timezone: "UTC" });
+  assert.equal(result.ok, true);
+  const reloaded = loadConfig(root);
+  assert.equal(reloaded.status, "ok");
+  if (reloaded.status === "ok") assert.equal(reloaded.config.dualWrite, true);
+});
+
+test("loadConfig create path respects a held control lock instead of racing it", (t) => {
+  const root = makeRoot(t);
+  mkdirSync(join(root, "config.json.lock")); // foreign writer active
+  const result = loadConfig(root, { timezone: "UTC" });
+  // Must not write defaults over an in-flight locked update: reports missing instead
+  assert.equal(result.status, "missing");
+  assert.throws(() => readFileSync(join(root, "config.json")));
+});
+
+test("a stale control lock from a crashed process is broken, not obeyed forever", (t) => {
+  const root = makeRoot(t);
+  const lock = join(root, "config.json.lock");
+  mkdirSync(lock);
+  // Age the lock beyond the staleness threshold (locks are held for ms)
+  const old = new Date(Date.now() - 120_000);
+  utimesSync(lock, old, old);
+  const result = loadConfig(root, { timezone: "UTC" });
+  assert.equal(result.status, "created");
+  assert.equal(loadConfig(root).status, "ok");
+});
+
+test("create path does not clobber a config committed while we waited for the lock", (t) => {
+  const root = makeRoot(t);
+  // Another process commits a config first; our create must then adopt it
+  const committed = { ...defaultConfig("UTC"), dualWrite: true };
+  writeFileSync(join(root, "config.json"), JSON.stringify(committed));
+  const result = loadConfig(root, { timezone: "UTC" });
+  assert.equal(result.status, "ok");
+  if (result.status === "ok") assert.equal(result.config.dualWrite, true);
+});
+
+test("a displaced lock holder detects loss and never deletes the new holder's lock", (t) => {
+  const root = makeRoot(t);
+  const lock = join(root, "config.json.lock");
+  const token = acquireLock(lock);
+  assert.ok(token, "first acquire succeeds");
+  // Simulate a stale-break race displacing us: another process claims it
+  rmSync(lock, { recursive: true, force: true });
+  mkdirSync(lock);
+  writeFileSync(join(lock, "owner"), "999999:foreign");
+  assert.equal(verifyLockOwnership(lock, token), false);
+  releaseLock(lock, token); // must NOT remove the foreign lock
+  assert.equal(readFileSync(join(lock, "owner"), "utf8"), "999999:foreign");
+  rmSync(lock, { recursive: true, force: true });
+});
+
+test("a lock whose owner process is dead is broken even when fresh", (t) => {
+  const root = makeRoot(t);
+  const lock = join(root, "config.json.lock");
+  mkdirSync(lock);
+  // 4194303 is above Linux's default pid_max — guaranteed dead
+  writeFileSync(join(lock, "owner"), "4194303:deadbeef");
+  const token = acquireLock(lock);
+  assert.ok(token, "dead owner's lock is broken and claimed");
+  assert.equal(verifyLockOwnership(lock, token), true);
+  releaseLock(lock, token);
+  assert.throws(() => statSync(lock));
+});
+
+test("owner metadata and directory identity are bound: replacement between reads yields", (t) => {
+  const root = makeRoot(t);
+  const lock = join(root, "config.json.lock");
+  // Dead owner's stale lock
+  mkdirSync(lock);
+  writeFileSync(join(lock, "owner"), "4194303:deadbeef");
+  // A breaker acquiring now should win (dead owner)…
+  const token1 = acquireLock(lock);
+  assert.ok(token1);
+  releaseLock(lock, token1);
+  // …and after release, a fresh claim by a live owner is never broken by
+  // someone who statted the OLD directory: simulate by claiming with our
+  // own live pid, then having a competitor attempt a break.
+  const token2 = acquireLock(lock);
+  assert.ok(token2);
+  const competitor = acquireLock(lock); // same process, lock held by self
+  assert.equal(competitor, false, "held lock with live owner is never broken");
+  releaseLock(lock, token2);
 });

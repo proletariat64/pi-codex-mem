@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { appendFileSync, chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -117,6 +118,7 @@ test("/memory import --run enrolls sanitized evidence without modifying the sour
   const file = join(root, "old-session.jsonl");
   const original = jsonl(cwd, [user("u1", null, "historic decision sk-ABCDEFGHIJKLMNOPQRSTUVWX")]);
   writeFileSync(file, original);
+  const fixtureHash = createHash("sha256").update(readFileSync(file)).digest("hex");
   const mock = makeMockPi(); memoryExtension(mock.pi);
   const notifications: string[] = [];
   const ctx = { cwd, hasUI: true, mode: "tui", sessionManager: { getBranch: () => [] },
@@ -144,6 +146,8 @@ test("/memory import --run enrolls sanitized evidence without modifying the sour
   await mock.commands.get("memory")!.handler(`import ${file} --run`, ctx);
   assert.equal(existsSync(snapshots[0]!), true, "explicit reimport reconstructs a pruned sanitized snapshot");
   assert.equal(readFileSync(file, "utf8"), original);
+  assert.equal(createHash("sha256").update(readFileSync(file)).digest("hex"), fixtureHash,
+    "import and reconstruction leave the original fixture byte-identical");
 });
 
 test("historical import applies the live input budget and reports omitted entry IDs", async (t) => {

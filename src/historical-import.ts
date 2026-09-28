@@ -34,7 +34,7 @@ export function planHistoricalImport(path: string, options: {
   const before = lstatSync(file);
   const report: ImportReport = { candidates: [], unsupported: [], deferred: [], ambiguous: [], totalBytes: 0 };
   if (before.isDirectory()) {
-    for (const name of readdirSync(file).sort()) {
+    for (const name of readdirSync(file).sort((a, b) => a.localeCompare(b))) {
       const childPath = resolve(file, name);
       try {
         const child = planHistoricalImport(childPath, options);
@@ -152,7 +152,7 @@ export function planHistoricalImport(path: string, options: {
   const leaves = entries.filter((entry) => !parents.has(entry.id));
   const captured = leaves.length === 1 ? undefined : options.resolveSelectedLeaf?.(file, header as SessionHeader);
   const leafId = options.leaf ?? (captured && byId.has(captured) ? captured : undefined) ??
-    (leaves.length === 1 ? leaves[0]!.id : undefined);
+    (leaves.length === 1 ? leaves[0]?.id : undefined);
   if (!leafId) {
     report.ambiguous.push({ path: file, leaves: leaves.map((entry) => entry.id) });
     return report;
@@ -170,9 +170,8 @@ export function planHistoricalImport(path: string, options: {
     visited.add(current);
     current = entry.parentId;
   }
-  branch.reverse();
   report.candidates.push({
-    path: file, header: header as SessionHeader, branch,
+    path: file, header: header as SessionHeader, branch: branch.toReversed(),
     leafId, bytes: bytes.length,
     contentHash: createHash("sha256").update(bytes).digest("hex"),
     workspace: computeWorkspaceIdentity(header.cwd),

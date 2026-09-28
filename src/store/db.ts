@@ -36,7 +36,7 @@ export interface SnapshotRecord {
   evidenceRemoved?: boolean;
 }
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 
 const MIGRATION_1 = `
 CREATE TABLE schema_migrations (
@@ -119,6 +119,80 @@ ALTER TABLE privacy_edit_targets ADD COLUMN edit_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE privacy_edit_targets ADD COLUMN edit_time INTEGER NOT NULL DEFAULT 0;
 `;
 
+const MIGRATION_5 = `
+CREATE TABLE jobs (
+  job_id TEXT PRIMARY KEY,
+  source_id TEXT REFERENCES source_revisions(source_id),
+  memory_version TEXT NOT NULL CHECK (memory_version IN ('v1', 'v2')),
+  kind TEXT NOT NULL CHECK (kind IN ('extract', 'consolidate')),
+  work_key TEXT NOT NULL UNIQUE,
+  prompt_hash TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('queued', 'leased', 'succeeded', 'no_output', 'retry_wait', 'blocked', 'cancelled', 'superseded')),
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  due_at INTEGER NOT NULL,
+  owner TEXT,
+  fence INTEGER NOT NULL DEFAULT 0,
+  lease_expires_at INTEGER,
+  error_code TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE (source_id, memory_version, kind, prompt_hash),
+  CHECK ((kind = 'extract' AND source_id IS NOT NULL) OR
+         (kind = 'consolidate' AND source_id IS NULL))
+);
+CREATE INDEX jobs_due ON jobs (status, due_at);
+CREATE TABLE extractions (
+  extraction_id TEXT PRIMARY KEY,
+  source_id TEXT NOT NULL REFERENCES source_revisions(source_id),
+  memory_version TEXT NOT NULL CHECK (memory_version IN ('v1', 'v2')),
+  prompt_hash TEXT NOT NULL,
+  job_id TEXT NOT NULL REFERENCES jobs(job_id),
+  raw_memory TEXT,
+  rollout_summary TEXT NOT NULL,
+  rollout_slug TEXT NOT NULL,
+  model_provider TEXT NOT NULL,
+  model_id TEXT NOT NULL,
+  output_hash TEXT NOT NULL,
+  outcome TEXT NOT NULL CHECK (outcome IN ('succeeded', 'no_output')),
+  usage_input INTEGER NOT NULL,
+  usage_output INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  UNIQUE (source_id, memory_version, prompt_hash),
+  CHECK ((memory_version = 'v1' AND raw_memory IS NOT NULL) OR
+         (memory_version = 'v2' AND raw_memory IS NULL))
+);
+CREATE TABLE process_activity (
+  owner_id TEXT PRIMARY KEY,
+  session_key TEXT NOT NULL,
+  activity_state TEXT NOT NULL CHECK (activity_state IN ('active', 'idle')),
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX process_activity_busy ON process_activity (session_key, activity_state, expires_at);
+CREATE TABLE budget_usage (
+  local_day TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  model TEXT NOT NULL,
+  reserved_input INTEGER NOT NULL DEFAULT 0,
+  reserved_output INTEGER NOT NULL DEFAULT 0,
+  actual_input INTEGER NOT NULL DEFAULT 0,
+  actual_output INTEGER NOT NULL DEFAULT 0,
+  call_count INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (local_day, provider, model)
+);
+CREATE TABLE budget_reservations (
+  reservation_id TEXT PRIMARY KEY,
+  local_day TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  model TEXT NOT NULL,
+  estimate_input INTEGER NOT NULL,
+  estimate_output INTEGER NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('reserved', 'charged')),
+  actual_input INTEGER,
+  actual_output INTEGER,
+  FOREIGN KEY (local_day, provider, model) REFERENCES budget_usage(local_day, provider, model)
+);
+`;
+
 export function openStateDb(root: string): DatabaseSync {
   mkdirSync(root, { recursive: true, mode: 0o700 });
   chmodSync(root, 0o700);
@@ -163,6 +237,10 @@ export function openStateDb(root: string): DatabaseSync {
       if (current < 4) {
         db.exec(MIGRATION_4);
         db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(4, Date.now());
+      }
+      if (current < 5) {
+        db.exec(MIGRATION_5);
+        db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(5, Date.now());
       }
       db.exec("COMMIT");
     } catch (err) {

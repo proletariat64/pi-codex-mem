@@ -3,7 +3,6 @@
 // reusable from a future standalone CLI.
 
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 
 export type MemoryVersion = "v1" | "v2";
@@ -100,7 +99,18 @@ export function loadConfig(root: string, opts?: { timezone?: string; create?: bo
   let text: string;
   try {
     text = readFileSync(path, "utf8");
-  } catch {
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT") {
+      // The file exists but cannot be read (EACCES, EISDIR, …). Never treat
+      // that as missing: creating defaults here would rename over the user's
+      // settings. Preserve and report instead (spec §14).
+      return {
+        status: "invalid",
+        problems: [`config.json exists but cannot be read (${code ?? "unknown error"}); the file is preserved and generation is disabled`],
+        path,
+      };
+    }
     if (opts?.create === false) {
       return { status: "missing", path };
     }
@@ -193,10 +203,20 @@ export function validateConfig(raw: unknown): string[] {
       maxStoreBytes: [2 ** 20, 2 ** 34],
     }, problems);
   }
-  if (typeof c.timezone !== "string" || c.timezone.length === 0) {
-    problems.push(`timezone must be a non-empty IANA timezone string`);
+  if (typeof c.timezone !== "string" || c.timezone.length === 0 || !isValidTimezone(c.timezone)) {
+    problems.push(`timezone must be a valid IANA timezone string, got ${JSON.stringify(c.timezone)}`);
   }
   return problems;
+}
+
+/** IANA timezone validation via Intl — rejects unrecognized names like Foo/Bar. */
+function isValidTimezone(tz: string): boolean {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: tz });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function validateRanges(
@@ -226,16 +246,11 @@ export function writeConfigAtomic(path: string, config: MemoryConfig): void {
   renameSync(tmp, path);
 }
 
-function contentHash(text: string): string {
-  return createHash("sha256").update(text, "utf8").digest("hex");
-}
-
 /**
  * Read-modify-write one config field set under a short store-wide control
- * lock with content-hash comparison (spec §5.4). The lock is an atomic
- * mkdir; the hash is compared while holding it, so no concurrent writer can
- * slip between check and rename. Retries by re-reading and re-applying the
- * mutation. Mutation must be pure.
+ * lock (spec §5.4). The mutation is applied to content read *while holding
+ * the lock*, so a concurrent change can never be silently overwritten.
+ * Mutation must be pure; on contention we wait briefly and retry.
  */
 export function updateConfig(
   root: string,
@@ -245,35 +260,32 @@ export function updateConfig(
   const attempts = opts?.maxAttempts ?? 5;
   const lockDir = join(root, "config.json.lock");
   for (let i = 0; i < attempts; i++) {
-    const loaded = loadConfig(root, opts);
-    if (loaded.status === "invalid") {
-      return { ok: false, reason: `config invalid: ${loaded.problems.join("; ")}` };
+    if (!acquireLock(lockDir)) {
+      briefSleep(25 * (i + 1));
+      continue; // another process holds the control lock
     }
-    if (loaded.status === "missing") {
-      return { ok: false, reason: "config missing and could not be created" };
-    }
-    const next = mutate(loaded.config);
-    const problems = validateConfig(next);
-    if (problems.length > 0) {
-      return { ok: false, reason: `mutation produced invalid config: ${problems.join("; ")}` };
-    }
-    if (!acquireLock(lockDir)) continue; // someone else is mid-write; re-read and retry
     try {
-      const beforeHash = contentHash(readFileSync(loaded.path, "utf8"));
-      const tmp = `${loaded.path}.tmp-${process.pid}-${i}`;
-      writeFileSync(tmp, JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });
-      const currentHash = contentHash(readFileSync(loaded.path, "utf8"));
-      if (currentHash !== beforeHash) {
-        rmSync(tmp, { force: true });
-        continue; // changed while we worked; retry with fresh content
+      // Fresh read under the lock: the mutation always applies to the
+      // newest committed content.
+      const loaded = loadConfig(root, opts);
+      if (loaded.status === "invalid") {
+        return { ok: false, reason: `config invalid: ${loaded.problems.join("; ")}` };
       }
-      renameSync(tmp, loaded.path);
+      if (loaded.status === "missing") {
+        return { ok: false, reason: "config missing and could not be created" };
+      }
+      const next = mutate(loaded.config);
+      const problems = validateConfig(next);
+      if (problems.length > 0) {
+        return { ok: false, reason: `mutation produced invalid config: ${problems.join("; ")}` };
+      }
+      writeConfigAtomic(loaded.path, next);
       return { ok: true, config: next };
     } finally {
       rmSync(lockDir, { recursive: true, force: true });
     }
   }
-  return { ok: false, reason: "config changed concurrently too many times" };
+  return { ok: false, reason: "config control lock held by another process" };
 }
 
 /** Atomic lock via mkdir; returns false when already held. */
@@ -284,4 +296,9 @@ function acquireLock(lockDir: string): boolean {
   } catch {
     return false;
   }
+}
+
+/** Synchronous short sleep for lock contention backoff (ms). */
+function briefSleep(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }

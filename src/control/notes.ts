@@ -4,6 +4,7 @@ import { dirname, relative, resolve } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { safeWorkspacePath } from "../pipeline/workspace-tools.ts";
 import { cleanupGenerations } from "../pipeline/publish.ts";
+import { redactSensitive } from "../sensitive.ts";
 
 export interface NoteProvenance {
   consumerSession: string | null; runId: string | null; userMessageId: string | null; origin: "command" | "tool";
@@ -34,7 +35,9 @@ export function addNote(input: {
   if (!["remember", "correct"].includes(action) || typeof input.text !== "string" || !input.text.trim() ||
       Buffer.byteLength(input.text) > 16_384 || typeof input.scope !== "string" || !input.scope.trim() ||
       Buffer.byteLength(input.scope) > 1024 || !["command", "tool"].includes(provenance.origin)) throw new Error("invalid_note");
-  const noteId = randomUUID(); const textHash = createHash("sha256").update(input.text).digest("hex");
+  const text = redactSensitive(input.text); const scope = redactSensitive(input.scope);
+  if (Buffer.byteLength(text) > 16_384 || Buffer.byteLength(scope) > 1024) throw new Error("invalid_note");
+  const noteId = randomUUID(); const textHash = createHash("sha256").update(text).digest("hex");
   const noteDirectory = safeWorkspacePath(root, "notes", true);
   mkdirSync(noteDirectory, { recursive: true, mode: 0o700 });
   const textPath = safeWorkspacePath(root, `notes/${noteId}.md`, true);
@@ -46,15 +49,15 @@ export function addNote(input: {
     const createdAt = Math.max(now, (previous ?? -1) + 1);
     const fd = openSync(textPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
     created = true;
-    try { writeFileSync(fd, input.text); fsyncSync(fd); } finally { closeSync(fd); }
+    try { writeFileSync(fd, text); fsyncSync(fd); } finally { closeSync(fd); }
     syncDirectory(noteDirectory); syncDirectory(resolve(root));
     db.prepare(`INSERT INTO notes (note_id, action, text_path, text_hash, scope, created_at,
       consumer_session, run_id, user_message_id, origin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(noteId, action, textPath, textHash, input.scope, createdAt, provenance.consumerSession,
+      .run(noteId, action, textPath, textHash, scope, createdAt, provenance.consumerSession,
         provenance.runId, provenance.userMessageId, provenance.origin);
     if (action === "correct") invalidate(db, "user_correction", now);
     const controlEpoch = epoch(db); db.exec("COMMIT");
-    return { noteId, textPath, textHash, scope: input.scope, controlEpoch };
+    return { noteId, textPath, textHash, scope, controlEpoch };
   } catch (error) {
     db.exec("ROLLBACK");
     if (created) { unlinkSync(textPath); syncDirectory(noteDirectory); }

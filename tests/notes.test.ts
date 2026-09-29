@@ -137,3 +137,17 @@ test("committed correction priority survives a backward or repeated wall clock",
   assert.deepEqual(notes.map(note => note.createdAt), [100, 101]); assert.equal(notes.at(-1)!.noteId, current.noteId);
   assert.match(publish(root, db, "v1", "current", 102)!.summary, /Use TypeScript/);
 });
+
+test("known credential and signed URL values are redacted before durable notes or writer staging", (t) => {
+  const { root, db } = fixture(t);
+  const fake = `sk-${"fake".repeat(12)}`;
+  const note = addNote({ root, db, action: "correct", text: `Use TypeScript. Key ${fake}; https://example.test/file?token=private-test-value`, scope: `project:${fake}`, provenance, now: 100 });
+  const stored = readFileSync(note.textPath, "utf8");
+  assert.doesNotMatch(stored, new RegExp(fake)); assert.doesNotMatch(stored, /private-test-value/); assert.match(stored, /Use TypeScript/);
+  assert.doesNotMatch(note.scope, new RegExp(fake));
+  const snapshot = selectConsolidation(db, { memoryVersion: "v1", now: 101 });
+  const stage = buildStaging({ root, snapshot, jobId: "redacted", promptHash: "writer" });
+  const staged = readFileSync(join(stage.directory, `notes/${note.noteId}.md`), "utf8");
+  assert.equal(staged, stored);
+  assert.equal(readFileSync(join(stage.directory, "manifest.json"), "utf8").includes(fake), false);
+});

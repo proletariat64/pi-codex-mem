@@ -179,7 +179,8 @@ export class ConsolidationScheduler {
     const snapshot = this.snapshot(config, version);
     const promptHash = consolidationPromptHash(config, version);
     const lease = claimConsolidation(db, { memoryVersion: version, owner: randomUUID(), now: clock(), promptHash,
-      configEpoch: consolidationConfigEpoch(config, version), inputRevisionHash: this.inputRevision(config, version), retryBlocked });
+      configEpoch: consolidationConfigEpoch(config, version), inputRevisionHash: this.inputRevision(config, version), retryBlocked,
+      modelRequired: snapshot.sources.length > 0 || snapshot.notes.length > 0 });
     if (!lease) {
       // A contended input has not been checked; keep its global-lease expiry wake.
       if (!db.prepare("SELECT 1 FROM jobs WHERE kind = 'consolidate' AND status = 'leased' AND lease_expires_at > ?").get(clock())) {

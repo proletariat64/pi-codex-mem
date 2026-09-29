@@ -25,6 +25,7 @@ export interface ConsolidationLease {
 export function claimConsolidation(db: DatabaseSync, opts: {
   memoryVersion: MemoryVersion; owner: string; now: number; promptHash: string; configEpoch?: string;
   inputRevisionHash?: string; retryBlocked?: boolean;
+  modelRequired?: boolean;
 }): ConsolidationLease | null {
   db.exec("BEGIN IMMEDIATE");
   try {
@@ -48,7 +49,7 @@ export function claimConsolidation(db: DatabaseSync, opts: {
       // for its fenced reset below. A later automatic selection may then run.
       db.prepare(`UPDATE jobs SET status = 'superseded', updated_at = ? WHERE ${authGate} AND work_key != ?`)
         .run(opts.now, opts.memoryVersion, opts.promptHash, configEpoch, workKey);
-    } else if (db.prepare(`SELECT 1 FROM jobs WHERE ${authGate} LIMIT 1`)
+    } else if (opts.modelRequired !== false && db.prepare(`SELECT 1 FROM jobs WHERE ${authGate} LIMIT 1`)
       .get(opts.memoryVersion, opts.promptHash, configEpoch)) {
       db.exec("COMMIT"); return null;
     }

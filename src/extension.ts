@@ -169,7 +169,8 @@ export default function (pi: ExtensionAPI) {
       try {
         if (signal?.aborted || !foregroundRun) throw new Error("memory_write_unavailable");
         const note = persistNote(ctx, args.action, args.text, args.scope, "tool");
-        return { content: [{ type: "text", text: `Saved ${args.action} note ${note.noteId} (${note.scope}).` }], details: note };
+        return { content: [{ type: "text", text: `Saved ${args.action} note ${note.noteId} (${note.scope}).` }],
+          details: { noteId: note.noteId, action: args.action, scope: note.scope, readingBlocked: args.action === "correct" } };
       } catch (error) {
         const code = (error as Error).message === "invalid_note" ? "invalid_note" : "memory_write_unavailable";
         return { content: [{ type: "text", text: code }], details: { error: code } };
@@ -244,14 +245,38 @@ export default function (pi: ExtensionAPI) {
     return { mode: "off", source: "config" };
   }
 
-  function eligibleExtractionConfig(root: string): MemoryConfig | null {
+  function eligibleGenerationConfig(root: string): MemoryConfig | null {
     const loaded = loadConfig(root, { create: false });
     if (loaded.status !== "ok") return null;
     const config = loaded.config;
     if (!config.enabled || !config.generate || flagMode() === "off" || flagMode() === "read" ||
-        !config.captureModes.includes(activeMode as MemoryConfig["captureModes"][number]) ||
         isExcludedWorkspace(activeCwd, config.excludedWorkspaces)) return null;
     return config;
+  }
+
+  function eligibleExtractionConfig(root: string): MemoryConfig | null {
+    const config = eligibleGenerationConfig(root);
+    return config?.captureModes.includes(activeMode as MemoryConfig["captureModes"][number]) ? config : null;
+  }
+
+  function eligibleConsolidationConfig(root: string): MemoryConfig | null {
+    const config = eligibleGenerationConfig(root);
+    if (!config || !state.db) return null;
+    if (config.captureModes.includes(activeMode as MemoryConfig["captureModes"][number])) return config;
+    // Explicit notes must reconcile even when automatic transcript capture is disabled in this runtime.
+    for (const version of targetVersions(config)) {
+      const pending = state.db.prepare(`SELECT 1 FROM notes n
+        LEFT JOIN note_applications a ON a.note_id = n.note_id AND a.memory_version = ?
+        JOIN pipeline_state p ON p.memory_version = ?
+        JOIN store_state s ON s.singleton = 1
+        WHERE n.status = 'active' AND (a.note_id IS NULL OR a.note_hash != n.text_hash OR
+          a.control_epoch != s.control_epoch OR p.active_generation_id IS NULL OR
+          a.generation_id != p.active_generation_id) LIMIT 1`).get(version, version);
+      const revoked = state.db.prepare(`SELECT 1 FROM pipeline_state WHERE memory_version = ? AND read_blocked = 1
+        AND block_reason IN ('user_correction', 'note_forgotten')`).get(version);
+      if (pending || revoked) return config;
+    }
+    return null;
   }
 
   function ensureScheduler(ctx?: ExtensionContext): void {
@@ -265,7 +290,7 @@ export default function (pi: ExtensionAPI) {
       const writerPort = consolidationPort;
       consolidator = new ConsolidationScheduler({ db: state.db, root, modelPort: () => writerPort,
         now: Date.now, isForegroundIdle: () => foregroundIdle,
-        config: () => eligibleExtractionConfig(root),
+        config: () => eligibleConsolidationConfig(root),
         pinnedGenerationIds: () => readerPin ? [readerPin.generationId] : [],
         onError: (err) => { state.captureError = `consolidation failed: ${(err as Error).message}`; },
       });

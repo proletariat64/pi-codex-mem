@@ -117,7 +117,7 @@ function describeMode(mode: MemoryMode, source: "flag" | "config"): string {
 interface RuntimeState {
   compat: CompatResult | null;
   config: LoadConfigResult | null;
-  promptSections: "confirmed" | "unobserved" | "unavailable";
+  promptSections: DoctorInput["promptSections"];
   modelRegistry: { find?: unknown } | null;
   db: DatabaseSync | null;
   capture: CaptureResult | null;
@@ -150,6 +150,8 @@ export default function (pi: ExtensionAPI) {
   let readerPin: MemoryReadView | null = null;
   let foregroundRun: MemoryConsumer | null = null;
   let foregroundPrompt: string | null = null;
+  let foregroundOptions: { sections?: unknown; forceSystemPrompt?: unknown } | null = null;
+  let persistentCapture = true;
   let retentionTimer: NodeJS.Timeout | null = null;
   let heartbeat: NodeJS.Timeout | null = null;
   let privacyRetryTimer: NodeJS.Timeout | null = null;
@@ -260,6 +262,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   function eligibleGenerationConfig(root: string): MemoryConfig | null {
+    if (!persistentCapture) return null;
     const loaded = loadConfig(root, { create: false });
     if (loaded.status !== "ok") return null;
     const config = loaded.config;
@@ -323,9 +326,30 @@ export default function (pi: ExtensionAPI) {
   async function stopExplicitRun(): Promise<void> {
     if (!explicitRun) return;
     const run = explicitRun;
-    run.db.prepare("UPDATE version_run_grants SET status = 'cancelled' WHERE request_id = ? AND status = 'active'").run(run.grant.requestId);
-    await Promise.all([run.extraction.stop(), run.consolidation?.stop()]);
+    const stopped = Promise.allSettled([run.extraction.stop(), run.consolidation?.stop()]);
+    let timeout: number | undefined;
+    try {
+      timeout = Number(run.db.prepare("PRAGMA busy_timeout").get()!.timeout);
+      run.db.exec("PRAGMA busy_timeout = 100");
+      run.db.prepare("UPDATE version_run_grants SET status = 'cancelled' WHERE request_id = ? AND status = 'active'").run(run.grant.requestId);
+    } catch (error) { state.captureError = `explicit run cleanup skipped: ${(error as Error).message}`; }
+    finally {
+      const failure = (await stopped).find(result => result.status === "rejected");
+      if (failure?.status === "rejected") state.captureError = `explicit run cleanup skipped: ${String(failure.reason)}`;
+      try { if (run.db.isOpen && timeout !== undefined) run.db.exec(`PRAGMA busy_timeout = ${timeout}`); }
+      catch (error) { state.captureError = `explicit run cleanup skipped: ${(error as Error).message}`; }
+    }
     if (explicitRun === run) explicitRun = null;
+  }
+
+  async function stopGeneration(ctx: ExtensionContext): Promise<void> {
+    const previousError = state.captureError;
+    try { state.db?.exec("PRAGMA busy_timeout = 100"); }
+    catch (error) { state.captureError = `background cleanup skipped: ${(error as Error).message}`; }
+    const results = await Promise.allSettled([scheduler?.stop(), consolidator?.stop(), stopExplicitRun()]);
+    const failure = results.find(result => result.status === "rejected");
+    if (failure?.status === "rejected") state.captureError = `background cleanup skipped: ${String(failure.reason)}`;
+    if (state.captureError && state.captureError !== previousError && ctx.hasUI) ctx.ui.notify(`pi-memory: ${state.captureError}`, "warning");
   }
 
   function armReaderRetention(): void {
@@ -422,6 +446,7 @@ export default function (pi: ExtensionAPI) {
   function markForegroundSettled(): void {
     foregroundRun = null;
     foregroundPrompt = null;
+    foregroundOptions = null;
     readerPin = null;
     if (heartbeat) clearInterval(heartbeat);
     heartbeat = null;
@@ -464,25 +489,32 @@ export default function (pi: ExtensionAPI) {
     cancelPrivacyCleanup();
     if (heartbeat) clearInterval(heartbeat);
     heartbeat = null;
-    await scheduler?.stop();
-    await consolidator?.stop();
-    await stopExplicitRun();
+    await stopGeneration(ctx);
     scheduler = null;
     consolidator = null;
     runtimePort = null;
     consolidationPort = null;
     readerPin = null;
     foregroundRun = null;
+    foregroundOptions = null;
     if (retentionTimer) clearTimeout(retentionTimer);
     retentionTimer = null;
-    if (state.db) clearProcessActivity(state.db, activityOwner);
-    state.db?.close();
-    state.db = null;
+    try {
+      if (state.db) { state.db.exec("PRAGMA busy_timeout = 100"); clearProcessActivity(state.db, activityOwner); }
+    } catch (error) {
+      if (ctx.hasUI) ctx.ui.notify(`pi-memory: previous session cleanup skipped: ${(error as Error).message}`, "warning");
+    } finally { state.db?.close(); state.db = null; }
     state.capture = null;
     state.captureError = null;
     state.modelRegistry = (ctx as { modelRegistry?: { find?: unknown } }).modelRegistry ?? null;
     activeCwd = ctx.cwd;
     activeMode = ctx.mode;
+    persistentCapture = true;
+    try {
+      if (typeof ctx.sessionManager.getSessionFile === "function" && typeof ctx.sessionManager.getHeader === "function") {
+        persistentCapture = Boolean(ctx.sessionManager.getSessionFile() && ctx.sessionManager.getHeader());
+      }
+    } catch { persistentCapture = false; }
     foregroundIdle = typeof ctx.isIdle === "function" ? ctx.isIdle() : true;
     // Per-session observations reset: a previous session's missing-sections
     // run must not poison this session's diagnostics.
@@ -506,10 +538,15 @@ export default function (pi: ExtensionAPI) {
       }
       state.config = loadConfig(root, {
         timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
+        create: state.compat.supported && persistentCapture && flagMode() !== "off" && flagMode() !== "read",
       });
+      if (state.config.status === "invalid") state.captureError = state.config.problems.join("; ");
+      else if (state.config.status === "missing" && state.config.reason) state.captureError = state.config.reason;
+      if (!persistentCapture) state.capture = { status: "ephemeral", reason: "persistent session header/path unavailable" };
+      if (storeSchemaState(root) === "unavailable") state.captureError = "memory store unavailable or corrupt; files preserved; generation disabled";
       // On resume, a different selected leaf may be active before any new
       // agent_settled event. Revoke stale heads before future reads (§5.3).
-      if (state.compat.supported && !legacyLockPath(root) && !existsSync(join(root, "clear.pending")) && storeSchemaState(root) === "current") {
+      if (state.compat.supported && persistentCapture && !legacyLockPath(root) && !existsSync(join(root, "clear.pending")) && storeSchemaState(root) === "current") {
         try {
           state.db = openStateDb(root);
           cleanupGenerations({ db: state.db, root, now: Date.now() });
@@ -566,6 +603,7 @@ export default function (pi: ExtensionAPI) {
     } catch (err) {
       state.captureError = `scheduler startup failed: ${(err as Error).message}`;
     }
+    if (state.captureError && ctx.hasUI) ctx.ui.notify(`pi-memory: ${state.captureError}`, "warning");
   });
 
   function captureNow(ctx: ExtensionContext, options?: { busyTimeoutMs?: number }): void {
@@ -611,7 +649,18 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  pi.on("agent_start", (_event, ctx) => markForegroundActive(ctx));
+  function diagnosePromptConflict(ctx: ExtensionContext): boolean {
+    if (foregroundOptions?.forceSystemPrompt === undefined) return false;
+    const diagnosed = state.promptSections === "conflict";
+    state.promptSections = "conflict"; readerPin = null;
+    if (retentionTimer) clearTimeout(retentionTimer); retentionTimer = null;
+    const sections = foregroundOptions.sections;
+    if (sections && typeof sections === "object" && !Array.isArray(sections)) delete (sections as Record<string, string>).pi_memory;
+    if (!diagnosed && ctx.hasUI) ctx.ui.notify("pi-memory: section_injection_conflict — another extension forced a full system prompt; memory injection disabled for this run", "warning");
+    return true;
+  }
+
+  pi.on("agent_start", (_event, ctx) => { markForegroundActive(ctx); diagnosePromptConflict(ctx); });
   pi.on("agent_settled", (_event, ctx) => {
     captureNow(ctx);
     // A brand-new memory root only creates its store on first capture.
@@ -649,12 +698,11 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_shutdown", async (_event, ctx) => {
     foregroundRun = null;
+    foregroundOptions = null;
     cancelPrivacyCleanup();
     if (heartbeat) clearInterval(heartbeat);
     heartbeat = null;
-    await scheduler?.stop();
-    await consolidator?.stop();
-    await stopExplicitRun();
+    await stopGeneration(ctx);
     scheduler = null;
     consolidator = null;
     readerPin = null;
@@ -666,6 +714,9 @@ export default function (pi: ExtensionAPI) {
         clearProcessActivity(state.db, activityOwner);
       }
       captureNow(ctx, { busyTimeoutMs: 100 });
+    } catch (error) {
+      state.captureError = `shutdown cleanup skipped: ${(error as Error).message}`;
+      if (ctx.hasUI) ctx.ui.notify(`pi-memory: ${state.captureError}`, "warning");
     } finally {
       cancelPrivacyCleanup();
       runtimePort = null;
@@ -684,7 +735,8 @@ export default function (pi: ExtensionAPI) {
     } catch { /* Ephemeral sessions still get a process-local consumer identity. */ }
     foregroundRun = { consumerSession, runId: randomUUID() };
     foregroundPrompt = typeof event.prompt === "string" ? event.prompt : null;
-    const opts = event.systemPromptOptions as { sections?: unknown } | undefined;
+    const opts = event.systemPromptOptions as { sections?: unknown; forceSystemPrompt?: unknown } | undefined;
+    foregroundOptions = opts ?? null;
     if (opts && typeof opts === "object" && "sections" in opts) {
       state.promptSections = "confirmed";
     } else {
@@ -699,7 +751,7 @@ export default function (pi: ExtensionAPI) {
     const root = resolveMemoryRoot();
     state.config = loadConfig(root, { create: false });
     const cfg = state.config;
-    if (state.compat?.supported && cfg.status === "ok" && cfg.config.enabled && cfg.config.generate &&
+    if (state.compat?.supported && persistentCapture && cfg.status === "ok" && cfg.config.enabled && cfg.config.generate &&
         ctx.model && cfg.config.captureModes.includes(ctx.mode) &&
         flagMode() !== "off" && flagMode() !== "read" &&
         !rootPointsIntoForeignMemory(root) && !legacyLockPath(root) &&
@@ -715,6 +767,7 @@ export default function (pi: ExtensionAPI) {
     if (retentionTimer) clearTimeout(retentionTimer);
     retentionTimer = null;
     const latest = state.config;
+    if (diagnosePromptConflict(ctx)) return;
     const sections = opts?.sections;
     if (!sections || typeof sections !== "object" || Array.isArray(sections)) return;
     const sectionMap = sections as Record<string, string>;
@@ -854,6 +907,7 @@ export default function (pi: ExtensionAPI) {
     const { mode, source } = effectiveMode();
     if (!cfg || cfg.status === "missing") {
       lines.push(cfg?.status === "missing" && cfg.reason ? `state: DISABLED — ${cfg.reason}` : "state: no session started yet");
+      if (state.capture?.status === "ephemeral") lines.push("capture: ephemeral (no persistent session)");
     } else if (cfg.status === "invalid") {
       lines.push("state: DISABLED generation — config invalid (file preserved)", ...cfg.problems.map((p) => `  - ${p}`));
     } else {
@@ -931,7 +985,7 @@ export default function (pi: ExtensionAPI) {
     };
     const root = resolveMemoryRoot();
     const cfg = loadConfig(root, { create: false });
-    if (!state.compat?.supported || rootPointsIntoForeignMemory(root) || legacyLockPath(root) ||
+    if (!state.compat?.supported || !persistentCapture || rootPointsIntoForeignMemory(root) || legacyLockPath(root) ||
         cfg.status !== "ok" || !cfg.config.enabled || !cfg.config.generate ||
         !cfg.config.captureModes.includes(ctx.mode) ||
         flagMode() === "off" || flagMode() === "read" ||

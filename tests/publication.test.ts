@@ -1,7 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import fs, { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -12,6 +13,7 @@ import { buildStaging } from "../src/pipeline/staging.ts";
 import { validateV2Artifacts, writeMinimalV2 } from "../src/pipeline/validate.ts";
 
 const NOW = Date.UTC(2026, 8, 1);
+const BOUNDARIES = ["before_fsync", "after_fsync", "before_rename", "after_rename_before_fsync", "after_rename", "before_cas", "after_cas"] as const;
 function fixture(t: test.TestContext) {
   const root = mkdtempSync(join(tmpdir(), "pi-publish-"));
   const db = openStateDb(root);
@@ -103,7 +105,7 @@ test("publication rejects staged symlinks and rechecks the lease clock after dis
 });
 
 test("actual process crashes around fsync, rename and CAS preserve complete old or new publication", (t) => {
-  for (const boundary of ["before_fsync", "after_fsync", "after_rename", "before_cas", "after_cas"] as const) {
+  for (const boundary of BOUNDARIES) {
     const { root, db, candidate } = fixture(t);
     assert.equal(publishGeneration(candidate("old")).published, true);
     const next = candidate("new", NOW + 1);
@@ -126,6 +128,10 @@ test("actual process crashes around fsync, rename and CAS preserve complete old 
       cleanupGenerations({ db: reopened, root, now: NOW + 3 });
       // A still-live lease must preserve staging/renamed files while the writer can resume.
       if (boundary !== "after_cas") assert.ok(reopened.prepare("SELECT 1 FROM jobs WHERE status = 'leased'").get());
+      cleanupGenerations({ db: reopened, root, now: NOW + 180_002 });
+      assert.deepEqual(readdirSync(join(root, "versions", "v1", "staging")), []);
+      assert.deepEqual(readdirSync(join(root, "versions", "v1", "generations")).sort(), boundary === "after_cas" ? ["new", "old"] : ["old"]);
+      assert.equal(getPublishedGeneration(reopened, "v1", NOW + 180_002)?.generationId, current!.generationId);
     } finally { reopened.close(); }
   }
 });
@@ -170,7 +176,7 @@ test("v2 publication revalidates summary and provenance instead of trusting a by
 });
 
 test("v2 process crashes leave a complete old or new summary-only generation", (t) => {
-  for (const boundary of ["before_fsync", "after_fsync", "after_rename", "before_cas", "after_cas"] as const) {
+  for (const boundary of BOUNDARIES) {
     const { root, db, candidate } = fixture(t);
     assert.equal(publishGeneration(candidate("v2-old", NOW, "v2")).published, true);
     const next = candidate("v2-new", NOW + 1, "v2");
@@ -193,6 +199,23 @@ test("v2 process crashes leave a complete old or new summary-only generation", (
       assert.equal(existsSync(join(current!.directory, "MEMORY.md")), false);
       assert.equal(existsSync(join(current!.directory, "raw_memories.md")), false);
       assert.equal(existsSync(join(current!.directory, "skills")), false);
+      cleanupGenerations({ db: reopened, root, now: NOW + 180_002 });
+      assert.deepEqual(readdirSync(join(root, "versions", "v2", "staging")), []);
+      assert.deepEqual(readdirSync(join(root, "versions", "v2", "generations")).sort(), boundary === "after_cas" ? ["v2-new", "v2-old"] : ["v2-old"]);
+      assert.equal(getPublishedGeneration(reopened, "v2", NOW + 180_002)?.generationId, current!.generationId);
     } finally { reopened.close(); }
   }
+});
+
+for (const version of ["v1", "v2"] as const) test(`${version}: disk full during fsync preserves the old pointer and permits recovery after orphan cleanup`, t => {
+  const { root, db, candidate } = fixture(t); const old = publishGeneration(candidate("old", NOW, version));
+  const next = candidate("disk-full", NOW + 1, version); const sync = fs.fsyncSync;
+  fs.fsyncSync = () => { throw Object.assign(new Error("disk full"), { code: "ENOSPC" }); }; syncBuiltinESMExports();
+  try { assert.throws(() => publishGeneration(next), error => (error as NodeJS.ErrnoException).code === "ENOSPC"); }
+  finally { fs.fsyncSync = sync; syncBuiltinESMExports(); }
+  assert.equal(getPublishedGeneration(db, version, NOW + 2)?.generationId, old.generationId);
+  assert.equal(existsSync(join(root, "versions", version, "generations", next.generationId)), false);
+  finishConsolidation(db, next.lease, "blocked", "ENOSPC", NOW + 2);
+  cleanupGenerations({ db, root, now: NOW + 3 }); assert.equal(existsSync(next.stagingDir), false);
+  assert.equal(publishGeneration(candidate("recovered", NOW + 4, version)).published, true);
 });

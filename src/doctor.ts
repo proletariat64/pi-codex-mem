@@ -35,7 +35,7 @@ export interface DoctorInput {
       | { status: "configured"; ref: ModelRef; resolved: boolean };
   };
   /** Runtime observation of structured prompt sections (spec §2.3 probe). */
-  promptSections: "confirmed" | "unobserved" | "unavailable";
+  promptSections: "confirmed" | "unobserved" | "unavailable" | "conflict";
 }
 
 export interface DoctorReport {
@@ -154,7 +154,9 @@ export function runDoctor(input: DoctorInput): DoctorReport {
 
   const ps = input.promptSections;
   probes.push(
-    ps === "confirmed"
+    ps === "conflict"
+      ? { id: "prompt-sections", label: "prompt injection", status: "fail", detail: "section_injection_conflict: another extension forced a full system prompt; pi_memory section injection is disabled" }
+      : ps === "confirmed"
       ? { id: "prompt-sections", label: "prompt injection", status: "ok", detail: "structured system-prompt sections observed at runtime" }
       : ps === "unobserved"
         ? { id: "prompt-sections", label: "prompt injection", status: "warn", detail: "structured sections not yet observed (no foreground run this session)" }

@@ -37,6 +37,8 @@ import { createConsolidationModelPort } from "./pipeline/model-port.ts";
 import { acquireReadView, type MemoryReadView } from "./read/view.ts";
 import { renderMemorySection } from "./read/inject.ts";
 import { cleanupGenerations } from "./pipeline/publish.ts";
+import { createMemoryTools, type MemoryConsumer } from "./read/tools.ts";
+import { getPublishedGeneration } from "./store/consolidation.ts";
 
 const EXTENSION_VERSION = "0.1.0";
 
@@ -133,6 +135,7 @@ export default function (pi: ExtensionAPI) {
   let runtimePort: ReturnType<typeof createRegistryModelPort> | null = null;
   let consolidationPort: ReturnType<typeof createConsolidationModelPort> | null = null;
   let readerPin: MemoryReadView | null = null;
+  let foregroundRun: MemoryConsumer | null = null;
   let retentionTimer: NodeJS.Timeout | null = null;
   let heartbeat: NodeJS.Timeout | null = null;
   let privacyRetryTimer: NodeJS.Timeout | null = null;
@@ -140,6 +143,21 @@ export default function (pi: ExtensionAPI) {
   let foregroundIdle = true;
   let activeCwd = "";
   let activeMode = "";
+
+  for (const tool of createMemoryTools({ root: resolveMemoryRoot(), db: () => state.db,
+    view: () => readerPin, consumer: () => foregroundRun,
+    maxUnusedDays: () => state.config?.status === "ok" ? state.config.config.schedule.maxUnusedDays : 30 })) {
+    pi.registerTool({ ...tool, async execute(id, args, signal, _update, ctx) {
+      const root = resolveMemoryRoot(); const config = loadConfig(root, { create: false });
+      if (!state.compat?.supported || !foregroundRun || config.status !== "ok" || !config.config.enabled ||
+          !config.config.read || flagMode() === "off" || rootPointsIntoForeignMemory(root) ||
+          legacyLockPath(root) || isExcludedWorkspace(ctx.cwd, config.config.excludedWorkspaces)) {
+        return { content: [{ type: "text", text: "Memory unavailable." }],
+          details: { items: [], truncated: false, cursor: null, error: "memory_unavailable" } };
+      }
+      return tool.execute(id, args, signal);
+    } });
+  }
 
   pi.registerFlag("pi-memory-mode", {
     description: "Pi Memory runtime mode: off | read | read-write (overrides config)",
@@ -198,6 +216,29 @@ export default function (pi: ExtensionAPI) {
   }
 
   function triggerScheduler(): void { scheduler?.trigger(); consolidator?.trigger(); }
+
+  function armReaderRetention(): void {
+    if (retentionTimer) clearTimeout(retentionTimer);
+    retentionTimer = null;
+    const pin = readerPin;
+    if (!pin || pin.retentionDeadline === null) return;
+    retentionTimer = setTimeout(() => {
+      retentionTimer = null;
+      if (readerPin !== pin) return;
+      try {
+        const live = state.db ? getPublishedGeneration(state.db, pin.memoryVersion, Date.now(),
+          { generationId: pin.generationId, maxUnusedDays: state.config?.status === "ok" ? state.config.config.schedule.maxUnusedDays : 30 }) : null;
+        if (live && live.controlEpoch === pin.controlEpoch && live.manifestHash === pin.manifestHash) {
+          pin.retentionDeadline = live.retentionDeadline;
+          armReaderRetention();
+          return;
+        }
+      } catch { /* An unavailable store cannot keep a cached view readable. */ }
+      readerPin = null;
+      consolidator?.trigger();
+    }, Math.max(0, Math.min(2_147_483_647, pin.retentionDeadline - Date.now())));
+    retentionTimer.unref();
+  }
 
   /** One-shot, bounded-backoff retry when another SQLite reader holds WAL frames. */
   function schedulePrivacyCleanup(root: string): void {
@@ -262,6 +303,8 @@ export default function (pi: ExtensionAPI) {
   }
 
   function markForegroundSettled(): void {
+    foregroundRun = null;
+    readerPin = null;
     if (heartbeat) clearInterval(heartbeat);
     heartbeat = null;
     foregroundIdle = true;
@@ -309,6 +352,7 @@ export default function (pi: ExtensionAPI) {
     runtimePort = null;
     consolidationPort = null;
     readerPin = null;
+    foregroundRun = null;
     if (retentionTimer) clearTimeout(retentionTimer);
     retentionTimer = null;
     if (state.db) clearProcessActivity(state.db, activityOwner);
@@ -479,6 +523,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
+    foregroundRun = null;
     cancelPrivacyCleanup();
     if (heartbeat) clearInterval(heartbeat);
     heartbeat = null;
@@ -506,6 +551,12 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("before_agent_start", (event, ctx) => {
     markForegroundActive(ctx);
+    let consumerSession: string = activityOwner;
+    try {
+      const file = ctx.sessionManager.getSessionFile(); const header = ctx.sessionManager.getHeader();
+      if (file && header) consumerSession = computeSessionKey(getAgentDir(), file, header.id);
+    } catch { /* Ephemeral sessions still get a process-local consumer identity. */ }
+    foregroundRun = { consumerSession, runId: randomUUID() };
     const opts = event.systemPromptOptions as { sections?: unknown } | undefined;
     if (opts && typeof opts === "object" && "sections" in opts) {
       state.promptSections = "confirmed";
@@ -557,14 +608,7 @@ export default function (pi: ExtensionAPI) {
         maxUnusedDays: latest.config.schedule.maxUnusedDays });
       if (!readerPin) return;
       sectionMap.pi_memory = renderMemorySection(readerPin, ctx.cwd);
-      if (readerPin.retentionDeadline !== null) {
-        retentionTimer = setTimeout(() => {
-          readerPin = null;
-          retentionTimer = null;
-          consolidator?.trigger();
-        }, Math.max(0, Math.min(2_147_483_647, readerPin.retentionDeadline - Date.now())));
-        retentionTimer.unref();
-      }
+      armReaderRetention();
     } catch { /* Memory failure must not stop the user's foreground task. */ }
     finally { readerDb?.close(); }
   });

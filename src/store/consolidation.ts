@@ -209,16 +209,16 @@ export interface PublishedGeneration {
 
 /** Read only the DB-selected version, rechecking revoked and expired supporting evidence. */
 export function getPublishedGeneration(db: DatabaseSync, memoryVersion: MemoryVersion,
-  now = Date.now(), options?: { maxUnusedDays?: number }): PublishedGeneration | null {
+  now = Date.now(), options?: { maxUnusedDays?: number; generationId?: string }): PublishedGeneration | null {
   const generation = db.prepare(`SELECT g.generation_id AS generationId, g.memory_version AS memoryVersion,
     g.directory, g.directory AS path, g.input_hash AS inputHash, g.manifest_hash AS manifestHash,
     g.selection_hash AS selectionHash, g.control_epoch AS controlEpoch, g.prompt_hash AS promptHash,
     g.created_at AS createdAt, g.retention_deadline AS retentionDeadline, g.max_unused_days AS maxUnusedDays
-    FROM pipeline_state p JOIN generations g ON g.generation_id = p.active_generation_id
+    FROM pipeline_state p JOIN generations g ON g.generation_id = COALESCE(?, p.active_generation_id)
       AND g.memory_version = p.memory_version CROSS JOIN store_state s
     WHERE p.memory_version = ? AND p.read_blocked = 0 AND g.status = 'published'
       AND g.control_epoch = s.control_epoch AND p.reconciled_epoch = s.control_epoch AND s.singleton = 1`)
-    .get(memoryVersion) as unknown as (PublishedGeneration & { maxUnusedDays: number }) | undefined;
+    .get(options?.generationId ?? null, memoryVersion) as unknown as (PublishedGeneration & { maxUnusedDays: number }) | undefined;
   if (!generation) return null;
   const retentionDays = options?.maxUnusedDays ?? generation.maxUnusedDays;
   if (!Number.isSafeInteger(retentionDays) || retentionDays < 1 || retentionDays > 3650) return null;

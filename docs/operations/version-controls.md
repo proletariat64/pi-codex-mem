@@ -1,0 +1,11 @@
+# Version selection and bounded generation
+
+`/memory version v1|v2` persists the selected read pipeline. The current foreground run keeps its pinned version and generation until settlement; reading changes at the next `before_agent_start`. An unbuilt target reports `warming_up` and injects no generated context. Switching back reuses a still-valid generation. Switching preserves other-version outputs and shared suppression tombstones.
+
+`/memory dual-write on|off` persists automatic generation targets. With dual writing enabled, extraction alternates version-specific jobs within the same total pass limit (two by default), concurrency slots, daily token/request budgets, and store-wide consolidation lease. Status reports both versions and partial publication independently.
+
+`/memory run [--version v1|v2|both] [--now]` queues one bounded extraction pass followed by one consolidation pass without changing the reader. Without an explicit version it uses the configured automatic targets. Only `--now` skips the idle interval for settled sources. Queued passes wait for their eligible deadline and retain their grant until completion or cancellation. All passes obey foreground activity, global mode, capture modes, workspace exclusions, source age, suppression, budgets, and leases. They never grant continuing background generation for an inactive version; `both` shares the same total pass limit.
+
+Each explicit version run persists a request ID, target, and policy hash in SQLite and records the request and policy with its jobs. Configuration changes cancel outstanding grants under the shared control lock. A valid in-flight completion may commit only into its original namespace; a cancelled grant cannot start a repair or another request, even after switching back. Ordinary automatic targets can resume unfinished jobs when eligible. Session shutdown and clear cancel owned explicit runs before closing the store.
+
+Newly enabled versions use shared sanitized snapshots. Pruned snapshots are reconstructed read-only from the already enrolled selected branch of the original JSONL session; changed evidence creates a new revision. Missing evidence blocks the target with `source_unavailable_for_version`. Other-version generated outputs are never used as evidence. Old unenrolled history still requires explicit import.

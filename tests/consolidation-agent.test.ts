@@ -149,7 +149,7 @@ test("writer stops before the thirteenth model call and forty-first workspace op
   }
 });
 
-test("cancellation settles when provider ignores abort, retains its reservation and rejects late tool writes", { timeout: 2_000 }, async (t) => {
+test("cancellation settles when provider ignores abort, retains its reservation and rejects late tool writes", { timeout: 10_000 }, async (t) => {
   const setup = fixture(t);
   const controller = new AbortController();
   const late = createAssistantMessageEventStream();

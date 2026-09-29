@@ -8,7 +8,7 @@ import type { MemoryVersion } from "../config.ts";
 import { validateV2Artifacts } from "./validate.ts";
 import { evidencePath, notePath, type StagingManifest } from "./staging.ts";
 
-export type PublicationBoundary = "before_fsync" | "after_fsync" | "after_rename" | "before_cas" | "after_cas";
+export type PublicationBoundary = "before_fsync" | "after_fsync" | "before_rename" | "after_rename_before_fsync" | "after_rename" | "before_cas" | "after_cas";
 
 function assertDirectory(path: string): void {
   const stat = lstatSync(path);
@@ -85,7 +85,9 @@ export function publishGeneration(opts: {
   fsyncPath(stagingRoot); fsyncPath(generations); fsyncPath(versionRoot);
   fsyncPath(join(root, "versions")); fsyncPath(root);
   opts.fault?.("after_fsync");
+  opts.fault?.("before_rename");
   renameSync(stagingDir, path);
+  opts.fault?.("after_rename_before_fsync");
   fsyncPath(generations); fsyncPath(stagingRoot);
   opts.fault?.("after_rename");
   opts.fault?.("before_cas");

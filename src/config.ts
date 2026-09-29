@@ -138,12 +138,12 @@ export function loadConfig(root: string, opts?: { timezone?: string; create?: bo
     // update in another process can never be renamed over (and vice versa).
     // If the lock is held, report missing rather than racing the writer.
     const lockDir = join(root, "config.json.lock");
-    mkdirSync(root, { recursive: true });
     let token: string | false;
     try {
+      mkdirSync(root, { recursive: true });
       token = acquireLock(lockDir);
     } catch (err) {
-      return { status: "missing", path, reason: `control store unavailable: ${(err as Error).message}` };
+      return { status: "missing", path, reason: `control store unavailable: ${(err as NodeJS.ErrnoException).code ?? (err as Error).message}` };
     }
     if (!token) {
       return { status: "missing", path, reason: existsSync(lockDir) ? legacyLockRecovery(lockDir) : "config control lock busy" };
@@ -178,6 +178,9 @@ export function loadConfig(root: string, opts?: { timezone?: string; create?: bo
         };
       }
       return { status: "created", config, path };
+    } catch (error) {
+      const reason = `configuration creation incomplete (${(error as NodeJS.ErrnoException).code ?? (error as Error).message}); generation disabled; re-read configuration before retrying`;
+      return existsSync(path) ? { status: "invalid", path, problems: [reason] } : { status: "missing", path, reason };
     } finally {
       releaseLock(lockDir, token);
     }
@@ -420,6 +423,9 @@ export function updateConfig(
         held.committed = true;
       }
       return { ok: true, config: next };
+    } catch (error) {
+      const reason = (error as NodeJS.ErrnoException).code ?? (error as Error).message;
+      return { ok: false, reason: `configuration update incomplete (${reason}); re-read configuration before retrying` };
     } finally {
       releaseLock(lockDir, token);
     }

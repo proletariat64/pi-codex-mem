@@ -2,7 +2,7 @@
 // This module is pure Node — no pi imports — so it is unit-testable and
 // reusable from a future standalone CLI.
 
-import { chmodSync, closeSync, constants as fsConstants, existsSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, constants as fsConstants, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
@@ -109,7 +109,9 @@ function parseAndValidate(text: string, path: string): LoadConfigResult {
   if (problems.length > 0) {
     return { status: "invalid", problems, path };
   }
-  return { status: "ok", config: raw as MemoryConfig, path };
+  const config = raw as MemoryConfig;
+  return { status: "ok", config: existsSync(join(dirname(path), "clear.pending"))
+    ? { ...config, enabled: false, read: false, generate: false } : config, path };
 }
 
 export function loadConfig(root: string, opts?: { timezone?: string; create?: boolean }): LoadConfigResult {
@@ -294,7 +296,14 @@ export function writeConfigAtomic(path: string, config: MemoryConfig): void {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.tmp-${process.pid}`;
   writeFileSync(tmp, JSON.stringify(config, null, 2) + "\n", { mode: 0o600 });
+  syncPath(tmp);
   renameSync(tmp, path);
+  syncPath(dirname(path));
+}
+
+function syncPath(path: string): void {
+  const fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  try { fsyncSync(fd); } finally { closeSync(fd); }
 }
 
 /**
@@ -306,8 +315,11 @@ export function writeConfigAtomic(path: string, config: MemoryConfig): void {
 export function updateConfig(
   root: string,
   mutate: (config: MemoryConfig) => MemoryConfig,
-  opts?: { timezone?: string; maxAttempts?: number },
+  opts?: { timezone?: string; maxAttempts?: number; beginClear?: boolean },
 ): { ok: true; config: MemoryConfig } | { ok: false; reason: string } {
+  if (!opts?.beginClear && existsSync(join(root, "clear.pending"))) {
+    return { ok: false, reason: "memory clear cleanup pending; retry clear before changing memory configuration" };
+  }
   const attempts = opts?.maxAttempts ?? 5;
   const lockDir = join(root, "config.json.lock");
   // The root may not exist yet (first-ever update): create it before
@@ -349,6 +361,9 @@ export function updateConfig(
         base === null ? defaultConfig(opts?.timezone ?? "UTC") : base.status === "ok" ? base.config : null;
       if (!current) return { ok: false, reason: "unexpected config state" };
       const next = mutate(current);
+      if ((opts?.beginClear || existsSync(join(root, "clear.pending"))) && (next.enabled || next.read || next.generate)) {
+        return { ok: false, reason: "memory clear cleanup pending; retry clear before enabling memory" };
+      }
       const problems = validateConfig(next);
       if (problems.length > 0) {
         return { ok: false, reason: `mutation produced invalid config: ${problems.join("; ")}` };
@@ -370,14 +385,28 @@ export function updateConfig(
         briefSleep(25 * (i + 1));
         continue; // content changed under us — reload and re-apply
       }
+      if (opts?.beginClear) {
+        const marker = join(root, "clear.pending");
+        if (existsSync(marker)) {
+          if (!lstatSync(marker).isFile() || readFileSync(marker, "utf8") !== "pi-memory-clear-v1\n") {
+            return { ok: false, reason: "invalid clear recovery marker; preserve store for recovery" };
+          }
+        } else {
+          const fd = openSync(marker, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
+          try { writeFileSync(fd, "pi-memory-clear-v1\n"); fsyncSync(fd); } finally { closeSync(fd); }
+          syncPath(root);
+        }
+      }
       const tmp = `${path}.tmp-${process.pid}-${i}`;
       writeFileSync(tmp, JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });
+      syncPath(tmp);
       if (!verifyLockOwnership(lockDir, token)) {
         rmSync(tmp, { force: true });
         briefSleep(25 * (i + 1));
         continue;
       }
       renameSync(tmp, path);
+      syncPath(root);
       if (!verifyLockOwnership(lockDir, token)) {
         return { ok: false, reason: "control lock displaced during commit; re-run the command to reconcile" };
       }
@@ -387,6 +416,11 @@ export function updateConfig(
     }
   }
   return { ok: false, reason: "config control lock held by another process" };
+}
+
+/** The marker and disabled configuration share the same cross-process control lock. */
+export function beginClear(root: string) {
+  return updateConfig(root, config => ({ ...config, enabled: false, read: false, generate: false }), { beginClear: true });
 }
 
 /**

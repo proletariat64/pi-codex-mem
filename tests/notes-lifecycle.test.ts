@@ -1,13 +1,17 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import extension from "../src/extension.ts";
 import { defaultConfig } from "../src/config.ts";
 import { makeMockPi } from "./mock-pi.ts";
+import { openStateDb } from "../src/store/db.ts";
+import { ConsolidationScheduler } from "../src/pipeline/scheduler.ts";
 
 async function fixture(t: test.TestContext, mode: "tui" | "rpc" = "tui") {
   const root = mkdtempSync(join(tmpdir(), "pi-notes-lifecycle-")); const cwd = join(root, "repo"); mkdirSync(cwd);
@@ -97,4 +101,46 @@ test("explicit notes obey disabled, excluded and read-only policies and cannot f
   const db = new DatabaseSync(join(root, "state.sqlite")); t.after(() => db.close());
   const rows = db.prepare("SELECT run_id, user_message_id FROM notes").all(); assert.equal(rows.length, 1);
   assert.notEqual(rows[0]!.run_id, "forged"); assert.equal(rows[0]!.user_message_id, "u1");
+});
+
+test("clear command requires exact confirmation, preserves transcripts and stays disabled after settlement and restart", async (t) => {
+  const { root, command, mock, ctx, notifications } = await fixture(t);
+  await command("remember Private preference");
+  await command("clear"); assert.equal(existsSync(join(root, "state.sqlite")), true);
+  await command("clear --confirm");
+  assert.equal(existsSync(join(root, "state.sqlite")), false);
+  assert.ok(existsSync(ctx.sessionManager.getSessionFile()));
+  assert.ok(notifications.some(text => /provider-side retention.*in-flight/.test(text)));
+  await mock.fire("agent_settled", {}, ctx);
+  await mock.fire("session_start", {}, ctx);
+  await mock.fire("agent_settled", {}, ctx);
+  assert.equal(existsSync(join(root, "state.sqlite")), false);
+  const config = JSON.parse(readFileSync(join(root, "config.json"), "utf8"));
+  assert.equal(config.enabled, false); assert.equal(config.generate, false);
+});
+
+test("forget retries revoked generation cleanup after a transient storage error even while generation is paused", async (t) => {
+  const { root, command, mock, ctx, notifications } = await fixture(t);
+  const db = openStateDb(root); const config = defaultConfig("UTC"); config.dualWrite = true;
+  const scheduler = new ConsolidationScheduler({ root, db, config: () => config, modelPort: () => null,
+    now: Date.now, isForegroundIdle: () => true });
+  await scheduler.runPass(); await scheduler.stop();
+  const directories = db.prepare("SELECT directory FROM generations").all().map(row => String(row.directory)); db.close();
+  writeFileSync(join(root, "config.json"), JSON.stringify({ ...config, generate: false }));
+  await mock.fire("agent_settled", {}, ctx);
+  const inspection = new DatabaseSync(join(root, "state.sqlite")); t.after(() => inspection.close());
+  const sourceId = inspection.prepare("SELECT source_id FROM source_revisions WHERE status = 'captured'").get()!.source_id;
+  const originalRemove = fs.rmSync; let failures = 0;
+  fs.rmSync = (...args: Parameters<typeof fs.rmSync>) => {
+    if (directories.includes(String(args[0])) && failures++ < 2) throw Object.assign(new Error("storage temporarily unavailable"), { code: "EACCES" });
+    return originalRemove(...args);
+  };
+  syncBuiltinESMExports();
+  try {
+    await command(`forget source ${sourceId}`);
+    assert.equal(failures, 2);
+    await t.waitFor(() => assert.ok(directories.every(directory => !existsSync(directory))), { timeout: 5000 });
+    assert.equal(inspection.prepare("SELECT COUNT(*) AS n FROM pipeline_state WHERE read_blocked = 1").get()!.n, 2);
+    await command("status"); assert.doesNotMatch(notifications.at(-1)!, /cleanup deferred|Cleanup pending/);
+  } finally { fs.rmSync = originalRemove; syncBuiltinESMExports(); }
 });

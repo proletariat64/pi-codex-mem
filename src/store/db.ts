@@ -36,7 +36,7 @@ export interface SnapshotRecord {
   evidenceRemoved?: boolean;
 }
 
-const SCHEMA_VERSION = 9;
+const SCHEMA_VERSION = 10;
 
 const MIGRATION_1 = `
 CREATE TABLE schema_migrations (
@@ -366,6 +366,14 @@ export function openStateDb(root: string, options?: { busyTimeoutMs?: number }):
         db.exec(MIGRATION_9);
         db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(9, Date.now());
       }
+      if (current < 10) {
+        const columns = new Set((db.prepare("PRAGMA table_info(notes)").all() as { name: string }[]).map(column => column.name));
+        for (const [name, definition] of [["consumer_session", "TEXT"], ["run_id", "TEXT"], ["user_message_id", "TEXT"],
+          ["origin", "TEXT NOT NULL DEFAULT 'legacy' CHECK (origin IN ('legacy', 'command', 'tool'))"]]) {
+          if (!columns.has(name!)) db.exec(`ALTER TABLE notes ADD COLUMN ${name} ${definition}`);
+        }
+        db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(10, Date.now());
+      }
       db.exec("COMMIT");
     } catch (err) {
       db.exec("ROLLBACK");
@@ -376,11 +384,31 @@ export function openStateDb(root: string, options?: { busyTimeoutMs?: number }):
   try {
     prunePrivacyRevoked(db, root);
     sweepOrphanSnapshots(db, root);
+    sweepUnindexedNotes(db, root);
     return db;
   } catch (err) {
     db.close();
     throw err;
   }
+}
+
+/** A crashed note writer/forget may leave an unindexed private file; active notes are never pruned. */
+function sweepUnindexedNotes(db: DatabaseSync, root: string): void {
+  const directory = join(root, "notes");
+  if (!existsSync(directory)) return;
+  if (lstatSync(directory).isSymbolicLink() || !lstatSync(directory).isDirectory()) throw new Error("notes symlink or special directory rejected");
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const active = new Set((db.prepare("SELECT text_path FROM notes WHERE status = 'active'").all() as { text_path: string }[])
+      .map(note => resolve(note.text_path)));
+    for (const name of readdirSync(directory)) {
+      if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\.md$/.test(name)) continue;
+      const path = join(directory, name);
+      if (lstatSync(path).isSymbolicLink() || !lstatSync(path).isFile()) throw new Error("unsafe note file rejected");
+      if (!active.has(resolve(path))) unlinkSync(path);
+    }
+    db.exec("COMMIT");
+  } catch (error) { db.exec("ROLLBACK"); throw error; }
 }
 
 /**

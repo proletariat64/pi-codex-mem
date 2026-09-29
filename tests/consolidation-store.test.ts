@@ -102,7 +102,7 @@ test("schema 8 upgrades preserve existing extraction data and privacy revocation
   db.exec(`DROP TRIGGER generation_source_version; DROP TRIGGER generation_source_version_update;
     DROP TRIGGER pipeline_generation_version; DROP TABLE note_applications; DROP TABLE generation_sources;
     DROP TABLE generations; DROP TABLE memory_usage; DROP TABLE source_stats; DROP TABLE notes;
-    ALTER TABLE pipeline_state DROP COLUMN active_generation_id; DELETE FROM schema_migrations WHERE version = 9;`);
+    ALTER TABLE pipeline_state DROP COLUMN active_generation_id; DELETE FROM schema_migrations WHERE version >= 9;`);
   db.close();
   const upgraded = openStateDb(root);
   t.after(() => upgraded.close());
@@ -240,4 +240,16 @@ test("new inputs supersede obsolete retries while leaving the live lease and its
   assert.ok(returnToPrior);
   assert.equal(returnToPrior.jobId, first.jobId);
   assert.equal((db.prepare("SELECT attempt_count FROM jobs WHERE job_id = ?").get(first.jobId) as { attempt_count: number }).attempt_count, 2);
+});
+
+test("a deterministic empty rebuild can publish while preserving the provider gate for future evidence", (t) => {
+  const { db } = fixture(t);
+  const options = { memoryVersion: "v1" as const, owner: "writer", promptHash: "prompt", configEpoch: "configuration" };
+  const first = claimConsolidation(db, { ...options, inputRevisionHash: "with-note", now: NOW });
+  assert.ok(first);
+  assert.equal(finishConsolidation(db, first, "blocked", "model_not_configured", NOW + 1), true);
+  const empty = claimConsolidation(db, { ...options, inputRevisionHash: "empty", modelRequired: false, now: NOW + 2 });
+  assert.ok(empty);
+  assert.equal(finishConsolidation(db, empty, "succeeded", null, NOW + 3), true);
+  assert.equal(claimConsolidation(db, { ...options, inputRevisionHash: "new-evidence", now: NOW + 4 }), null);
 });

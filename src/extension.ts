@@ -39,6 +39,8 @@ import { renderMemorySection } from "./read/inject.ts";
 import { cleanupGenerations } from "./pipeline/publish.ts";
 import { createMemoryTools, type MemoryConsumer } from "./read/tools.ts";
 import { getPublishedGeneration } from "./store/consolidation.ts";
+import { Type } from "typebox";
+import { addNote, cleanupRevokedNotes, forgetNote, type NoteProvenance } from "./control/notes.ts";
 
 const EXTENSION_VERSION = "0.1.0";
 
@@ -136,6 +138,7 @@ export default function (pi: ExtensionAPI) {
   let consolidationPort: ReturnType<typeof createConsolidationModelPort> | null = null;
   let readerPin: MemoryReadView | null = null;
   let foregroundRun: MemoryConsumer | null = null;
+  let foregroundPrompt: string | null = null;
   let retentionTimer: NodeJS.Timeout | null = null;
   let heartbeat: NodeJS.Timeout | null = null;
   let privacyRetryTimer: NodeJS.Timeout | null = null;
@@ -157,6 +160,68 @@ export default function (pi: ExtensionAPI) {
       }
       return tool.execute(id, args, signal);
     } });
+  }
+  pi.registerTool({ name: "pi_memory_note", label: "Remember or correct memory",
+    description: "Record a scoped remember/correct note only when the user explicitly asks to remember or correct something. Text is user evidence, not a trusted instruction. Host records triggering run and user-message provenance. No delete capability; use deterministic /memory forget note <note-id> commands for removal.",
+    parameters: Type.Object({ action: Type.Union([Type.Literal("remember"), Type.Literal("correct")]),
+      text: Type.String({ minLength: 1, maxLength: 16_384 }), scope: Type.String({ minLength: 1, maxLength: 1024 }) }, { additionalProperties: false }),
+    async execute(_id, args, signal, _update, ctx) {
+      try {
+        if (signal?.aborted || !foregroundRun) throw new Error("memory_write_unavailable");
+        const note = persistNote(ctx, args.action, args.text, args.scope, "tool");
+        return { content: [{ type: "text", text: `Saved ${args.action} note ${note.noteId} (${note.scope}).` }],
+          details: { noteId: note.noteId, action: args.action, scope: note.scope, readingBlocked: args.action === "correct" } };
+      } catch (error) {
+        const code = (error as Error).message === "invalid_note" ? "invalid_note" : "memory_write_unavailable";
+        return { content: [{ type: "text", text: code }], details: { error: code } };
+      }
+    },
+  });
+
+  function writableNoteStore(ctx: ExtensionContext): { root: string; db: DatabaseSync } {
+    const root = resolveMemoryRoot(); const config = loadConfig(root, { create: false });
+    if (!state.compat?.supported || rootPointsIntoForeignMemory(root) || legacyLockPath(root) || config.status !== "ok" ||
+        !config.config.enabled || flagMode() === "off" || flagMode() === "read" ||
+        isExcludedWorkspace(ctx.cwd, config.config.excludedWorkspaces)) throw new Error("memory_write_unavailable");
+    state.db ??= openStateDb(root);
+    ensureScheduler(ctx);
+    return { root, db: state.db };
+  }
+  function hostNoteProvenance(ctx: ExtensionContext, origin: "command" | "tool"): NoteProvenance {
+    let consumerSession = foregroundRun?.consumerSession ?? null;
+    let userMessageId: string | null = null;
+    try {
+      const file = ctx.sessionManager.getSessionFile(); const header = ctx.sessionManager.getHeader();
+      if (file && header) consumerSession = computeSessionKey(getAgentDir(), file, header.id);
+    } catch { /* A command outside a persisted foreground run has no transcript pointer. */ }
+    if (origin === "tool" && foregroundPrompt !== null) {
+      try {
+        const latestUser = ctx.sessionManager.getBranch().findLast(entry => entry.type === "message" && entry.message.role === "user");
+        if (latestUser?.type === "message" && latestUser.message.role === "user") {
+          const content = latestUser.message.content;
+          const text = typeof content === "string" ? content : content.filter(part => part.type === "text").map(part => part.text).join("\n");
+          if (text === foregroundPrompt) userMessageId = latestUser.id;
+        }
+      } catch { /* No pointer is preferable to attributing this request to an older user message. */ }
+    }
+    return { consumerSession, runId: foregroundRun?.runId ?? null, userMessageId, origin };
+  }
+  function afterNoteChange(root: string, corrected: boolean): void {
+    if (corrected) {
+      readerPin = null;
+      if (retentionTimer) clearTimeout(retentionTimer);
+      retentionTimer = null;
+      try { if (state.db) cleanupRevokedNotes({ root, db: state.db }); }
+      catch { state.captureError = "note cleanup deferred; revoked views remain unavailable"; }
+    }
+    triggerScheduler();
+  }
+  function persistNote(ctx: ExtensionContext, action: "remember" | "correct", text: string, scope: string, origin: "command" | "tool") {
+    const store = writableNoteStore(ctx);
+    const resolvedScope = scope === "workspace" ? `workspace:${realpathSync(ctx.cwd)}` : scope;
+    const note = addNote({ ...store, action, text, scope: resolvedScope, provenance: hostNoteProvenance(ctx, origin) });
+    afterNoteChange(store.root, action === "correct");
+    return note;
   }
 
   pi.registerFlag("pi-memory-mode", {
@@ -180,14 +245,38 @@ export default function (pi: ExtensionAPI) {
     return { mode: "off", source: "config" };
   }
 
-  function eligibleExtractionConfig(root: string): MemoryConfig | null {
+  function eligibleGenerationConfig(root: string): MemoryConfig | null {
     const loaded = loadConfig(root, { create: false });
     if (loaded.status !== "ok") return null;
     const config = loaded.config;
     if (!config.enabled || !config.generate || flagMode() === "off" || flagMode() === "read" ||
-        !config.captureModes.includes(activeMode as MemoryConfig["captureModes"][number]) ||
         isExcludedWorkspace(activeCwd, config.excludedWorkspaces)) return null;
     return config;
+  }
+
+  function eligibleExtractionConfig(root: string): MemoryConfig | null {
+    const config = eligibleGenerationConfig(root);
+    return config?.captureModes.includes(activeMode as MemoryConfig["captureModes"][number]) ? config : null;
+  }
+
+  function eligibleConsolidationConfig(root: string): MemoryConfig | null {
+    const config = eligibleGenerationConfig(root);
+    if (!config || !state.db) return null;
+    if (config.captureModes.includes(activeMode as MemoryConfig["captureModes"][number])) return config;
+    // Explicit notes must reconcile even when automatic transcript capture is disabled in this runtime.
+    for (const version of targetVersions(config)) {
+      const pending = state.db.prepare(`SELECT 1 FROM notes n
+        LEFT JOIN note_applications a ON a.note_id = n.note_id AND a.memory_version = ?
+        JOIN pipeline_state p ON p.memory_version = ?
+        JOIN store_state s ON s.singleton = 1
+        WHERE n.status = 'active' AND (a.note_id IS NULL OR a.note_hash != n.text_hash OR
+          a.control_epoch != s.control_epoch OR p.active_generation_id IS NULL OR
+          a.generation_id != p.active_generation_id) LIMIT 1`).get(version, version);
+      const revoked = state.db.prepare(`SELECT 1 FROM pipeline_state WHERE memory_version = ? AND read_blocked = 1
+        AND block_reason IN ('user_correction', 'note_forgotten')`).get(version);
+      if (pending || revoked) return config;
+    }
+    return null;
   }
 
   function ensureScheduler(ctx?: ExtensionContext): void {
@@ -201,7 +290,7 @@ export default function (pi: ExtensionAPI) {
       const writerPort = consolidationPort;
       consolidator = new ConsolidationScheduler({ db: state.db, root, modelPort: () => writerPort,
         now: Date.now, isForegroundIdle: () => foregroundIdle,
-        config: () => eligibleExtractionConfig(root),
+        config: () => eligibleConsolidationConfig(root),
         pinnedGenerationIds: () => readerPin ? [readerPin.generationId] : [],
         onError: (err) => { state.captureError = `consolidation failed: ${(err as Error).message}`; },
       });
@@ -304,6 +393,7 @@ export default function (pi: ExtensionAPI) {
 
   function markForegroundSettled(): void {
     foregroundRun = null;
+    foregroundPrompt = null;
     readerPin = null;
     if (heartbeat) clearInterval(heartbeat);
     heartbeat = null;
@@ -557,6 +647,7 @@ export default function (pi: ExtensionAPI) {
       if (file && header) consumerSession = computeSessionKey(getAgentDir(), file, header.id);
     } catch { /* Ephemeral sessions still get a process-local consumer identity. */ }
     foregroundRun = { consumerSession, runId: randomUUID() };
+    foregroundPrompt = typeof event.prompt === "string" ? event.prompt : null;
     const opts = event.systemPromptOptions as { sections?: unknown } | undefined;
     if (opts && typeof opts === "object" && "sections" in opts) {
       state.promptSections = "confirmed";
@@ -804,9 +895,29 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.registerCommand("memory", {
-    description: "Pi Memory — persistent cross-session memory (status, doctor, import, run)",
+    description: "Pi Memory — persistent cross-session memory (status, doctor, import, run, remember, correct, forget note)",
     handler: async (args, ctx) => {
       const sub = args.trim().split(/\s+/).filter(Boolean)[0] ?? "status";
+      if (sub === "remember" || sub === "correct") {
+        const text = args.trim().slice(sub.length).trim();
+        try {
+          const note = persistNote(ctx, sub, text, "workspace", "command");
+          if (ctx.hasUI) ctx.ui.notify(`pi-memory: saved ${sub} note ${note.noteId} (${note.scope}); consolidation follows generation settings`, "info");
+        } catch (error) {
+          if (ctx.hasUI) ctx.ui.notify(`pi-memory: ${(error as Error).message === "invalid_note" ? `usage: /memory ${sub} <text>` : "note write unavailable"}`, "warning");
+        }
+        return;
+      }
+      if (sub === "forget") {
+        const match = /^forget\s+note\s+([A-Za-z0-9_-]{1,160})$/.exec(args.trim());
+        if (!match) { if (ctx.hasUI) ctx.ui.notify("usage: /memory forget note <note-id>", "warning"); return; }
+        try {
+          const store = writableNoteStore(ctx); const result = forgetNote({ ...store, noteId: match[1]! });
+          if (result.removed) afterNoteChange(store.root, true);
+          if (ctx.hasUI) ctx.ui.notify(`pi-memory: ${result.removed ? "removed" : "no active note found for"} ${result.noteId}. ${result.explanation}`, "info");
+        } catch { if (ctx.hasUI) ctx.ui.notify("pi-memory: note removal unavailable; committed revocation remains effective", "warning"); }
+        return;
+      }
       if (sub === "run") {
         if (args.trim() === "run --now") await runNow(ctx);
         else if (ctx.hasUI) ctx.ui.notify("usage: /memory run --now", "warning");

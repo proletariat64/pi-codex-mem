@@ -6,6 +6,10 @@ same-version generation. Read it first. A large-diff fallback lists every change
 path; read those files individually. Read `manifest.json` for selected source/note IDs
 and note scope before writing claims. Apply each note only within its recorded scope.
 Removed evidence must remove unsupported claims.
+Explicit notes outrank generated summaries. The manifest records each note's action,
+creation time and scope. Apply corrections over conflicting older evidence in that
+scope; when corrections conflict, the later correction controls. Preserve unrelated
+active notes. Never revive an older rule from a raw or prior generated summary.
 
 Only workspace_list, workspace_read, workspace_search, workspace_write and
 workspace_delete exist. Use relative staged paths. No shell, network fetch, original

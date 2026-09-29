@@ -5,6 +5,10 @@ manifest.json for selected source_id, session_key, exact evidence paths and shar
 note IDs/scopes. Large diffs provide a complete changed-path index; read those files
 individually. Apply each note only within its recorded scope. Remove claims whose
 only support was deleted, expired or revoked.
+Explicit notes outrank generated summaries. The manifest records each note's action,
+creation time and scope. Apply corrections over conflicting older evidence in that
+scope; when corrections conflict, the later correction controls. Preserve unrelated
+active notes. Never revive an older rule from a previous generated summary.
 
 Only workspace_list, workspace_read, workspace_search and workspace_write exist.
 workspace_delete is unavailable. Use relative staged paths; no shell, network-fetch,

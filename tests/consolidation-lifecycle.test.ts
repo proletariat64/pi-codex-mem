@@ -105,7 +105,7 @@ test(`${memoryVersion} extraction publishes through the confined Agent and the n
   assert.match(event.systemPromptOptions.sections.pi_memory!, /generation/i);
   assert.match(event.systemPromptOptions.sections.pi_memory!, /evidence/i);
   assert.equal(extractionCalls + writerCalls, before, "prompt path makes no model request");
-  assert.deepEqual([...mock.tools.keys()].sort(), ["pi_memory_list", "pi_memory_read", "pi_memory_search"]);
+  assert.deepEqual([...mock.tools.keys()].sort(), ["pi_memory_list", "pi_memory_note", "pi_memory_read", "pi_memory_search"]);
   const search = await mock.tools.get("pi_memory_search")!.execute("search", { queries: ["TypeScript"], match: "any" }, undefined, undefined, ctx as never);
   const evidencePath = (search.details as { items: { path: string }[] }).items.find(item => item.path.startsWith("rollout_summaries/"))!.path;
   const read = () => mock.tools.get("pi_memory_read")!.execute("read", { path: evidencePath }, undefined, undefined, ctx as never);
@@ -139,7 +139,12 @@ test(`${memoryVersion} extraction publishes through the confined Agent and the n
   writeFileSync(summaryPath, originalSummary);
   await mock.fire("before_agent_start", event, ctx);
   assert.match(JSON.stringify(await read()), /TypeScript/);
+  const correction = await mock.tools.get("pi_memory_note")!.execute("correct",
+    { action: "correct", text: "Answer in Chinese", scope: "global" }, undefined, undefined, ctx as never);
+  assert.doesNotMatch(JSON.stringify(correction), /memory_write_unavailable/);
+  assert.match(JSON.stringify(await read()), /memory_unavailable/, "note correction revokes the current run's detail pin");
   const control = new DatabaseSync(join(agentDir, "memory", "state.sqlite"));
+  assert.deepEqual(control.prepare("SELECT read_blocked FROM pipeline_state ORDER BY memory_version").all().map(row => row.read_blocked), [1, 1]);
   control.exec("UPDATE store_state SET control_epoch = control_epoch + 1");
   control.close();
   assert.match(JSON.stringify(await read()), /memory_unavailable/, "correction by another process revokes the existing run pin");

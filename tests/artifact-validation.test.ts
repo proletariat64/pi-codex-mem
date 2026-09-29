@@ -97,7 +97,7 @@ const snapshotV2 = (): ConsolidationSnapshot => ({ ...snapshot(), memoryVersion:
   sources: snapshot().sources.map(source => ({ ...source, rawMemory: null })) });
 const summaryV2 = () => `v1\n\n## User Profile\n\n## User preferences\n\n## General Tips\n\n## What's in Memory\n\n### /repo\n\n#### 1970-01-01\n\n- TypeScript: ${evidencePath("a", "choice")} explains when typed interfaces matter; source_id: a; session_key: s-a.\n\n### Older Memory Topics\n`;
 
-test("v2 validates direct grouped routes and always enforces the UTF-8 byte boundary", () => {
+test("T25 v2: 9,999-byte valid summary passes, 10,000 fails, marker remains v1", () => {
   const root = mkdtempSync(join(tmpdir(), "memory-v2-validate-"));
   try {
     const snap = snapshotV2();
@@ -152,7 +152,7 @@ test("v2 rejects unselected routes, IDs, incomplete groups, tampered evidence an
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test("v2 older-topic and note routes remain grounded and empty inputs write only the deterministic summary", () => {
+test("T36 v2: empty evidence and notes produce only a deterministic minimal summary", () => {
   const root = mkdtempSync(join(tmpdir(), "memory-v2-notes-"));
   try {
     mkdirSync(join(root, "notes"));

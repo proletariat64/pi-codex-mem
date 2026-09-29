@@ -52,7 +52,7 @@ test("v2 truncates after redaction at a complete paragraph inside 9,000 UTF-8 by
   assert.ok(Buffer.byteLength(result.output.rollout_summary, "utf8") <= 9_000);
 });
 
-test("v2 falls back to complete lines and never slices a URL or Chinese code point", () => {
+test("T24 v2: overlong Chinese summary retains complete pointers and UTF-8 inside the 9,000-byte cap", () => {
   const line = "界".repeat(1_500); // 4,500 bytes
   const summary = `${line}\n${line}\nhttps://example.com/important/identifier-not-partial`;
   const result = parseV2Output(JSON.stringify({ rollout_summary: summary, rollout_slug: "history" }), 49_152, 9_000);

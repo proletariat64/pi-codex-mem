@@ -325,6 +325,27 @@ test("a branching JSONL file is ambiguous instead of choosing its last physical 
   assert.equal(previouslyCaptured.candidates[0]?.leafId, "a1", "a captured active leaf resolves ambiguity");
 });
 
+for (const version of ["v1", "v2"] as const) test(`T20 ${version}: malformed and branching historic JSONL are rejected read-only`, async (t) => {
+  const { root, cwd } = sandbox(t);
+  const branchFile = join(root, "ambiguous.jsonl");
+  const branchBytes = jsonl(cwd, [user("u1", null, "root"), user("a1", "u1", "first"), user("a2", "u1", "second")]);
+  writeFileSync(branchFile, branchBytes);
+  const malformedFile = join(root, "malformed.jsonl");
+  const malformedBytes = jsonl(cwd, [user("u1", null, "root")]) + "{broken\n" + JSON.stringify(user("u2", "u1", "two")) + "\n";
+  writeFileSync(malformedFile, malformedBytes);
+  const { agentDir, mock, ctx, notifications } = await cliFixture(t, root, cwd);
+  const configPath = join(agentDir, "memory", "config.json");
+  const config = JSON.parse(readFileSync(configPath, "utf8"));
+  writeFileSync(configPath, JSON.stringify({ ...config, version }));
+  await mock.commands.get("memory")!.handler(`import ${branchFile} --dry-run`, ctx);
+  assert.match(notifications.at(-1) ?? "", /ambiguous|multiple.*leaves/i);
+  await mock.commands.get("memory")!.handler(`import ${malformedFile} --dry-run`, ctx);
+  assert.match(notifications.at(-1) ?? "", /malformed.*line 3|line 3.*malformed/i);
+  assert.equal(readFileSync(branchFile, "utf8"), branchBytes);
+  assert.equal(readFileSync(malformedFile, "utf8"), malformedBytes);
+  assert.equal(existsSync(join(agentDir, "memory", "sources")), false);
+});
+
 test("unknown session version is skipped without migrating it in place", (t) => {
   const { root, cwd } = sandbox(t);
   const file = join(root, "future.jsonl");

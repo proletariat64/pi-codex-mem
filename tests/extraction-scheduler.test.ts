@@ -113,7 +113,7 @@ test("a policy change in another process releases a cancelled queued run at its 
   assert.equal(fx.db.prepare("SELECT status FROM version_run_grants").get()!.status, "cancelled");
 });
 
-test("no-output watermark prevents repeated model calls at startup", async (t) => {
+test("T12 v1: no-output watermark prevents repeated model calls at startup", async (t) => {
   const fx = setup(t);
   fx.config.schedule.minIdleMinutes = 0;
   fx.port.request = async (_model, context) => { fx.calls.push(context); return {
@@ -126,6 +126,22 @@ test("no-output watermark prevents repeated model calls at startup", async (t) =
   await fx.scheduler.runPass();
   assert.equal(fx.calls.length, 1);
   assert.equal((fx.db.prepare("SELECT status FROM jobs").get() as { status: string }).status, "no_output");
+});
+
+test("T12 v2: no reusable signal records one no-output result without repeated work", async (t) => {
+  const fx = setup(t);
+  fx.config.version = "v2";
+  fx.config.schedule.minIdleMinutes = 0;
+  fx.port.request = async (_model, context) => { fx.calls.push(context); return {
+    stopReason: "stop", text: '{"rollout_summary":"","rollout_slug":""}',
+  }; };
+  fx.scheduler.trigger();
+  assert.deepEqual(await fx.scheduler.runPass(), [{ status: "no_output" }]);
+  fx.scheduler.trigger();
+  assert.deepEqual(await fx.scheduler.runPass(), []);
+  assert.equal(fx.calls.length, 1);
+  assert.deepEqual(fx.db.prepare("SELECT memory_version, outcome, raw_memory FROM extractions").all().map(row => ({ ...row })),
+    [{ memory_version: "v2", outcome: "no_output", raw_memory: null }]);
 });
 
 test("switching to v2 enrolls the same captured source without reusing v1's no-output watermark", async (t) => {
@@ -167,7 +183,7 @@ test("dual writing extracts each version once within a shared two-job pass", asy
   assert.equal(fx.calls.length, 2);
 });
 
-test("a v1 provider failure cannot suppress successful v2 dual-write work", async (t) => {
+test("T30 cross: failed v1 model request leaves v2 usable with independent retry and shared budget", async (t) => {
   const fx = setup(t);
   fx.config.schedule.minIdleMinutes = 0;
   fx.config.dualWrite = true;

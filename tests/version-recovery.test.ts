@@ -25,7 +25,7 @@ function fixture(t: test.TestContext) {
   const config = defaultConfig("UTC"); config.version = "v2";
   return { root, db, file, original, captured, config, cwd, agentDir, header, entry };
 }
-test("a newly enabled version reconstructs pruned enrolled snapshots read-only from original JSONL", (t) => {
+test("T34 cross: newly enabled v2 reconstructs pruned enrolled snapshots from original JSONL read-only", (t) => {
   const f = fixture(t); unlinkSync(f.captured.snapshotPath);
   const report = recoverEnrolledSnapshots({ root: f.root, db: f.db, config: f.config, now: Date.now() });
   assert.equal(report.recovered, 1); assert.deepEqual(report.unavailable, []);

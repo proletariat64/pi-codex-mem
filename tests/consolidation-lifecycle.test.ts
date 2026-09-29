@@ -11,7 +11,7 @@ import { makeMockPi } from "./mock-pi.ts";
 import { defaultConfig } from "../src/config.ts";
 
 for (const memoryVersion of ["v1", "v2"] as const) {
-test(`${memoryVersion} extraction publishes through the confined Agent and the next session injects its summary without a request`, async (t) => {
+test(`${memoryVersion === "v2" ? "T27 v2: " : ""}${memoryVersion} extraction publishes through the confined Agent and the next session injects its summary without a request`, async (t) => {
   const temporary = mkdtempSync(join(tmpdir(), "pi-memory-consolidation-lifecycle-"));
   t.after(() => rmSync(temporary, { recursive: true, force: true }));
   const cwd = join(temporary, "repo"); mkdirSync(cwd);

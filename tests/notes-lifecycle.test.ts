@@ -141,11 +141,19 @@ test("forget retries revoked generation cleanup after a transient storage error 
     assert.equal(failures, 2);
     await t.waitFor(() => assert.ok(directories.every(directory => !existsSync(directory))), { timeout: 5000 });
     assert.equal(inspection.prepare("SELECT COUNT(*) AS n FROM pipeline_state WHERE read_blocked = 1").get()!.n, 2);
+    for (const version of ["v2", "v1"] as const) {
+      await command(`version ${version}`);
+      await mock.fire("agent_settled", {}, ctx);
+      await mock.fire("session_start", {}, ctx);
+      const event = { systemPromptOptions: { sections: {} as Record<string, string> } };
+      await mock.fire("before_agent_start", event, ctx);
+      assert.equal(event.systemPromptOptions.sections.pi_memory, undefined, `${version} switch must not revive forgotten guidance`);
+    }
     await command("status"); assert.doesNotMatch(notifications.at(-1)!, /cleanup deferred|Cleanup pending/);
   } finally { fs.rmSync = originalRemove; syncBuiltinESMExports(); }
 });
 
-test("version switching preserves the foreground pin, leaves an unbuilt target warming up and reuses the valid original version", async (t) => {
+test("T28 cross: version switching preserves the foreground pin, leaves an unbuilt target warming up and reuses valid v1", async (t) => {
   const { root, command, mock, ctx, notifications } = await fixture(t);
   const db = openStateDb(root); const config = defaultConfig("UTC");
   const scheduler = new ConsolidationScheduler({ root, db, config: () => config, modelPort: () => null,
@@ -176,4 +184,33 @@ test("version switching preserves the foreground pin, leaves an unbuilt target w
   await mock.fire("agent_settled", {}, ctx);
   assert.ok((await start()).pi_memory);
   assert.equal((await list()).details.memoryVersion, "v1");
+});
+
+test("T38 cross: conflicting version commands persist after restart without changing unrelated settings or reader", async (t) => {
+  const { root, command, mock, ctx } = await fixture(t);
+  const db = openStateDb(root);
+  const config = defaultConfig("UTC"); config.dualWrite = true;
+  const scheduler = new ConsolidationScheduler({ root, db, config: () => config, modelPort: () => null,
+    now: Date.now, isForegroundIdle: () => true });
+  await scheduler.runPass(); await scheduler.stop(); db.close();
+  const configPath = join(root, "config.json");
+  const persisted = { ...config, dualWrite: false, generate: false, limits: { ...config.limits, dailyRequests: 7 } };
+  writeFileSync(configPath, JSON.stringify(persisted));
+  await Promise.all([command("version v2"), command("version v1")]);
+  const raced = JSON.parse(readFileSync(configPath, "utf8"));
+  assert.ok(["v1", "v2"].includes(raced.version), "same-key writes leave valid version config");
+  assert.equal(raced.limits.dailyRequests, 7);
+  await Promise.all([command("version v2"), command("dual-write on")]);
+  const after = JSON.parse(readFileSync(configPath, "utf8"));
+  assert.equal(after.version, "v2"); assert.equal(after.dualWrite, true);
+  assert.equal(after.limits.dailyRequests, 7); assert.equal(after.generate, false);
+  await mock.fire("session_shutdown", {}, ctx);
+  await mock.fire("session_start", {}, ctx);
+  const event = { systemPromptOptions: { sections: {} as Record<string, string> } };
+  await mock.fire("before_agent_start", event, ctx);
+  assert.match(event.systemPromptOptions.sections.pi_memory ?? "", /Memory version: v2/);
+  assert.doesNotMatch(event.systemPromptOptions.sections.pi_memory ?? "", /Memory version: v1/);
+  const list = await mock.tools.get("pi_memory_list")!.execute("list", {}, undefined, undefined, ctx as never);
+  assert.equal((list.details as { memoryVersion?: string }).memoryVersion, "v2");
+  assert.equal(JSON.parse(readFileSync(configPath, "utf8")).limits.dailyRequests, 7);
 });

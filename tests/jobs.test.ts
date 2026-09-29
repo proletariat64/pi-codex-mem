@@ -282,7 +282,7 @@ test("store rejects a false no-output classification without consuming the lease
     rolloutSlug: "", outcome: "no_output" }, NOW + 2), true);
 });
 
-test("no-output v1 result is processed once without suppressing the other version", (t) => {
+test("T31 cross: v1 no-output still lets v2 process and neither version churns", (t) => {
   const { db } = fixture(t);
   enqueueExtraction(db, { sourceId: SOURCE_ID, memoryVersion: "v1", promptHash: PROMPT_HASH, now: NOW });
   enqueueExtraction(db, { sourceId: SOURCE_ID, memoryVersion: "v2", promptHash: PROMPT_HASH, now: NOW });

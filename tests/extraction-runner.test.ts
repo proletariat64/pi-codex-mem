@@ -90,6 +90,22 @@ test("v2 runner uses the pinned prompt, stores NULL raw learning and bounded sum
   assert.ok(row.original_bytes > 9_000);
 });
 
+test("T23 v2: strict summary-and-slug schema rejects raw_memory before writing NULL raw memory", async (t) => {
+  const { db, job, root } = setup(t, undefined, "v2");
+  const { port, calls } = fakePort([
+    response('{"raw_memory":"v1 leak","rollout_summary":"history","rollout_slug":"history"}'),
+    response('{"rollout_summary":"User chose TypeScript over Rust","rollout_slug":"typescript"}'),
+  ]);
+  assert.deepEqual(await runV2Extraction({ db, root, job, modelRef, port, now: NOW + 1,
+    timezone: "UTC", limits: { ...limits, v2RolloutSummaryBytes: 9_000 },
+    signal: new AbortController().signal }), { status: "succeeded" });
+  assert.equal(calls.length, 2);
+  assert.match(calls[1]?.text ?? "", /two required v2 string fields/);
+  assert.deepEqual(db.prepare("SELECT raw_memory, rollout_summary FROM extractions").all().map(row => ({ ...row })),
+    [{ raw_memory: null, rollout_summary: "User chose TypeScript over Rust" }]);
+  assert.throws(() => db.prepare("UPDATE extractions SET raw_memory = 'v1 leak'").run(), /CHECK constraint failed/);
+});
+
 test("v2 rejects raw_memory and repairs once within the shared attempt and request budgets", async (t) => {
   const { db, job, root } = setup(t, undefined, "v2");
   const { port, calls } = fakePort([
@@ -271,6 +287,21 @@ test("provider-error or aborted result never enters JSON repair", async (t) => {
   }
 });
 
+for (const version of ["v1", "v2"] as const) test(`T17 ${version}: missing configured model blocks without fallback or copied credentials`, async (t) => {
+  const { db, job, root } = setup(t, undefined, version);
+  const missing = fakePort([]);
+  missing.port.resolve = ref => {
+    assert.deepEqual(ref, modelRef, "only the selected pi registry reference is resolved");
+    return undefined;
+  };
+  assert.deepEqual(await (version === "v1" ? runV1Extraction : runV2Extraction)({
+    db, root, job, modelRef, port: missing.port, now: NOW + 1, timezone: "UTC",
+    limits: { ...limits, v2RolloutSummaryBytes: 9_000 }, signal: new AbortController().signal,
+  }), { status: "blocked" });
+  assert.equal(missing.calls.length, 0);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM extractions").get()!.n, 0);
+});
+
 test("a blocked missing model resumes only after its persisted configuration epoch changes", async (t) => {
   const { db, job, root } = setup(t);
   const missing = fakePort([]);
@@ -325,11 +356,11 @@ test("provider Retry-After hints extend transient backoff without persisting raw
   assert.equal(row.error_code, "provider_error");
 });
 
-test("exhausted daily budget defers work without making a model request", async (t) => {
-  const { db, job, root } = setup(t);
+for (const version of ["v1", "v2"] as const) test(`T19 ${version}: exhausted budget defers work without starting another request`, async (t) => {
+  const { db, job, root } = setup(t, undefined, version);
   const { port, calls } = fakePort([]);
-  const result = await runV1Extraction({ db, root, job, modelRef, port, now: NOW + 1,
-    timezone: "UTC", limits: { ...limits, dailyInputTokens: 100 }, signal: new AbortController().signal });
+  const result = await (version === "v1" ? runV1Extraction : runV2Extraction)({ db, root, job, modelRef, port, now: NOW + 1,
+    timezone: "UTC", limits: { ...limits, v2RolloutSummaryBytes: 9_000, dailyInputTokens: 100 }, signal: new AbortController().signal });
   assert.deepEqual(result, { status: "budget_deferred", reason: "input_budget" });
   assert.equal(calls.length, 0);
   assert.equal((db.prepare("SELECT status FROM jobs").get() as { status: string }).status, "retry_wait");

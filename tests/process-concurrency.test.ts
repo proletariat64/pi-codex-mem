@@ -76,7 +76,7 @@ function startWorker(root: string, version: string, sourceId: string, cwd: strin
   return { child, ready, exchange(phase: string) { const pending = response(phase); child.send({ phase }); return pending; } };
 }
 
-for (const version of ["v1", "v2"] as const) test(`${version}: two live processes accept one extraction and publish one consolidation winner`, { timeout: 30_000 }, async t => {
+for (const version of ["v1", "v2"] as const) test(`T13 ${version}: two live processes accept one extraction and publish one consolidation winner`, { timeout: 30_000 }, async t => {
   const base = mkdtempSync(join(tmpdir(), "pi-process-race-")); const cwd = join(base, "repo"); mkdirSync(cwd);
   execFileSync("git", ["init", "-q"], { cwd }); const agentDir = join(base, "agent"); const root = join(agentDir, "memory");
   const children: ChildProcess[] = [];

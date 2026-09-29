@@ -44,7 +44,7 @@ function fixture(t: test.TestContext, version: MemoryVersion, options: { ephemer
 }
 
 for (const version of ["v1", "v2"] as const) {
-  for (const order of ["before", "after"]) test(`${version}: full system prompt override ${order} memory injection is diagnosed without overriding it`, async t => {
+  for (const order of ["before", "after"]) test(`${order === "before" ? `T21 ${version}: ` : ""}${version}: full system prompt override ${order} memory injection is diagnosed without overriding it`, async t => {
     const f = fixture(t, version); f.config.generate = false;
     fs.writeFileSync(join(f.root, "config.json"), JSON.stringify(f.config));
     const db = openStateDb(f.root);
@@ -64,7 +64,7 @@ for (const version of ["v1", "v2"] as const) {
     assert.match(JSON.stringify(result), /memory_unavailable/); assert.equal(f.requests(), 0);
   });
 
-  for (const configured of [false, true]) test(`${version}: an ephemeral lifecycle with configured=${configured} makes no memory artifacts or model requests`, async t => {
+  for (const configured of [false, true]) test(`${configured ? `T22 ${version}: ` : ""}${version}: an ephemeral lifecycle with configured=${configured} makes no memory artifacts or model requests`, async t => {
     const f = fixture(t, version, { ephemeral: true, configured });
     if (configured) {
       f.config.models.extract = { provider: "mock", modelId: "memory" };
@@ -91,7 +91,7 @@ for (const version of ["v1", "v2"] as const) {
     assert.deepEqual(fs.readFileSync(f.file), original);
   });
 
-  test(`${version}: provider retry after agent_end captures only the final settled branch`, async t => {
+  test(`T11 ${version}: provider retry after agent_end captures only the final settled branch`, async t => {
     const f = fixture(t, version);
     await f.mock.fire("session_start", {}, f.ctx);
     await f.mock.fire("before_agent_start", { systemPromptOptions: { sections: {} } }, f.ctx);

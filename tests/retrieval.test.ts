@@ -112,7 +112,7 @@ test("v2 reads rollout evidence only and successful detail reads deduplicate ver
   assert.equal((await v1.call("read", { path: "skills/types/SKILL.md" })).details.error, undefined);
 });
 
-test("cursors reject another version, generation, query, path, matching mode or operation", async (t) => {
+test("T33 cross: version and generation mismatched cursors cannot serve content", async (t) => {
   const { publish } = fixture(t); const first = publish("v1");
   const search = { queries: ["中文"], match: "any", maxResults: 1 };
   const cursor = (await first.call("search", search)).details.cursor;

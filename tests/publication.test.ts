@@ -104,7 +104,7 @@ test("publication rejects staged symlinks and rechecks the lease clock after dis
   assert.equal(getPublishedGeneration(db, "v1", time), null);
 });
 
-test("actual process crashes around fsync, rename and CAS preserve complete old or new publication", (t) => {
+test("T14 v1: actual process crashes around fsync, rename and CAS preserve complete old or new publication", (t) => {
   for (const boundary of BOUNDARIES) {
     const { root, db, candidate } = fixture(t);
     assert.equal(publishGeneration(candidate("old")).published, true);
@@ -175,7 +175,7 @@ test("v2 publication revalidates summary and provenance instead of trusting a by
   assert.equal(existsSync(join(root, "versions", "v2", "generations", oversized.generationId)), false);
 });
 
-test("v2 process crashes leave a complete old or new summary-only generation", (t) => {
+test("T14 v2: process crashes leave a complete old or new summary-only generation", (t) => {
   for (const boundary of BOUNDARIES) {
     const { root, db, candidate } = fixture(t);
     assert.equal(publishGeneration(candidate("v2-old", NOW, "v2")).published, true);

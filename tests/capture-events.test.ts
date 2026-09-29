@@ -5,6 +5,7 @@ import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import memoryExtension from "../src/extension.ts";
+import { defaultConfig, type MemoryVersion } from "../src/config.ts";
 import { openStateDb } from "../src/store/db.ts";
 import { claimDueExtractions, commitExtraction, enqueueExtraction } from "../src/store/jobs.ts";
 import { makeMockPi } from "./mock-pi.ts";
@@ -30,7 +31,7 @@ function userEntry(id: string, text: string) {
   return { type: "message", id, parentId: null, timestamp: new Date(0).toISOString(), message: { role: "user", content: [{ type: "text", text }], timestamp: 0 } };
 }
 
-function makeSandbox(t: test.TestContext): { agentDir: string; cwd: string; memoryRoot: string } {
+function makeSandbox(t: test.TestContext, version?: MemoryVersion): { agentDir: string; cwd: string; memoryRoot: string } {
   const base = mkdtempSync(join(tmpdir(), "pi-memory-cap3-"));
   t.after(() => rmSync(base, { recursive: true, force: true }));
   const agentDir = join(base, "agent");
@@ -38,7 +39,12 @@ function makeSandbox(t: test.TestContext): { agentDir: string; cwd: string; memo
   mkdirSync(cwd, { recursive: true });
   process.env.PI_CODING_AGENT_DIR = agentDir;
   execFileSync("git", ["init", "-q"], { cwd });
-  return { agentDir, cwd, memoryRoot: join(agentDir, "memory") };
+  const memoryRoot = join(agentDir, "memory");
+  if (version) {
+    mkdirSync(memoryRoot, { recursive: true });
+    writeFileSync(join(memoryRoot, "config.json"), JSON.stringify({ ...defaultConfig("UTC"), version }));
+  }
+  return { agentDir, cwd, memoryRoot };
 }
 
 function snapshotFiles(root: string): string[] {
@@ -101,8 +107,8 @@ test("compaction and shutdown checkpoint branch state without waiting for a mode
   assert.ok(files.some((f) => readFileSync(f, "utf8").includes("last unscheduled decision")));
 });
 
-test("session_tree retires the abandoned head (T08)", async (t) => {
-  const { cwd, memoryRoot } = makeSandbox(t);
+for (const version of ["v1", "v2"] as const) test(`T08 ${version}: session_tree retires abandoned head and revokes stale decisions`, async (t) => {
+  const { cwd, memoryRoot } = makeSandbox(t, version);
   const mock = makeMockPi();
   memoryExtension(mock.pi);
   const ctx = {
@@ -126,6 +132,15 @@ test("session_tree retires the abandoned head (T08)", async (t) => {
   assert.ok(heads.every((h) => h.state === "retired"), "old head retired after /tree switch");
   assert.equal(epoch.control_epoch, 1);
   assert.deepEqual(blocked.map((r) => r.read_blocked), [1, 1]);
+  const replacement = { ...ctx, sessionManager: fakeSessionManager(cwd, [userEntry("uX", "replacement decision: use Rust")]) };
+  await mock.fire("agent_settled", { type: "agent_settled" }, replacement);
+  const active = new DatabaseSync(join(memoryRoot, "state.sqlite"), { readOnly: true });
+  const row = active.prepare(`SELECT r.snapshot_path FROM source_revisions r
+    JOIN branch_heads h ON h.session_key = r.session_key AND h.branch_id = r.branch_id
+    WHERE h.state = 'active' AND r.status = 'captured'`).get() as { snapshot_path: string };
+  assert.match(readFileSync(row.snapshot_path, "utf8"), /replacement decision: use Rust/);
+  assert.doesNotMatch(readFileSync(row.snapshot_path, "utf8"), /original decision/);
+  active.close();
 });
 
 test("resume blocks old captured evidence when a new context edit is present before settlement", async (t) => {
@@ -149,8 +164,8 @@ test("resume blocks old captured evidence when a new context edit is present bef
   assert.equal(snapshotFiles(memoryRoot).length, 1, "the old at-rest snapshot is removed on settlement");
 });
 
-test("context edit removes sensitive evidence, supersedes old revision, and never touches source session (T10/R07)", async (t) => {
-  const { cwd, memoryRoot } = makeSandbox(t);
+for (const version of ["v1", "v2"] as const) test(`T10 ${version}: context edit removes sensitive evidence and invalidates old views`, async (t) => {
+  const { cwd, memoryRoot } = makeSandbox(t, version);
   const sourceFile = join(cwd, "session.jsonl");
   writeFileSync(sourceFile, "authoritative session bytes\n");
   const mock = makeMockPi();
@@ -254,7 +269,7 @@ test("shutdown stays bounded when a concurrent reader delays privacy WAL cleanup
   const reopened = openStateDb(memoryRoot);
   reopened.close();
   const path = join(memoryRoot, "state.sqlite");
-  for (const file of [path, path + "-wal"]) {
+  for (const file of [path, `${path}-wal`]) {
     if (existsSync(file)) assert.equal(readFileSync(file).includes(Buffer.from(marker)), false);
   }
 });
@@ -361,8 +376,8 @@ test("privacy edit revokes copied ancestor evidence on previously selected branc
   db.close();
 });
 
-test("pre-compaction ancestry is captured but the derived summary is not counted twice (T07)", async (t) => {
-  const { cwd, memoryRoot } = makeSandbox(t);
+for (const version of ["v1", "v2"] as const) test(`T07 ${version}: pre-compaction raw evidence survives without counting derived summary twice`, async (t) => {
+  const { cwd, memoryRoot } = makeSandbox(t, version);
   const mock = makeMockPi(); memoryExtension(mock.pi);
   const entries = [userEntry("u1", "choose TypeScript because of type safety"),
     { type: "compaction", id: "c1", parentId: "u1", timestamp: new Date().toISOString(), summary: "choose TypeScript", firstKeptEntryId: "u1", tokensBefore: 100 }];
@@ -402,8 +417,8 @@ test("fork copies the ancestor evidence key from an older retained parent revisi
   assert.equal(copied.items[0].evidenceKey, first.items[0].evidenceKey);
 });
 
-test("forked session receives a distinct session identity (T09)", async (t) => {
-  const { cwd, memoryRoot } = makeSandbox(t);
+for (const version of ["v1", "v2"] as const) test(`T09 ${version}: fork retains ancestor identity without counting preference twice`, async (t) => {
+  const { cwd, memoryRoot } = makeSandbox(t, version);
   const mock = makeMockPi(); memoryExtension(mock.pi);
   const entries = [userEntry("u1", "shared ancestor")];
   const sm = fakeSessionManager(cwd, entries);

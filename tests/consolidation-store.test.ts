@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openStateDb, recordSnapshot } from "../src/store/db.ts";
 import { DatabaseSync } from "node:sqlite";
+import { addNote } from "../src/control/notes.ts";
 import { enqueueExtraction, claimDueExtractions, commitExtraction } from "../src/store/jobs.ts";
 import { claimConsolidation, commitGeneration, finishConsolidation, getPublishedGeneration,
   recordSourceUsage, renewConsolidationLease, selectConsolidation } from "../src/store/consolidation.ts";
@@ -47,6 +48,32 @@ test("selection uses only active same-version evidence and ranks real usage with
   assert.equal(selected.retentionDeadline, NOW + 30 * 86_400_000 + 1);
   db.prepare("UPDATE branch_heads SET state = 'suppressed' WHERE session_key = 'session-used'").run();
   assert.deepEqual(selectConsolidation(db, { memoryVersion: "v1", now: NOW }).sources.map(s => s.sourceId), ["recent"]);
+});
+
+test("T37 cross: dirty selection and retention remain versioned while correction invalidates both", (t) => {
+  const { root, db, source } = fixture(t);
+  source("original-v1", 10, "v1");
+  source("original-v2", 10, "v2");
+  const hashes = {} as Record<"v1" | "v2", string>;
+  for (const version of ["v1", "v2"] as const) {
+    const lease = claimConsolidation(db, { memoryVersion: version, owner: "writer", promptHash: `prompt-${version}`, now: NOW + 2 });
+    assert.ok(lease);
+    const snapshot = selectConsolidation(db, { memoryVersion: version, now: NOW + 2 });
+    hashes[version] = snapshot.selectionHash;
+    assert.equal(selectConsolidation(db, { memoryVersion: version, now: NOW + 2 }).selectionHash, hashes[version], "unchanged input is a no-op");
+    assert.deepEqual(snapshot.sources.map(item => item.sourceId), [`original-${version}`]);
+    assert.equal(commitGeneration(db, { lease, snapshot, generation: { generationId: `published-${version}`,
+      memoryVersion: version, directory: join(root, `published-${version}`), inputHash: snapshot.selectionHash,
+      manifestHash: "manifest" }, now: NOW + 3 }), true, `${version}: ${JSON.stringify(db.prepare("SELECT memory_version, kind, status, error_code, owner FROM jobs").all())}`);
+    assert.ok(getPublishedGeneration(db, version, NOW + 4));
+    assert.equal(getPublishedGeneration(db, version, NOW + 4, { maxUnusedDays: 7 }), null, "retention expiry applies to selected evidence");
+  }
+  source("new-v2", 1, "v2");
+  assert.equal(selectConsolidation(db, { memoryVersion: "v1", now: NOW + 4 }).selectionHash, hashes.v1);
+  assert.notEqual(selectConsolidation(db, { memoryVersion: "v2", now: NOW + 4 }).selectionHash, hashes.v2);
+  addNote({ root, db, action: "correct", text: "Ignore prior preference", scope: "global",
+    provenance: { consumerSession: "reader", runId: "run", userMessageId: "u1", origin: "tool" }, now: NOW + 5 });
+  for (const version of ["v1", "v2"] as const) assert.equal(getPublishedGeneration(db, version, NOW + 6), null);
 });
 
 test("publication compares selection, version, epoch and lease in one transaction", (t) => {

@@ -69,7 +69,7 @@ const run = (setup: ReturnType<typeof fixture>, port: ConsolidationModelPort,
   modelRef: { provider: "mock", modelId: "writer" }, signal: new AbortController().signal,
   clock: () => NOW + 1, ...extra });
 
-test("v2 writer exposes only four tools and cannot create a handbook or invoke deletion", async (t) => {
+test("T26 v2: writer tools deny handbook, skill and deletion attempts", async (t) => {
   const setup = fixture(t, "v2");
   const { port, calls } = fakePort([
     reply([tool("workspace_delete", { path: "memory_summary.md" }),
@@ -94,23 +94,25 @@ test("v2 writer exposes only four tools and cannot create a handbook or invoke d
   assert.notEqual(consolidationPromptHash(setup.config, "v2"), consolidationPromptHash(setup.config, "v1"));
 });
 
-test("real Agent uses only five staged tools and hostile source instructions cannot read original JSONL or execute shell", async (t) => {
-  const setup = fixture(t);
+for (const version of ["v1", "v2"] as const) test(`T18 ${version}: hostile writer cannot read original JSONL or execute shell`, async (t) => {
+  const setup = fixture(t, version);
   const { port, calls } = fakePort([
     reply([tool("workspace_read", { path: "rollout_summaries/source.md" })], "toolUse"),
     reply([tool("bash", { command: "touch escaped" }), tool("workspace_read", { path: setup.original }),
-      tool("workspace_write", { path: "MEMORY.md", content: handbook }),
+      ...(version === "v1" ? [tool("workspace_write", { path: "MEMORY.md", content: handbook })] : []),
       tool("workspace_write", { path: "memory_summary.md", content: summary })], "toolUse"),
     reply([{ type: "text", text: "Written." }]),
   ]);
   assert.deepEqual(await run(setup, port), { status: "succeeded" });
-  assert.equal(readFileSync(join(setup.directory, "MEMORY.md"), "utf8"), handbook);
+  if (version === "v1") assert.equal(readFileSync(join(setup.directory, "MEMORY.md"), "utf8"), handbook);
+  else assert.throws(() => readFileSync(join(setup.directory, "MEMORY.md")), /ENOENT/);
   assert.equal(readFileSync(join(setup.directory, "memory_summary.md"), "utf8"), summary);
   assert.equal(calls.length, 3);
   const system = calls[0]?.context.messages[0]; assert.equal(system?.role, "system");
   if (system?.role !== "system") throw new Error("missing system");
-  assert.deepEqual(system.toolsAdded?.map(x => x.name),
-    ["workspace_list", "workspace_read", "workspace_search", "workspace_write", "workspace_delete"]);
+  assert.deepEqual(system.toolsAdded?.map(x => x.name), version === "v1" ?
+    ["workspace_list", "workspace_read", "workspace_search", "workspace_write", "workspace_delete"] :
+    ["workspace_list", "workspace_read", "workspace_search", "workspace_write"]);
   assert.doesNotMatch(JSON.stringify(system), /Untrusted text|original-only-private-text/);
   assert.doesNotMatch(JSON.stringify(calls), /original-only-private-text/);
   const results = calls[2]?.context.messages.filter(x => x.role === "toolResult");

@@ -10,7 +10,7 @@ import { makeMockPi } from "./mock-pi.ts";
 import { createVersionRun } from "../src/control/switch.ts";
 import { recordProcessActivity } from "../src/store/jobs.ts";
 
-for (const scenario of ["selected", "explicit", "late-valid", "late-invalid", "queued", "queued-default", "queued-force-busy", "both"]) test({
+for (const scenario of ["selected", "explicit", "late-valid", "late-invalid", "queued", "queued-default", "queued-force-busy", "both"]) test(`${scenario === "late-valid" ? "T29 cross: " : ""}${({
   selected: "/memory run --now follows selected v2 and reports its independent extraction",
   explicit: "/memory run --version v2 grants one bounded pass without changing the selected v1 reader",
   "late-valid": "a cancelled version grant accepts an in-flight valid result only in its original namespace",
@@ -19,7 +19,7 @@ for (const scenario of ["selected", "explicit", "late-valid", "late-invalid", "q
   "queued-default": "/memory run queues the configured target without skipping idle",
   "queued-force-busy": "forced explicit passes report the busy boundary without imposing the ordinary idle window",
   both: "/memory run --version both --now uses one shared two-job pass and preserves single-version reading",
-}[scenario]!, async (t) => {
+})[scenario]!}`, async (t) => {
   const explicit = scenario !== "selected" && scenario !== "queued-default";
   let finish: (() => void) | undefined;
   const waiting = new Promise<void>(resolve => { finish = resolve; });

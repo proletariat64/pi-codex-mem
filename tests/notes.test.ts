@@ -50,7 +50,7 @@ test("explicit notes survive reopening with shared scope and host-provided prove
   assert.deepEqual({ ...stored }, { consumer_session: "reader", run_id: "run", user_message_id: "u1", origin: "tool", scope: "workspace:/repo" });
 });
 
-test("correction fences old writers and each version independently reconciles its note application", (t) => {
+test("T35 cross: shared note revision applies independently to both publications", (t) => {
   const { root, db } = fixture(t);
   const v1 = publish(root, db, "v1", "old-v1", 100); const v2 = publish(root, db, "v2", "old-v2", 101);
   assert.ok(v1); assert.ok(v2);
@@ -111,7 +111,7 @@ test("startup sweeps interrupted note files, keeps active notes and rejects a sy
   assert.throws(() => addNote({ root, db: reopened, action: "remember", text: "escape", scope: "global", provenance }), /symlink/);
 });
 
-test("a provider outage after correction keeps both versions unavailable and notes durable", async (t) => {
+test("T32 cross: correction while v2 inactive and provider outage cannot revive either version", async (t) => {
   const { root, db } = fixture(t);
   publish(root, db, "v1", "old-v1", 100); publish(root, db, "v2", "old-v2", 101);
   const note = addNote({ root, db, action: "correct", text: "Use TypeScript", scope: "global", provenance, now: 102 });
@@ -126,6 +126,28 @@ test("a provider outage after correction keeps both versions unavailable and not
     assert.equal(acquireReadView({ root, db, memoryVersion: "v2", now: 104 }), null);
     assert.equal(readFileSync(note.textPath, "utf8"), "Use TypeScript");
     assert.equal(db.prepare("SELECT COUNT(*) AS n FROM note_applications WHERE note_id = ?").get(note.noteId)!.n, 0);
+  } finally { await scheduler.stop(); }
+});
+
+for (const version of ["v1", "v2"] as const) test(`T16 ${version}: correction revokes old view through provider outage`, async (t) => {
+  const { root, db } = fixture(t);
+  publish(root, db, "v1", "old-v1", 100);
+  publish(root, db, "v2", "old-v2", 101);
+  const note = addNote({ root, db, action: "correct", text: "Use TypeScript, not Rust", scope: "global", provenance, now: 102 });
+  const config = defaultConfig("UTC");
+  config.version = version;
+  config.models.consolidate = { provider: "fixture", modelId: "writer" };
+  const model: Model<Api> = { provider: "fixture", id: "writer", api: "openai-completions", name: "Writer",
+    baseUrl: "https://unused.invalid", contextWindow: 200_000, maxTokens: 8_000,
+    reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
+  const scheduler = new ConsolidationScheduler({ root, db, config: () => config, now: () => 103,
+    isForegroundIdle: () => true, modelPort: () => ({ resolve: () => model,
+      stream: () => { throw new Error("provider unavailable"); } }) });
+  try {
+    assert.equal((await scheduler.runPass())[0]?.status, "retry_wait");
+    assert.equal(acquireReadView({ root, db, memoryVersion: version, now: 104 }), null);
+    assert.equal(acquireReadView({ root, db, memoryVersion: version === "v1" ? "v2" : "v1", now: 104 }), null);
+    assert.equal(readFileSync(note.textPath, "utf8"), "Use TypeScript, not Rust");
   } finally { await scheduler.stop(); }
 });
 

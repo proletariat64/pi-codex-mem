@@ -59,7 +59,7 @@ export function clearMemoryStore(input: { root: string; db: DatabaseSync; confir
       invalidateGeneratedViews(db, "store_cleared", Date.now());
       for (const table of ["note_applications", "generation_sources", "generations", "memory_usage", "source_stats",
         "extractions", "jobs", "source_revisions", "branch_heads", "sessions", "workspaces", "notes",
-        "suppression_tombstones", "privacy_edit_targets", "process_activity", "budget_reservations", "budget_usage"]) {
+        "suppression_tombstones", "privacy_edit_targets", "process_activity", "budget_reservations", "budget_usage", "version_run_grants"]) {
         db.exec(`DELETE FROM ${table}`);
       }
       db.exec("COMMIT");

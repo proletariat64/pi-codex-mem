@@ -410,6 +410,15 @@ export function updateConfig(
       if (!verifyLockOwnership(lockDir, token)) {
         return { ok: false, reason: "control lock displaced during commit; re-run the command to reconcile" };
       }
+      // Revoke outstanding one-run grants under the same store-wide writer
+      // lock. A switch away and back must not revive unconsumed requests.
+      const held = heldLocks.get(token)!;
+      if (JSON.stringify(current) !== JSON.stringify(next) &&
+          held.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'version_run_grants'").get()) {
+        held.db.prepare("UPDATE version_run_grants SET status = 'cancelled' WHERE status = 'active'").run();
+        held.db.exec("COMMIT");
+        held.committed = true;
+      }
       return { ok: true, config: next };
     } finally {
       releaseLock(lockDir, token);
@@ -433,7 +442,7 @@ export function beginClear(root: string) {
  * legacy config.json.lock file/directory. NEVER auto-delete that path: an
  * old process could replace it between inspection and deletion.
  */
-const heldLocks = new Map<string, { db: DatabaseSync; lockPath: string }>();
+const heldLocks = new Map<string, { db: DatabaseSync; lockPath: string; committed?: boolean }>();
 
 export function legacyLockRecovery(lockPath: string): string {
   return `legacy control lock at ${lockPath}; stop all pre-upgrade pi processes, verify they have exited, then manually remove the legacy lock before retrying`;
@@ -489,7 +498,7 @@ export function releaseLock(lockPath: string, token: string): void {
   const held = heldLocks.get(token);
   if (!held || held.lockPath !== lockPath) return;
   heldLocks.delete(token);
-  try { held.db.exec("ROLLBACK"); }
+  try { if (!held.committed) held.db.exec("ROLLBACK"); }
   finally { held.db.close(); }
 }
 

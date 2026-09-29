@@ -41,6 +41,7 @@ export function extractionConfigEpoch(config: MemoryConfig): string {
 /** Enqueue once per immutable source revision, version and prompt hash. */
 export function enqueueExtraction(db: DatabaseSync, item: {
   sourceId: string; memoryVersion: MemoryVersion; promptHash: string; now: number; configEpoch?: string;
+  request?: { requestId: string; policyHash: string };
 }): void {
   db.exec("BEGIN IMMEDIATE");
   try {
@@ -64,6 +65,9 @@ export function enqueueExtraction(db: DatabaseSync, item: {
       ).run(randomUUID(), item.sourceId, item.memoryVersion,
         JSON.stringify(["extract", item.sourceId, item.memoryVersion, item.promptHash]),
         item.promptHash, item.configEpoch ?? "", item.now, item.now, item.now);
+      if (item.request) db.prepare(`UPDATE jobs SET request_id = ?, scheduling_policy_hash = ? WHERE source_id = ?
+        AND memory_version = ? AND prompt_hash = ? AND status IN ('queued', 'retry_wait', 'blocked', 'cancelled')`)
+        .run(item.request.requestId, item.request.policyHash, item.sourceId, item.memoryVersion, item.promptHash);
     }
     db.exec("COMMIT");
   } catch (err) {
@@ -104,6 +108,7 @@ export function recoverExpiredExtractions(db: DatabaseSync, now: number): void {
 export function claimDueExtractions(db: DatabaseSync, opts: {
   owner: string; now: number; limit: number; slots?: number; minIdleMs?: number; maxAgeMs?: number;
   versions?: readonly MemoryVersion[]; preferredVersion?: MemoryVersion;
+  request?: { requestId: string; policyHash: string };
 }): LeasedJob[] {
   if (opts.versions && (opts.versions.length < 1 || opts.versions.length > 2 ||
       opts.versions.some((version) => version !== "v1" && version !== "v2"))) {
@@ -139,6 +144,8 @@ export function claimDueExtractions(db: DatabaseSync, opts: {
     }[];
     const jobs: LeasedJob[] = [];
     for (const row of candidates) {
+      db.prepare("UPDATE jobs SET request_id = ?, scheduling_policy_hash = ? WHERE job_id = ?")
+        .run(opts.request?.requestId ?? null, opts.request?.policyHash ?? null, row.job_id);
       const expires = opts.now + LEASE_MS;
       db.prepare(
         `UPDATE jobs SET status = 'leased', owner = ?, fence = fence + 1,

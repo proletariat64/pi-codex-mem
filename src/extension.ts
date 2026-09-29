@@ -43,6 +43,7 @@ import { getPublishedGeneration } from "./store/consolidation.ts";
 import { Type } from "typebox";
 import { addNote, cleanupRevokedNotes, forgetNote, type NoteProvenance } from "./control/notes.ts";
 import { clearMemoryStore, DELETION_LIMITS, forgetEvidence, resumeClear } from "./control/forget.ts";
+import { createVersionRun, finishVersionRun, setDualWrite, setMemoryVersion, versionRunConfig, type VersionRunGrant, type VersionRunTarget } from "./control/switch.ts";
 
 const EXTENSION_VERSION = "0.1.0";
 
@@ -123,6 +124,13 @@ interface RuntimeState {
   captureError: string | null;
 }
 
+interface ExplicitMemoryRun {
+  extraction: ExtractionScheduler;
+  consolidation: ConsolidationScheduler | null;
+  grant: VersionRunGrant;
+  db: DatabaseSync;
+}
+
 export default function (pi: ExtensionAPI) {
   const state: RuntimeState = {
     compat: null,
@@ -136,6 +144,7 @@ export default function (pi: ExtensionAPI) {
   const activityOwner = randomUUID();
   let scheduler: ExtractionScheduler | null = null;
   let consolidator: ConsolidationScheduler | null = null;
+  let explicitRun: ExplicitMemoryRun | null = null;
   let runtimePort: ReturnType<typeof createRegistryModelPort> | null = null;
   let consolidationPort: ReturnType<typeof createConsolidationModelPort> | null = null;
   let readerPin: MemoryReadView | null = null;
@@ -309,7 +318,15 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
-  function triggerScheduler(): void { scheduler?.trigger(); consolidator?.trigger(); }
+  function triggerScheduler(): void { scheduler?.trigger(); consolidator?.trigger(); explicitRun?.extraction.trigger(); }
+
+  async function stopExplicitRun(): Promise<void> {
+    if (!explicitRun) return;
+    const run = explicitRun;
+    run.db.prepare("UPDATE version_run_grants SET status = 'cancelled' WHERE request_id = ? AND status = 'active'").run(run.grant.requestId);
+    await Promise.all([run.extraction.stop(), run.consolidation?.stop()]);
+    if (explicitRun === run) explicitRun = null;
+  }
 
   function armReaderRetention(): void {
     if (retentionTimer) clearTimeout(retentionTimer);
@@ -378,6 +395,7 @@ export default function (pi: ExtensionAPI) {
     foregroundIdle = false;
     scheduler?.foregroundStarted();
     consolidator?.foregroundStarted();
+    explicitRun?.extraction.foregroundStarted();
     if (heartbeat) clearInterval(heartbeat);
     heartbeat = null;
     try {
@@ -412,6 +430,7 @@ export default function (pi: ExtensionAPI) {
       if (state.db) clearProcessActivity(state.db, activityOwner);
       scheduler?.foregroundSettled();
       consolidator?.foregroundSettled();
+      explicitRun?.extraction.foregroundSettled();
     } catch (err) {
       state.captureError = `scheduler failed: ${(err as Error).message}`;
     }
@@ -447,6 +466,7 @@ export default function (pi: ExtensionAPI) {
     heartbeat = null;
     await scheduler?.stop();
     await consolidator?.stop();
+    await stopExplicitRun();
     scheduler = null;
     consolidator = null;
     runtimePort = null;
@@ -634,6 +654,7 @@ export default function (pi: ExtensionAPI) {
     heartbeat = null;
     await scheduler?.stop();
     await consolidator?.stop();
+    await stopExplicitRun();
     scheduler = null;
     consolidator = null;
     readerPin = null;
@@ -792,17 +813,25 @@ export default function (pi: ExtensionAPI) {
     const db = state.db ?? new DatabaseSync(storePath, { readOnly: true });
     try {
       const row = db.prepare(
-        `SELECT j.status, j.error_code, j.due_at FROM jobs j
+        `SELECT j.status, j.error_code, j.due_at, s.last_activity_at,
+         COALESCE((SELECT skip_idle FROM version_run_grants g WHERE g.request_id = j.request_id AND g.status = 'active'), 0) AS skip_idle,
+         (SELECT MAX(expires_at) FROM process_activity p WHERE p.session_key = r.session_key
+           AND p.activity_state = 'active' AND p.expires_at > ?) AS busy_until FROM jobs j
          JOIN source_revisions r ON r.source_id = j.source_id
+         JOIN sessions s ON s.session_key = r.session_key
          JOIN branch_heads h ON h.session_key = r.session_key AND h.branch_id = r.branch_id
          WHERE j.kind = 'extract' AND j.memory_version = ?
            AND h.state = 'active' AND h.latest_revision = r.source_id
          ORDER BY j.updated_at DESC LIMIT 1`,
-      ).get(version) as { status: string; error_code: string | null; due_at: number } | undefined;
+      ).get(Date.now(), version) as { status: string; error_code: string | null; due_at: number;
+        last_activity_at: number; busy_until: number | null; skip_idle: number } | undefined;
       if (!row) return `${version} extraction: not queued`;
       const outcome = row.status === "leased" ? "extracting" : row.status === "succeeded" ? "extracted" : row.status;
       const reason = row.error_code ? ` — ${row.error_code}` : "";
-      const due = row.status === "retry_wait" ? ` (next due ${new Date(row.due_at).toISOString()})` : "";
+      const idleUntil = row.last_activity_at + (row.skip_idle ? 0 : state.config?.status === "ok" ? state.config.config.schedule.minIdleMinutes : 360) * 60_000;
+      const nextDue = Math.max(row.due_at, idleUntil, row.busy_until ?? 0);
+      const pending = row.status === "queued" && idleUntil > Date.now() ? "pending idle window; " : "";
+      const due = ["queued", "retry_wait"].includes(row.status) ? ` (${pending}next due ${new Date(nextDue).toISOString()})` : "";
       return `${version} extraction: ${outcome}${reason}${due}`;
     } catch {
       return `${version} extraction: store unavailable`;
@@ -813,6 +842,7 @@ export default function (pi: ExtensionAPI) {
 
   function statusLines(): string[] {
     const root = resolveMemoryRoot();
+    state.config = loadConfig(root, { create: false });
     const lines = [`pi-memory ${EXTENSION_VERSION} (pi ${PI_VERSION})`, `memory root: ${root}`];
     const legacy = legacyLockPath(root);
     if (legacy) lines.push(`upgrade BLOCKED: ${legacyLockRecovery(legacy)}`);
@@ -828,6 +858,7 @@ export default function (pi: ExtensionAPI) {
       lines.push("state: DISABLED generation — config invalid (file preserved)", ...cfg.problems.map((p) => `  - ${p}`));
     } else {
       const c = cfg.config;
+      const readiness = (["v1", "v2"] as const).map(version => pipelineReadiness(root, version));
       lines.push(
         `mode: ${describeMode(mode, source)}`,
         `selected version: ${c.version}${c.dualWrite ? " + dual-write v1&v2" : ""}`,
@@ -844,10 +875,35 @@ export default function (pi: ExtensionAPI) {
             : "capture: pending settlement",
         extractionStatusLine(root, "v1"),
         extractionStatusLine(root, "v2"),
+        ...readiness,
+        `generation targets: ${targetVersions(c).join(", ")}`,
+        ...(c.dualWrite ? [`dual-write: ${readiness.every(line => line.endsWith(": published")) ? "published both" : "partial"}`] : []),
         ...(state.captureError ? [`capture error: ${state.captureError}`] : []),
       );
     }
     return lines;
+  }
+
+  function pipelineReadiness(root: string, version: MemoryVersion): string {
+    if (storeSchemaState(root) !== "current") return `${version} readiness: warming_up`;
+    let db: DatabaseSync | undefined;
+    try {
+      db = state.db ?? new DatabaseSync(join(root, "state.sqlite"), { readOnly: true });
+      const pipeline = db.prepare("SELECT read_blocked, block_reason FROM pipeline_state WHERE memory_version = ?").get(version);
+      if (pipeline?.read_blocked) return `${version} readiness: read invalidated (${pipeline.block_reason})`;
+      const config = state.config;
+      if (getPublishedGeneration(db, version, Date.now(), { maxUnusedDays: config?.status === "ok" ? config.config.schedule.maxUnusedDays : 30 })) {
+        return `${version} readiness: published`;
+      }
+      const writer = db.prepare("SELECT status, error_code FROM jobs WHERE kind = 'consolidate' AND memory_version = ? ORDER BY updated_at DESC LIMIT 1").get(version);
+      const extraction = db.prepare("SELECT status, error_code FROM jobs WHERE kind = 'extract' AND memory_version = ? ORDER BY updated_at DESC LIMIT 1").get(version);
+      const captured = db.prepare("SELECT 1 FROM source_revisions WHERE status = 'captured' LIMIT 1").get();
+      const progress = writer?.status === "leased" ? "; consolidating" : writer?.status === "blocked" ? `; blocked (${writer.error_code})`
+        : extraction?.status === "leased" ? "; extracting" : extraction?.status === "blocked" ? `; blocked (${extraction.error_code})`
+        : captured ? "; captured" : "";
+      return `${version} readiness: warming_up${progress}`;
+    } catch { return `${version} readiness: store unavailable`; }
+    finally { if (db && db !== state.db) db.close(); }
   }
 
   function selectedImportLeaf(file: string, header: SessionHeader): string | undefined {
@@ -869,7 +925,7 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  async function runNow(ctx: ExtensionCommandContext): Promise<void> {
+  async function runNow(ctx: ExtensionCommandContext, version?: VersionRunTarget, force = false): Promise<void> {
     const report = (text: string, level: "info" | "warning" = "info") => {
       if (ctx.hasUI) ctx.ui.notify(`pi-memory run: ${text}`, level);
     };
@@ -884,15 +940,58 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     if (!ctx.isIdle() || !foregroundIdle) { report("foreground session is busy", "warning"); return; }
+    if (explicitRun) { report("another explicit pass is running", "warning"); return; }
     if (!cfg.config.models.extract) {
       report("blocked: no extraction model configured", "warning"); return;
     }
+    let manual: ExplicitMemoryRun | null = null;
+    let completed = false;
     try {
       state.db ??= openStateDb(root);
       ensureScheduler(ctx);
       if (!scheduler) { report("scheduler unavailable", "warning"); return; }
-      const results = await scheduler.runPass(true);
-      const consolidated = await consolidator?.runPass(true) ?? [];
+      let extraction = scheduler; let consolidation = consolidator;
+      if (version || !force) {
+        const db = state.db;
+        const request = createVersionRun(db, cfg.config, version ?? (cfg.config.dualWrite ? "both" : cfg.config.version), Date.now(), force);
+        const config = () => versionRunConfig(db, request, eligibleExtractionConfig(root));
+        scheduler.foregroundStarted(); consolidator?.foregroundStarted();
+        extraction = new ExtractionScheduler({ db, root, config, modelPort: () => runtimePort,
+          now: Date.now, isForegroundIdle: () => foregroundIdle, request,
+          onError: (err) => { state.captureError = `scheduler failed: ${(err as Error).message}`; },
+          onPassComplete: async results => {
+            completed = true;
+            try {
+              const consolidated = await consolidation?.runPass(true) ?? [];
+              reportRunResults(results, consolidated);
+            } finally {
+              await Promise.all([extraction.stop(), consolidation?.stop()]);
+              if (state.db === db) finishVersionRun(db, request, eligibleExtractionConfig(root));
+              if (explicitRun?.grant.requestId === request.requestId) explicitRun = null;
+              triggerScheduler();
+            }
+          } });
+        consolidation = consolidationPort ? new ConsolidationScheduler({ db, root, config,
+          modelPort: () => consolidationPort, now: Date.now, isForegroundIdle: () => foregroundIdle, request,
+          pinnedGenerationIds: () => readerPin ? [readerPin.generationId] : [],
+          onError: (err) => { state.captureError = `consolidation failed: ${(err as Error).message}`; } }) : null;
+        manual = { extraction, consolidation, grant: request, db }; explicitRun = manual;
+      }
+      const results = await extraction.runPass(force);
+      if (manual) {
+        if (!completed) report(`queued bounded pass for ${manual.grant.version}; waiting for source idle, due time or lease`);
+        return;
+      }
+      const consolidated = await consolidation?.runPass(true) ?? [];
+      reportRunResults(results, consolidated);
+    } catch (err) {
+      if (manual) await stopExplicitRun();
+      notePrivacyCleanupFailure(err, root);
+      report(`failed: ${(err as Error).message}`, "warning");
+    }
+
+    function reportRunResults(results: Awaited<ReturnType<ExtractionScheduler["runPass"]>>,
+      consolidated: Awaited<ReturnType<ConsolidationScheduler["runPass"]>>) {
       let message = "no eligible settled sources";
       if (results.length) {
         message = results.map((result) => result.status === "budget_deferred"
@@ -903,9 +1002,6 @@ export default function (pi: ExtensionAPI) {
       if (consolidated.length) message += `; consolidation: ${consolidated.map((result) =>
         result.reason ? `${result.status} (${result.reason})` : result.status).join(", ")}`;
       report(message, message.startsWith("scheduler failed:") ? "warning" : "info");
-    } catch (err) {
-      notePrivacyCleanupFailure(err, root);
-      report(`failed: ${(err as Error).message}`, "warning");
     }
   }
 
@@ -913,6 +1009,24 @@ export default function (pi: ExtensionAPI) {
     description: "Pi Memory — persistent cross-session memory (status, doctor, import, run, remember, correct, forget, clear)",
     handler: async (args, ctx) => {
       const sub = args.trim().split(/\s+/).filter(Boolean)[0] ?? "status";
+      if (sub === "version" || sub === "dual-write") {
+        const root = resolveMemoryRoot();
+        const match = sub === "version" ? /^version\s+(v1|v2)$/.exec(args.trim()) : /^dual-write\s+(on|off)$/.exec(args.trim());
+        if (!match) { if (ctx.hasUI) ctx.ui.notify(`usage: /memory ${sub} ${sub === "version" ? "v1|v2" : "on|off"}`, "warning"); return; }
+        if (!state.compat?.supported || rootPointsIntoForeignMemory(root) || legacyLockPath(root)) {
+          if (ctx.hasUI) ctx.ui.notify("pi-memory: configuration update unavailable", "warning"); return;
+        }
+        const saved = sub === "version" ? setMemoryVersion(root, match[1] as MemoryVersion) : setDualWrite(root, match[1] === "on");
+        if (saved.ok) {
+          state.config = { status: "ok", config: saved.config, path: join(root, "config.json") };
+          ensureScheduler(ctx); triggerScheduler();
+        }
+        if (ctx.hasUI) ctx.ui.notify(saved.ok ? `pi-memory: ${sub} ${match[1]} saved; ${sub === "version"
+          ? `${pipelineReadiness(root, saved.config.version)}; reading changes at the next foreground run`
+          : `generation targets: ${targetVersions(saved.config).join(", ")}`}`
+          : `pi-memory: ${saved.reason}`, saved.ok ? "info" : "warning");
+        return;
+      }
       if (sub === "remember" || sub === "correct") {
         const text = args.trim().slice(sub.length).trim();
         try {
@@ -954,6 +1068,7 @@ export default function (pi: ExtensionAPI) {
           if (retentionTimer) clearTimeout(retentionTimer); retentionTimer = null;
           cancelPrivacyCleanup();
           await scheduler?.stop(); await consolidator?.stop(); scheduler = null; consolidator = null;
+          await stopExplicitRun();
           const db = state.db ?? openStateDb(root); state.db = null;
           const result = clearMemoryStore({ root, db, confirmed: true });
           state.config = loadConfig(root, { create: false }); state.capture = null;
@@ -963,8 +1078,15 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       if (sub === "run") {
-        if (args.trim() === "run --now") await runNow(ctx);
-        else if (ctx.hasUI) ctx.ui.notify("usage: /memory run --now", "warning");
+        const parts = args.trim().split(/\s+/).slice(1);
+        let force = false; let version: VersionRunTarget | undefined; let valid = true;
+        for (let index = 0; index < parts.length; index++) {
+          if (parts[index] === "--now" && !force) force = true;
+          else if (parts[index] === "--version" && !version && ["v1", "v2", "both"].includes(parts[index + 1] ?? "")) version = parts[++index] as VersionRunTarget;
+          else { valid = false; break; }
+        }
+        if (valid) await runNow(ctx, version, force);
+        else if (ctx.hasUI) ctx.ui.notify("usage: /memory run [--version v1|v2|both] [--now]", "warning");
         return;
       }
       if (!ctx.hasUI) return; // No status text on protocol stdout (spec §6.3).

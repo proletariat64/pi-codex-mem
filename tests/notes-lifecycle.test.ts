@@ -144,3 +144,36 @@ test("forget retries revoked generation cleanup after a transient storage error 
     await command("status"); assert.doesNotMatch(notifications.at(-1)!, /cleanup deferred|Cleanup pending/);
   } finally { fs.rmSync = originalRemove; syncBuiltinESMExports(); }
 });
+
+test("version switching preserves the foreground pin, leaves an unbuilt target warming up and reuses the valid original version", async (t) => {
+  const { root, command, mock, ctx, notifications } = await fixture(t);
+  const db = openStateDb(root); const config = defaultConfig("UTC");
+  const scheduler = new ConsolidationScheduler({ root, db, config: () => config, modelPort: () => null,
+    now: Date.now, isForegroundIdle: () => true });
+  await scheduler.runPass(); await scheduler.stop(); db.close();
+  writeFileSync(join(root, "config.json"), JSON.stringify({ ...config, generate: false }));
+  await mock.fire("session_start", {}, ctx);
+  const start = async () => {
+    const sections: Record<string, string> = {};
+    await mock.fire("before_agent_start", { prompt: "Remember: answer in Chinese", systemPromptOptions: { sections } }, ctx);
+    return sections;
+  };
+  const list = async () => JSON.parse(JSON.stringify(await mock.tools.get("pi_memory_list")!.execute("list", {}, undefined, undefined, ctx as never)));
+  assert.ok((await start()).pi_memory);
+  await command("version v2");
+  assert.match(notifications.at(-1) ?? "", /v2 readiness: warming_up/);
+  assert.equal(JSON.parse(readFileSync(join(root, "config.json"), "utf8")).version, "v2");
+  assert.equal((await list()).details.memoryVersion, "v1");
+  await mock.fire("agent_settled", {}, ctx);
+  assert.equal((await start()).pi_memory, undefined);
+  assert.equal((await list()).details.error, "memory_unavailable");
+  await command("dual-write on"); await command("status");
+  assert.match(notifications.at(-1)!, /v2 readiness: warming_up/);
+  assert.match(notifications.at(-1)!, /dual-write: partial/);
+  await command("version v1");
+  assert.match(notifications.at(-1) ?? "", /v1 readiness: published/);
+  assert.equal((await list()).details.error, "memory_unavailable", "an unbuilt pin never falls back mid-run");
+  await mock.fire("agent_settled", {}, ctx);
+  assert.ok((await start()).pi_memory);
+  assert.equal((await list()).details.memoryVersion, "v1");
+});

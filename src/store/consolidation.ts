@@ -26,6 +26,7 @@ export function claimConsolidation(db: DatabaseSync, opts: {
   memoryVersion: MemoryVersion; owner: string; now: number; promptHash: string; configEpoch?: string;
   inputRevisionHash?: string; retryBlocked?: boolean;
   modelRequired?: boolean;
+  request?: { requestId: string; policyHash: string };
 }): ConsolidationLease | null {
   db.exec("BEGIN IMMEDIATE");
   try {
@@ -68,6 +69,8 @@ export function claimConsolidation(db: DatabaseSync, opts: {
       .get(workKey, opts.now) as { jobId: string; fence: number } | undefined;
     if (!row) { db.exec("COMMIT"); return null; }
     const leaseExpiresAt = opts.now + LEASE_MS;
+    db.prepare("UPDATE jobs SET request_id = ?, scheduling_policy_hash = ? WHERE job_id = ?")
+      .run(opts.request?.requestId ?? null, opts.request?.policyHash ?? null, row.jobId);
     db.prepare(`UPDATE jobs SET status = 'leased', owner = ?, fence = fence + 1,
       attempt_count = attempt_count + 1, lease_expires_at = ?, updated_at = ? WHERE job_id = ?`)
       .run(opts.owner, leaseExpiresAt, opts.now, row.jobId);

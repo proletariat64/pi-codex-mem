@@ -24,6 +24,7 @@ export interface ConsolidationSchedulerOptions {
   timer?: SchedulerTimer;
   onError?: (error: unknown) => void;
   pinnedGenerationIds?: () => readonly string[];
+  request?: { requestId: string; policyHash: string };
 }
 
 export interface ConsolidationPassResult { status: string; reason?: string }
@@ -89,6 +90,7 @@ export class ConsolidationScheduler {
   }
 
   trigger(): void {
+    if (this.options.request) return; // Explicit version grants never arm an automatic continuation.
     this.timer?.cancel();
     this.timer = null;
     if (this.stopped || this.running || !this.options.isForegroundIdle()) return;
@@ -180,7 +182,7 @@ export class ConsolidationScheduler {
     const promptHash = consolidationPromptHash(config, version);
     const lease = claimConsolidation(db, { memoryVersion: version, owner: randomUUID(), now: clock(), promptHash,
       configEpoch: consolidationConfigEpoch(config, version), inputRevisionHash: this.inputRevision(config, version), retryBlocked,
-      modelRequired: snapshot.sources.length > 0 || snapshot.notes.length > 0 });
+      modelRequired: snapshot.sources.length > 0 || snapshot.notes.length > 0, request: this.options.request });
     if (!lease) {
       // A contended input has not been checked; keep its global-lease expiry wake.
       if (!db.prepare("SELECT 1 FROM jobs WHERE kind = 'consolidate' AND status = 'leased' AND lease_expires_at > ?").get(clock())) {

@@ -11,6 +11,7 @@ import { writeSnapshotFile } from "../src/store/snapshot-files.ts";
 import { claimDueExtractions, recordProcessActivity, recoverExpiredExtractions } from "../src/store/jobs.ts";
 import { ExtractionScheduler, type SchedulerTimer } from "../src/extraction/scheduler.ts";
 import { runV1Extraction, type MemoryModelPort } from "../src/extraction/runner.ts";
+import { createVersionRun, finishVersionRun, versionRunConfig } from "../src/control/switch.ts";
 
 const NOW = Date.UTC(2024, 0, 2, 12);
 const sourceId = "scheduler-source";
@@ -74,6 +75,42 @@ test("startup schedules one due-time wakeup after source idle interval, then ext
   fx.scheduler.trigger();
   assert.equal(fx.calls.length, 1);
   assert.equal(fx.scheduled.filter((item) => !item.cancelled).length, 0);
+});
+
+test("an explicit version grant waits until idle, executes one bounded pass and never arms another provider pass", async (t) => {
+  const fx = setup(t); let now = NOW; let completed = 0;
+  const grant = createVersionRun(fx.db, fx.config, "v2", now);
+  fx.port.request = async (_model, context) => { fx.calls.push(context); return { stopReason: "stop",
+    text: '{"rollout_summary":"v2 evidence","rollout_slug":"history"}' }; };
+  const queued = new ExtractionScheduler({ db: fx.db, root: fx.root,
+    config: () => versionRunConfig(fx.db, grant, fx.config), request: grant,
+    now: () => now, modelPort: () => fx.port, isForegroundIdle: () => true,
+    timer: { schedule(run, delay) { fx.scheduled.push({ run, delay, cancelled: false }); return { cancel() {} }; } },
+    onPassComplete: results => { assert.equal(results.length, 1); completed++; finishVersionRun(fx.db, grant, fx.config); } });
+  t.after(() => queued.stop());
+  assert.deepEqual(await queued.runPass(), []); assert.equal(fx.calls.length, 0);
+  assert.equal(fx.scheduled.at(-1)!.delay, 40_000);
+  assert.equal(fx.db.prepare("SELECT status FROM version_run_grants").get()!.status, "active");
+  now += 40_000; await fx.scheduled.at(-1)!.run();
+  assert.equal(fx.calls.length, 1); assert.equal(completed, 1);
+  assert.equal(fx.db.prepare("SELECT status FROM version_run_grants").get()!.status, "completed");
+  assert.deepEqual(await queued.runPass(true), []); assert.equal(fx.calls.length, 1);
+});
+
+test("a policy change in another process releases a cancelled queued run at its idle wakeup", async (t) => {
+  const fx = setup(t); let completed = 0;
+  const grant = createVersionRun(fx.db, fx.config, "v2", NOW);
+  const queued = new ExtractionScheduler({ db: fx.db, root: fx.root, request: grant,
+    config: () => versionRunConfig(fx.db, grant, fx.config), now: () => NOW,
+    modelPort: () => fx.port, isForegroundIdle: () => true,
+    timer: { schedule(run, delay) { fx.scheduled.push({ run, delay, cancelled: false }); return { cancel() {} }; } },
+    onPassComplete: results => { assert.deepEqual(results, []); completed++; } });
+  t.after(() => queued.stop());
+  await queued.runPass(); assert.equal(completed, 0);
+  fx.config.generate = false;
+  await fx.scheduled.at(-1)!.run();
+  assert.equal(completed, 1); assert.equal(fx.calls.length, 0);
+  assert.equal(fx.db.prepare("SELECT status FROM version_run_grants").get()!.status, "cancelled");
 });
 
 test("no-output watermark prevents repeated model calls at startup", async (t) => {

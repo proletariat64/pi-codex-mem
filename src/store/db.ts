@@ -36,7 +36,7 @@ export interface SnapshotRecord {
   evidenceRemoved?: boolean;
 }
 
-const SCHEMA_VERSION = 11;
+const SCHEMA_VERSION = 12;
 
 const MIGRATION_1 = `
 CREATE TABLE schema_migrations (
@@ -379,6 +379,17 @@ export function openStateDb(root: string, options?: { busyTimeoutMs?: number }):
           kind TEXT NOT NULL CHECK (kind IN ('lineage', 'session')), identity TEXT NOT NULL,
           created_at INTEGER NOT NULL, PRIMARY KEY (kind, identity))`);
         db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(11, Date.now());
+      }
+      if (current < 12) {
+        const columns = new Set((db.prepare("PRAGMA table_info(jobs)").all() as { name: string }[]).map(column => column.name));
+        for (const column of ["request_id", "scheduling_policy_hash"]) {
+          if (!columns.has(column)) db.exec(`ALTER TABLE jobs ADD COLUMN ${column} TEXT`);
+        }
+        db.exec(`CREATE TABLE IF NOT EXISTS version_run_grants (request_id TEXT PRIMARY KEY,
+          memory_version TEXT NOT NULL CHECK (memory_version IN ('v1', 'v2', 'both')), policy_hash TEXT NOT NULL,
+          skip_idle INTEGER NOT NULL DEFAULT 0 CHECK (skip_idle IN (0, 1)),
+          status TEXT NOT NULL CHECK (status IN ('active', 'completed', 'cancelled')), created_at INTEGER NOT NULL)`);
+        db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(12, Date.now());
       }
       db.exec("COMMIT");
     } catch (err) {

@@ -803,7 +803,12 @@ export default function (pi: ExtensionAPI) {
         sectionMap.pi_memory = section;
       }
       armReaderRetention();
-    } catch { /* Memory failure must not stop the user's foreground task. */ }
+    } catch (readError) {
+      // Fail open, but keep the failure visible to /memory doctor instead of
+      // a fully silent injection loss (observed as a transient sqlite race
+      // during the #16 smoke tests).
+      state.readDiagnostic = `memory injection skipped: ${(readError as Error).message}`;
+    }
     finally { readerDb?.close(); }
   });
 

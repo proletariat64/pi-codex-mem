@@ -137,6 +137,18 @@ test("writer reserves each accumulated context, defers before an over-budget req
   assert.equal(budget.call_count, 1);
 });
 
+test("writer charges cached inputs to the shared daily token ledger exactly once", async (t) => {
+  const setup = fixture(t);
+  const message = reply([{ type: "text", text: "Done." }], "stop", 100, 20);
+  message.usage.cacheRead = 8_000;
+  message.usage.cacheWrite = 1_900;
+  message.usage.cacheWrite1h = 200;
+  message.usage.totalTokens = 10_020;
+  const { port } = fakePort([message]);
+  assert.deepEqual(await run(setup, port), { status: "succeeded" });
+  assert.equal(setup.db.prepare("SELECT actual_input FROM budget_usage").get()!.actual_input, 10_000);
+});
+
 test("writer stops before the thirteenth model call and forty-first workspace operation", async (t) => {
   for (const kind of ["calls", "tools"] as const) {
     const setup = fixture(t);

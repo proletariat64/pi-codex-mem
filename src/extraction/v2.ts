@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { redactSensitive } from "../sensitive.ts";
-import { v1EvidenceLine, type V1RequestInput } from "./v1.ts";
+import { renderTemplate } from "../template.ts";
+import { extractionPromptHash, v1EvidenceLine, type V1RequestInput } from "./v1.ts";
 
 export interface V2Output {
   rollout_summary: string;
@@ -91,7 +92,7 @@ function promptFiles(): { system: string; template: string } {
 
 export function v2PromptHash(): string {
   const { system, template } = promptFiles();
-  return digest(system + "\n" + template);
+  return extractionPromptHash(system, template, "v2");
 }
 
 /** Render normalized snapshot evidence into the immutable v2 prompt family. */
@@ -105,10 +106,9 @@ export function renderV2Request(input: V2RequestInput): {
     ...input.items.map(v1EvidenceLine),
     input.omittedForContext ? `[${input.omittedForContext} evidence items omitted for model context budget]` : "",
   ].filter(Boolean).join("\n");
-  const userPrompt = template
-    .replace("{{ rollout_path }}", JSON.stringify(input.snapshotPath))
-    .replace("{{ rollout_cwd }}", JSON.stringify(input.cwd))
-    .replace("{{ rollout_git_branch }}", JSON.stringify(input.gitBranch ?? "unknown"))
-    .replace("{{ rollout_contents }}", contents);
-  return { systemPrompt: system, userPrompt, promptHash: digest(system + "\n" + template) };
+  const userPrompt = renderTemplate(template, {
+    rollout_path: JSON.stringify(input.snapshotPath), rollout_cwd: JSON.stringify(input.cwd),
+    rollout_git_branch: JSON.stringify(input.gitBranch ?? "unknown"), rollout_contents: contents,
+  });
+  return { systemPrompt: system, userPrompt, promptHash: extractionPromptHash(system, template, "v2") };
 }

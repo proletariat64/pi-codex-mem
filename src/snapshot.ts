@@ -64,6 +64,31 @@ export interface Omission {
   reason: string;
 }
 
+/** Apply the same dependency-aware evidence ordering at capture and model-fit time.
+ * A short user choice cannot be selected unless its adjacent question fits too. */
+export function selectEvidenceWithinBudget<Item extends { role: string; text: string }>(
+  items: readonly Item[], limit: number, bytesOf: (item: Item) => number,
+): Set<Item> {
+  const tiers: Record<string, number> = { user: 0, assistant: 1, tool: 2 };
+  const order = items.map((item, index) => ({ item, index }))
+    .sort((a, b) => (tiers[a.item.role] ?? 3) - (tiers[b.item.role] ?? 3) || b.index - a.index);
+  const selected = new Set<Item>();
+  let used = 0;
+  for (const { item, index } of order) {
+    if (selected.has(item)) continue;
+    const previous = items[index - 1];
+    const dependsOnQuestion = item.role === "user" && Buffer.byteLength(item.text, "utf8") <= 128 &&
+      previous && (previous.role === "assistant" || previous.role === "user") && /[?？]/u.test(previous.text);
+    const group = dependsOnQuestion && previous && !selected.has(previous) ? [previous, item] : [item];
+    const bytes = group.reduce((sum, candidate) => sum + bytesOf(candidate), 0);
+    if (used + bytes <= limit) {
+      for (const candidate of group) selected.add(candidate);
+      used += bytes;
+    }
+  }
+  return selected;
+}
+
 export interface NormalizeResult {
   items: EvidenceItem[];
   omissions: Omission[];
@@ -220,29 +245,8 @@ export function normalizeEvidence(
 
   // §7.3 total budget: tiered selection user → assistant → tool, newest wins
   // within a tier, selected items rendered chronologically.
-  const tiers: Record<string, number> = { user: 0, assistant: 1, tool: 2 };
-  const byTier: EvidenceItem[][] = [[], [], []];
-  for (const item of candidates) byTier[tiers[item.role]!]!.push(item);
-
-  const selected = new Set<EvidenceItem>();
-  let used = 0;
-  for (const tier of byTier) {
-    for (const item of [...tier].reverse()) {
-      if (selected.has(item)) continue;
-      const index = candidates.indexOf(item);
-      const previous = candidates[index - 1];
-      const dependsOnQuestion = item.role === "user" && Buffer.byteLength(item.text, "utf8") <= 128 &&
-        previous && (previous.role === "assistant" || previous.role === "user") && /[?？]/u.test(previous.text);
-      // A short reply without its adjacent question would invent certainty
-      // about what was chosen. Select the pair or omit the reply (§7.3).
-      const group = dependsOnQuestion && !selected.has(previous) ? [previous, item] : [item];
-      const bytes = group.reduce((sum, candidate) => sum + Buffer.byteLength(candidate.text, "utf8"), 0);
-      if (used + bytes <= limits.totalBytes) {
-        for (const candidate of group) selected.add(candidate);
-        used += bytes;
-      }
-    }
-  }
+  const selected = selectEvidenceWithinBudget(candidates, limits.totalBytes,
+    item => Buffer.byteLength(item.text, "utf8"));
   const items = candidates.filter((i) => {
     if (selected.has(i)) return true;
     omissions.push({ entryId: i.sourceId, reason: "budget-exceeded" });

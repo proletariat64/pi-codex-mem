@@ -76,6 +76,33 @@ test("T37 cross: dirty selection and retention remain versioned while correction
   for (const version of ["v1", "v2"] as const) assert.equal(getPublishedGeneration(db, version, NOW + 6), null);
 });
 
+test("policy-aware consolidation and reader cannot reuse another extraction hash on upgrade or rollback", (t) => {
+  const { root, db, source } = fixture(t);
+  source("policy-source", 1, "v1");
+  const legacy = "prompt-v1";
+  const current = "renderer-upgrade";
+  assert.deepEqual(selectConsolidation(db, { memoryVersion: "v1", now: NOW + 2,
+    extractionPromptHash: current }).sources, [], "old extraction cannot feed a new-policy writer");
+  enqueueExtraction(db, { sourceId: "policy-source", memoryVersion: "v1", promptHash: current, now: NOW + 4 });
+  const [job] = claimDueExtractions(db, { owner: "upgrade", now: NOW + 4, limit: 1 }); assert.ok(job);
+  assert.equal(commitExtraction(db, job, { memoryVersion: "v1", promptHash: current,
+    model: { provider: "fixture", modelId: "extract" }, rawMemory: "new memory", rolloutSummary: "new summary",
+    rolloutSlug: "new", outputHash: "new-output", usage: { input: 1, output: 1 }, outcome: "succeeded" }, NOW + 5), true);
+  const newSnapshot = selectConsolidation(db, { memoryVersion: "v1", now: NOW + 6, extractionPromptHash: current });
+  assert.equal(newSnapshot.sources.length, 1);
+  const lease = claimConsolidation(db, { memoryVersion: "v1", owner: "writer", promptHash: "writer", now: NOW + 6 });
+  assert.ok(lease);
+  assert.equal(commitGeneration(db, { lease, snapshot: newSnapshot, generation: { generationId: "new-policy",
+    memoryVersion: "v1", directory: join(root, "new-policy"), inputHash: newSnapshot.selectionHash,
+    manifestHash: "manifest" }, now: NOW + 7 }), true);
+  assert.equal(getPublishedGeneration(db, "v1", NOW + 8, { extractionPromptHash: legacy }), null,
+    "rollback must not serve a generation built from newer-policy evidence");
+  assert.equal(getPublishedGeneration(db, "v1", NOW + 8, { extractionPromptHash: current })?.generationId, "new-policy");
+  const oldSnapshot = selectConsolidation(db, { memoryVersion: "v1", now: NOW + 8, extractionPromptHash: legacy });
+  assert.deepEqual(oldSnapshot.sources.map(item => item.outputHash), ["hash-policy-source-v1"],
+    "rollback must select the matching old extraction, not the newest different policy");
+});
+
 test("publication compares selection, version, epoch and lease in one transaction", (t) => {
   const { db, root, source } = fixture(t);
   source("first");

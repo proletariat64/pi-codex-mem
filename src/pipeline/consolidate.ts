@@ -6,6 +6,7 @@ import { createAssistantMessageEventStream, type Api, type AssistantMessage, typ
 import type { MemoryConfig, MemoryVersion, ModelRef } from "../config.ts";
 import { truncateUtf8 } from "../snapshot.ts";
 import { redactSensitive } from "../sensitive.ts";
+import { normalizeModelUsage } from "../model-usage.ts";
 import { reconcileModelCall, reserveModelCall } from "../store/jobs.ts";
 import { renewConsolidationLease, type ConsolidationLease } from "../store/consolidation.ts";
 import { createWorkspaceTools } from "./workspace-tools.ts";
@@ -78,10 +79,8 @@ function providerFailure(message: string | undefined): ConsolidationRunResult {
 }
 
 function usableUsage(message: AssistantMessage): { input: number; output: number } | undefined {
-  const usage = message.usage;
-  return usage && Number.isSafeInteger(usage.input) && usage.input >= 0 &&
-    Number.isSafeInteger(usage.output) && usage.output >= 0 && (usage.input > 0 || usage.output > 0)
-    ? { input: usage.input, output: usage.output } : undefined;
+  const usage = normalizeModelUsage(message.usage);
+  return usage && (usage.input > 0 || usage.output > 0) ? usage : undefined;
 }
 
 function failureMessage(model: Model<Api>, clock: () => number, aborted: boolean, reason: string): AssistantMessage {

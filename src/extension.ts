@@ -362,7 +362,8 @@ export default function (pi: ExtensionAPI) {
       if (readerPin !== pin) return;
       try {
         const live = state.db ? getPublishedGeneration(state.db, pin.memoryVersion, Date.now(),
-          { generationId: pin.generationId, maxUnusedDays: state.config?.status === "ok" ? state.config.config.schedule.maxUnusedDays : 30 }) : null;
+          { generationId: pin.generationId, maxUnusedDays: state.config?.status === "ok" ? state.config.config.schedule.maxUnusedDays : 30,
+            extractionPromptHash: pin.extractionPromptHash }) : null;
         if (live && live.controlEpoch === pin.controlEpoch && live.manifestHash === pin.manifestHash) {
           pin.retentionDeadline = live.retentionDeadline;
           armReaderRetention();
@@ -785,7 +786,8 @@ export default function (pi: ExtensionAPI) {
       }
       readerPin = acquireReadView({ db: state.db ?? readerDb!, root,
         memoryVersion: latest.config.version, summaryBytes: latest.config.limits.summaryBytes,
-        maxUnusedDays: latest.config.schedule.maxUnusedDays });
+        maxUnusedDays: latest.config.schedule.maxUnusedDays,
+        extractionPromptHash: latest.config.version === "v1" ? v1PromptHash() : v2PromptHash() });
       if (!readerPin) return;
       sectionMap.pi_memory = renderMemorySection(readerPin, ctx.cwd);
       armReaderRetention();
@@ -946,7 +948,8 @@ export default function (pi: ExtensionAPI) {
       const pipeline = db.prepare("SELECT read_blocked, block_reason FROM pipeline_state WHERE memory_version = ?").get(version);
       if (pipeline?.read_blocked) return `${version} readiness: read invalidated (${pipeline.block_reason})`;
       const config = state.config;
-      if (getPublishedGeneration(db, version, Date.now(), { maxUnusedDays: config?.status === "ok" ? config.config.schedule.maxUnusedDays : 30 })) {
+      if (getPublishedGeneration(db, version, Date.now(), { maxUnusedDays: config?.status === "ok" ? config.config.schedule.maxUnusedDays : 30,
+        extractionPromptHash: version === "v1" ? v1PromptHash() : v2PromptHash() })) {
         return `${version} readiness: published`;
       }
       const writer = db.prepare("SELECT status, error_code FROM jobs WHERE kind = 'consolidate' AND memory_version = ? ORDER BY updated_at DESC LIMIT 1").get(version);

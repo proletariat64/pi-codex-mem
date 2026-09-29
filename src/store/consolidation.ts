@@ -15,6 +15,8 @@ export interface ConsolidationSnapshot {
   memoryVersion: MemoryVersion; baseGenerationId: string | null; controlEpoch: number;
   sources: SelectedExtraction[]; notes: ActiveNote[]; selectionHash: string;
   retentionDeadline: number | null; maxSources: number; maxUnusedDays: number;
+  /** Expected Phase 1 policy; the writer must not mix evidence from another renderer. */
+  extractionPromptHash?: string;
 }
 export interface ConsolidationLease {
   jobId: string; memoryVersion: MemoryVersion; owner: string; fence: number;
@@ -105,6 +107,7 @@ export function finishConsolidation(db: DatabaseSync, lease: ConsolidationLease,
 /** Snapshot content and provenance in one SQLite view. */
 export function selectConsolidation(db: DatabaseSync, opts: {
   memoryVersion: MemoryVersion; now: number; maxSources?: number; maxUnusedDays?: number;
+  extractionPromptHash?: string;
 }, transactionOwned = false): ConsolidationSnapshot {
   if (transactionOwned) return selectSnapshot(db, opts);
   db.exec("BEGIN");
@@ -116,6 +119,7 @@ export function selectConsolidation(db: DatabaseSync, opts: {
 
 function selectSnapshot(db: DatabaseSync, opts: {
   memoryVersion: MemoryVersion; now: number; maxSources?: number; maxUnusedDays?: number;
+  extractionPromptHash?: string;
 }): ConsolidationSnapshot {
   const maxSources = opts.maxSources ?? 256;
   const maxUnusedDays = opts.maxUnusedDays ?? 30;
@@ -123,6 +127,7 @@ function selectSnapshot(db: DatabaseSync, opts: {
       !Number.isSafeInteger(maxUnusedDays) || maxUnusedDays < 1 || maxUnusedDays > 3650) {
     throw new Error("invalid consolidation selection limits");
   }
+  // SAFETY: this fixed SELECT aliases every SelectedExtraction field; SQLite returns those columns for each row.
   const sources = db.prepare(`SELECT * FROM (
     SELECT e.extraction_id AS extractionId, r.source_id AS sourceId, r.lineage_key AS lineageKey,
       r.session_key AS sessionKey, s.workspace_key AS workspaceKey, w.cwd,
@@ -135,12 +140,14 @@ function selectSnapshot(db: DatabaseSync, opts: {
     JOIN branch_heads h ON h.session_key = r.session_key AND h.branch_id = r.branch_id
     JOIN sessions s ON s.session_key = r.session_key JOIN workspaces w ON w.workspace_key = s.workspace_key
     LEFT JOIN source_stats st ON st.memory_version = e.memory_version AND st.lineage_key = r.lineage_key
-    WHERE e.memory_version = ? AND r.status = 'captured'
+    WHERE e.memory_version = ? AND (? IS NULL OR e.prompt_hash = ?) AND r.status = 'captured'
       AND h.state = 'active' AND h.latest_revision = r.source_id
   ) WHERE rank = 1 AND outcome = 'succeeded' AND eligibilityTime >= ?
     ORDER BY usageCount DESC, eligibilityTime DESC, sourceId LIMIT ?`)
-    .all(opts.memoryVersion, opts.now - maxUnusedDays * DAY_MS, maxSources) as unknown as
+    .all(opts.memoryVersion, opts.extractionPromptHash ?? null, opts.extractionPromptHash ?? null,
+      opts.now - maxUnusedDays * DAY_MS, maxSources) as unknown as
     (SelectedExtraction & { usageCount: number; eligibilityTime: number; rank: number; outcome: string })[];
+  // SAFETY: the notes schema and these explicit aliases match ActiveNote's scalar fields.
   const notes = db.prepare(`SELECT note_id AS noteId, text_path AS textPath, text_hash AS textHash, scope, action, created_at AS createdAt
     FROM notes WHERE status = 'active' ORDER BY note_id`).all() as unknown as ActiveNote[];
   const state = db.prepare(`SELECT p.active_generation_id AS baseGenerationId, s.control_epoch AS controlEpoch
@@ -149,12 +156,12 @@ function selectSnapshot(db: DatabaseSync, opts: {
   const retentionDeadline = sources.length ? Math.min(...sources.map(s => s.eligibilityTime + maxUnusedDays * DAY_MS + 1)) : null;
   const selected = sources.map(({ usageCount: _usage, eligibilityTime: _time, rank: _rank, outcome: _outcome, ...source }) => source);
   const selectionHash = createHash("sha256").update(JSON.stringify({ memoryVersion: opts.memoryVersion,
-    maxUnusedDays,
+    maxUnusedDays, extractionPromptHash: opts.extractionPromptHash ?? null,
     sources: [...selected].sort((a, b) => a.sourceId.localeCompare(b.sourceId)).map(s =>
       [s.sourceId, s.extractionId, s.outputHash, s.lineageKey, s.sessionKey, s.workspaceKey, s.cwd, s.sourceUpdatedAt]),
     notes: notes.map(n => [n.noteId, n.textHash, n.scope, n.textPath, n.action, n.createdAt]) })).digest("hex");
   return { ...state, memoryVersion: opts.memoryVersion, sources: selected, notes,
-    selectionHash, retentionDeadline, maxSources, maxUnusedDays };
+    selectionHash, retentionDeadline, maxSources, maxUnusedDays, extractionPromptHash: opts.extractionPromptHash };
 }
 
 export interface GenerationCommit {
@@ -174,7 +181,8 @@ export function commitGeneration(db: DatabaseSync, opts: {
       AND memory_version = ? AND prompt_hash = ? AND status = 'leased' AND owner = ? AND fence = ?
       AND lease_expires_at > ?`).get(lease.jobId, lease.memoryVersion, lease.promptHash, lease.owner, lease.fence, now);
     const current = selectConsolidation(db, { memoryVersion: snapshot.memoryVersion, now,
-      maxSources: snapshot.maxSources, maxUnusedDays: snapshot.maxUnusedDays }, true);
+      maxSources: snapshot.maxSources, maxUnusedDays: snapshot.maxUnusedDays,
+      extractionPromptHash: snapshot.extractionPromptHash }, true);
     if (!owned || current.controlEpoch !== snapshot.controlEpoch ||
         current.baseGenerationId !== snapshot.baseGenerationId || current.selectionHash !== snapshot.selectionHash) {
       db.exec("COMMIT"); return false;
@@ -213,7 +221,9 @@ export interface PublishedGeneration {
 
 /** Read only the DB-selected version, rechecking revoked and expired supporting evidence. */
 export function getPublishedGeneration(db: DatabaseSync, memoryVersion: MemoryVersion,
-  now = Date.now(), options?: { maxUnusedDays?: number; generationId?: string }): PublishedGeneration | null {
+  now = Date.now(), options?: { maxUnusedDays?: number; generationId?: string;
+    extractionPromptHash?: string }): PublishedGeneration | null {
+  // SAFETY: generation/pipeline schema and the fixed aliases below match PublishedGeneration plus maxUnusedDays.
   const generation = db.prepare(`SELECT g.generation_id AS generationId, g.memory_version AS memoryVersion,
     g.directory, g.directory AS path, g.input_hash AS inputHash, g.manifest_hash AS manifestHash,
     g.selection_hash AS selectionHash, g.control_epoch AS controlEpoch, g.prompt_hash AS promptHash,
@@ -229,10 +239,13 @@ export function getPublishedGeneration(db: DatabaseSync, memoryVersion: MemoryVe
   const unavailable = db.prepare(`SELECT 1 FROM generation_sources gs
     JOIN source_revisions r ON r.source_id = gs.source_id
     JOIN branch_heads h ON h.session_key = r.session_key AND h.branch_id = r.branch_id
+    LEFT JOIN extractions e ON e.extraction_id = gs.extraction_id
     LEFT JOIN source_stats st ON st.lineage_key = r.lineage_key AND st.memory_version = ?
     WHERE gs.generation_id = ? AND (r.status != 'captured' OR h.state != 'active'
-      OR h.latest_revision != r.source_id OR COALESCE(st.last_used_at, r.source_time) < ?)
-    LIMIT 1`).get(memoryVersion, generation.generationId, now - retentionDays * DAY_MS);
+      OR h.latest_revision != r.source_id OR COALESCE(st.last_used_at, r.source_time) < ?
+      OR (? IS NOT NULL AND (e.extraction_id IS NULL OR e.prompt_hash != ?)))
+    LIMIT 1`).get(memoryVersion, generation.generationId, now - retentionDays * DAY_MS,
+      options?.extractionPromptHash ?? null, options?.extractionPromptHash ?? null);
   if (unavailable) return null;
   const deadline = db.prepare(`SELECT MIN(COALESCE(st.last_used_at, r.source_time) + ?) AS deadline
     FROM generation_sources gs JOIN source_revisions r ON r.source_id = gs.source_id

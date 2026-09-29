@@ -16,6 +16,7 @@ export interface MemoryReadView {
   summary: string;
   applicability: string[];
   retentionDeadline: number | null;
+  extractionPromptHash?: string;
 }
 
 const hash = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
@@ -23,11 +24,12 @@ const hash = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex")
 /** Fail open using only the DB-selected generation; never discover staging or orphans. */
 export function acquireReadView(input: {
   db: DatabaseSync; root: string; memoryVersion: MemoryVersion; now?: number; summaryBytes?: number; maxUnusedDays?: number;
+  extractionPromptHash?: string;
 }): MemoryReadView | null {
   const started = performance.now();
   try {
     const generation = getPublishedGeneration(input.db, input.memoryVersion, input.now ?? Date.now(),
-      { maxUnusedDays: input.maxUnusedDays });
+      { maxUnusedDays: input.maxUnusedDays, extractionPromptHash: input.extractionPromptHash });
     if (!generation) return null;
     const expected = resolve(input.root, "versions", input.memoryVersion, "generations", generation.generationId);
     if (resolve(generation.directory) !== expected) return null;
@@ -65,10 +67,10 @@ export function acquireReadView(input: {
     if (performance.now() - started > 200) return null;
     // Epoch/retention can change while reading files; do not serve a stale cache.
     const latest = getPublishedGeneration(input.db, input.memoryVersion, input.now ?? Date.now(),
-      { maxUnusedDays: input.maxUnusedDays });
+      { maxUnusedDays: input.maxUnusedDays, extractionPromptHash: input.extractionPromptHash });
     if (latest?.generationId !== generation.generationId || latest.controlEpoch !== generation.controlEpoch) return null;
     return { memoryVersion: input.memoryVersion, generationId: generation.generationId, directory: expected,
       controlEpoch: generation.controlEpoch, manifestHash: generation.manifestHash, summary, retentionDeadline: generation.retentionDeadline,
-      applicability: [...new Set((manifest.sources ?? []).flatMap((source) => typeof source.cwd === "string" ? [source.cwd] : []))] };
+      extractionPromptHash: input.extractionPromptHash, applicability: [...new Set((manifest.sources ?? []).flatMap((source) => typeof source.cwd === "string" ? [source.cwd] : []))] };
   } catch { return null; }
 }

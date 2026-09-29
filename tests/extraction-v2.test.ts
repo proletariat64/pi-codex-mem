@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { parseV2Output, renderV2Request } from "../src/extraction/v2.ts";
+import { parseV2Output, renderV2Request, v2PromptHash } from "../src/extraction/v2.ts";
 
 test("v2 uses its pinned prompt and accepts exactly summary plus slug", () => {
   const system = readFileSync(join("prompts", "upstream", "v2", "stage_one_system_v2.md"), "utf8");
@@ -11,7 +11,9 @@ test("v2 uses its pinned prompt and accepts exactly summary plus slug", () => {
   const request = renderV2Request({ snapshotPath: "/memory/sources/lineage/revision.json", cwd: "/repo",
     gitBranch: "feature/v2", items: [{ entryId: "u1", role: "user", origin: "human", text: "选择 TypeScript" }] });
   assert.equal(request.systemPrompt, system);
-  assert.equal(request.promptHash, createHash("sha256").update(system + "\n" + template).digest("hex"));
+  assert.equal(request.promptHash, v2PromptHash());
+  assert.notEqual(request.promptHash, createHash("sha256").update(system + "\n" + template).digest("hex"),
+    "a renderer fix must queue new work instead of reusing a terminal legacy extraction");
   assert.match(request.userPrompt, /选择 TypeScript/);
   assert.match(request.userPrompt, /feature\/v2/);
   assert.doesNotMatch(request.userPrompt, /\{\{\s*rollout_/);

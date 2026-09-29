@@ -5,6 +5,8 @@ import type { DatabaseSync } from "node:sqlite";
 import type { MemoryConfig, MemoryVersion } from "../config.ts";
 import type { SchedulerTimer } from "../extraction/scheduler.ts";
 import { targetVersions } from "../extraction/scheduler.ts";
+import { v1PromptHash } from "../extraction/v1.ts";
+import { v2PromptHash } from "../extraction/v2.ts";
 import { nextLocalDayTime } from "../store/jobs.ts";
 import { claimConsolidation, finishConsolidation, getPublishedGeneration, selectConsolidation } from "../store/consolidation.ts";
 import { consolidationPromptHash, runConsolidation } from "./consolidate.ts";
@@ -65,14 +67,16 @@ export class ConsolidationScheduler {
 
   private snapshot(config: MemoryConfig, version: MemoryVersion) {
     return selectConsolidation(this.options.db, { memoryVersion: version, now: this.options.now(),
-      maxSources: Math.min(256, config.schedule.maxConsolidationSources), maxUnusedDays: config.schedule.maxUnusedDays });
+      maxSources: Math.min(256, config.schedule.maxConsolidationSources), maxUnusedDays: config.schedule.maxUnusedDays,
+      extractionPromptHash: version === "v1" ? v1PromptHash() : v2PromptHash() });
   }
 
   private key(config: MemoryConfig, version: MemoryVersion): string {
     const snapshot = this.snapshot(config, version);
     let outputHashes: Record<string, string> | string = "unavailable";
     const generation = getPublishedGeneration(this.options.db, version, this.options.now(),
-      { maxUnusedDays: config.schedule.maxUnusedDays });
+      { maxUnusedDays: config.schedule.maxUnusedDays,
+        extractionPromptHash: version === "v1" ? v1PromptHash() : v2PromptHash() });
     if (generation) {
       try {
         outputHashes = Object.fromEntries(workspaceInventory(generation.directory).filter(path => generatedOutput(path, version))
@@ -198,7 +202,8 @@ export class ConsolidationScheduler {
         "SELECT directory, manifest_hash FROM generations WHERE generation_id = ? AND memory_version = ? AND status = 'published'",
       ).get(snapshot.baseGenerationId, version) as { directory: string; manifest_hash: string } | undefined : undefined;
       let priorDir: string | undefined;
-      if (prior) {
+      if (prior && getPublishedGeneration(db, version, clock(), { generationId: snapshot.baseGenerationId ?? undefined,
+        maxUnusedDays: config.schedule.maxUnusedDays, extractionPromptHash: snapshot.extractionPromptHash })) {
         try {
           const text = readWorkspaceUtf8(prior.directory, "manifest.json");
           if (createHash("sha256").update(text).digest("hex") === prior.manifest_hash) priorDir = prior.directory;

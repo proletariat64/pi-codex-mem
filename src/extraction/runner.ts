@@ -4,7 +4,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { dirname, join, resolve, sep } from "node:path";
 import type { Context } from "@earendil-works/pi-ai";
 import type { ModelRef } from "../config.ts";
-import { truncateUtf8 } from "../snapshot.ts";
+import { selectEvidenceWithinBudget, truncateUtf8 } from "../snapshot.ts";
 import {
   commitExtraction, deferExtractionForBudget, failExtraction, nextLocalDayTime,
   pauseExtraction, reconcileModelCall, renewExtractionLease, reserveModelCall, reserveRepairAttempt,
@@ -129,17 +129,11 @@ function fitContext(source: V2RequestInput, model: ResolvedMemoryModel,
   const base = render({ ...source, items: [] });
   const baseBytes = Buffer.byteLength(base.systemPrompt + base.userPrompt, "utf8");
   if (baseBytes + 80 > maxBytes) return null;
-  let remaining = maxBytes - baseBytes - 80; // reserve for the explicit omissions marker
-  const tiers: Record<string, number> = { user: 0, assistant: 1, tool: 2 };
-  const order = source.items.map((item, index) => ({ item, index }))
-    .sort((a, b) => (tiers[a.item.role] ?? 3) - (tiers[b.item.role] ?? 3) || b.index - a.index);
-  const selected = new Set<number>();
-  for (const { item, index } of order) {
-    const bytes = Buffer.byteLength(v1EvidenceLine(item), "utf8") + 1;
-    if (bytes <= remaining) { selected.add(index); remaining -= bytes; }
-  }
+  const remaining = maxBytes - baseBytes - 80; // reserve for the explicit omissions marker
+  const selected = selectEvidenceWithinBudget(source.items, remaining,
+    item => Buffer.byteLength(v1EvidenceLine(item), "utf8") + 1);
   const request = render({ ...source,
-    items: source.items.filter((_item, index) => selected.has(index)),
+    items: source.items.filter(item => selected.has(item)),
     omittedForContext: source.items.length - selected.size });
   return Buffer.byteLength(request.systemPrompt + request.userPrompt, "utf8") <= maxBytes ? request : null;
 }

@@ -113,6 +113,12 @@ test(`${memoryVersion} extraction publishes through the confined Agent and the n
   assert.match(JSON.stringify(await read()), /TypeScript/);
   const usage = new DatabaseSync(join(agentDir, "memory", "state.sqlite"));
   assert.equal(usage.prepare("SELECT COUNT(*) AS n FROM memory_usage").get()!.n, 1, "detail use is deduplicated within one foreground run");
+  usage.exec("UPDATE source_stats SET last_used_at = NULL");
+  usage.prepare("UPDATE source_revisions SET source_time = ?").run(Date.now() - 30 * 86_400_000 + 150);
+  await mock.fire("before_agent_start", event, ctx);
+  assert.match(JSON.stringify(await read()), /TypeScript/, "detail use extends retention");
+  await new Promise(resolve => setTimeout(resolve, 200));
+  assert.match(JSON.stringify(await read()), /TypeScript/, "old retention timer must respect successful detail use");
   usage.close();
   const configurationPath = join(agentDir, "memory", "config.json");
   const configuration = JSON.parse(readFileSync(configurationPath, "utf8"));

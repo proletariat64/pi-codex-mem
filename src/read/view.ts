@@ -12,6 +12,7 @@ export interface MemoryReadView {
   generationId: string;
   directory: string;
   controlEpoch: number;
+  manifestHash: string;
   summary: string;
   applicability: string[];
   retentionDeadline: number | null;
@@ -67,7 +68,7 @@ export function acquireReadView(input: {
       { maxUnusedDays: input.maxUnusedDays });
     if (latest?.generationId !== generation.generationId || latest.controlEpoch !== generation.controlEpoch) return null;
     return { memoryVersion: input.memoryVersion, generationId: generation.generationId, directory: expected,
-      controlEpoch: generation.controlEpoch, summary, retentionDeadline: generation.retentionDeadline,
+      controlEpoch: generation.controlEpoch, manifestHash: generation.manifestHash, summary, retentionDeadline: generation.retentionDeadline,
       applicability: [...new Set((manifest.sources ?? []).flatMap((source) => typeof source.cwd === "string" ? [source.cwd] : []))] };
   } catch { return null; }
 }

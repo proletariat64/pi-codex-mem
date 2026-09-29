@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openStateDb, recordSnapshot } from "../src/store/db.ts";
@@ -26,7 +26,7 @@ function fixture(t: test.TestContext) {
       snapshotPath: join(root, "snapshot.json"), snapshotHash: "snapshot", sourceTime: NOW - 86_400_000 },
     capturedAt: NOW,
   });
-  function publish(version: "v1" | "v2", id = `generation-${version}`, text = "中文决策\nTypeScript chosen\n中文理由\n") {
+  function publish(version: "v1" | "v2", id = `generation-${version}`, text = "中文决策\nTypeScript chosen\n中文理由\n", handbook?: string) {
     enqueueExtraction(db, { sourceId: "source", memoryVersion: version, promptHash: "extract", now: NOW });
     const [job] = claimDueExtractions(db, { owner: "extractor", now: NOW, limit: 1 });
     if (job) assert.equal(commitExtraction(db, job, { memoryVersion: version, promptHash: "extract",
@@ -42,7 +42,7 @@ function fixture(t: test.TestContext) {
     const files: Record<string, string> = { "memory_summary.md": MINIMAL_V1_SUMMARY, [path]: text,
       "notes/private.md": "private note", "raw_memories.md": "private raw", "phase2_workspace_diff.md": "private diff" };
     if (version === "v1") {
-      files["MEMORY.md"] = `# Decision\n中文决策 ${path}\n`;
+      files["MEMORY.md"] = handbook ?? `# Decision\n中文决策 ${path}\n`;
       files["skills/types/SKILL.md"] = `# Procedure\nSee ${path}\n`;
     }
     for (const [name, content] of Object.entries(files)) {
@@ -157,4 +157,35 @@ test("responses stay within 16 KiB including details and expose continuation and
     found += output.details.items.length; cursor = output.details.cursor;
   } while (cursor);
   assert.equal(found, 201);
+});
+
+test("a pinned manifest hash cannot be replaced even when the database hash changes", async (t) => {
+  const { db, publish } = fixture(t); const { call, directory, path } = publish("v1");
+  const manifestPath = join(directory, "manifest.json");
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  writeFileSync(join(directory, path), "replaced pinned content");
+  manifest.fileHashes[path] = textHash("replaced pinned content");
+  const bytes = JSON.stringify(manifest); writeFileSync(manifestPath, bytes);
+  db.prepare("UPDATE generations SET manifest_hash = ? WHERE generation_id = 'generation-v1'").run(textHash(bytes));
+  assert.equal((await call("read", { path })).details.error, "memory_unavailable");
+});
+
+test("JSON escape expansion still yields truncated evidence instead of losing the response", async (t) => {
+  const { publish } = fixture(t); const { call, path } = publish("v1", "escaped", `中文${"\u0000".repeat(6_000)}\n中文next`);
+  for (const name of ["read", "search"]) {
+    const output = await call(name, { path, queries: ["中文"], match: "any" });
+    assert.equal(output.details.error, undefined); assert.ok(output.details.items.length);
+    assert.equal(output.details.truncated, true); assert.ok(Buffer.byteLength(JSON.stringify(output)) <= 16_384);
+  }
+});
+
+test("a handbook lesson read counts its task-local sources even when references are outside the requested page", async (t) => {
+  const { db, publish } = fixture(t);
+  const handbook = `# Task Group: Types\nscope: project\napplies_to: repo\n## Task 1: Choice\n### rollout_summary_files\n- ${evidencePath("source", "decision")}\n### learnings\n- 中文决策\n## Task 2: Explicit note\n### rollout_summary_files\n- notes/private.md\n### learnings\n- Note-only lesson\n`;
+  const { call } = publish("v1", "task-attribution", "中文决策", handbook);
+  const detail = await call("read", { path: "MEMORY.md", startLine: 8, maxLines: 1 });
+  assert.deepEqual(detail.details.items[0]!.sourceIds, ["source"]);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM memory_usage").get()!.n, 1);
+  const noteOnly = await call("read", { path: "MEMORY.md", startLine: 13, maxLines: 1 });
+  assert.deepEqual(noteOnly.details.items[0]!.sourceIds, [], "an unrelated task's sources must not be refreshed");
 });

@@ -38,6 +38,7 @@ import { acquireReadView, type MemoryReadView } from "./read/view.ts";
 import { renderMemorySection } from "./read/inject.ts";
 import { cleanupGenerations } from "./pipeline/publish.ts";
 import { createMemoryTools, type MemoryConsumer } from "./read/tools.ts";
+import { getPublishedGeneration } from "./store/consolidation.ts";
 
 const EXTENSION_VERSION = "0.1.0";
 
@@ -215,6 +216,29 @@ export default function (pi: ExtensionAPI) {
   }
 
   function triggerScheduler(): void { scheduler?.trigger(); consolidator?.trigger(); }
+
+  function armReaderRetention(): void {
+    if (retentionTimer) clearTimeout(retentionTimer);
+    retentionTimer = null;
+    const pin = readerPin;
+    if (!pin || pin.retentionDeadline === null) return;
+    retentionTimer = setTimeout(() => {
+      retentionTimer = null;
+      if (readerPin !== pin) return;
+      try {
+        const live = state.db ? getPublishedGeneration(state.db, pin.memoryVersion, Date.now(),
+          { generationId: pin.generationId, maxUnusedDays: state.config?.status === "ok" ? state.config.config.schedule.maxUnusedDays : 30 }) : null;
+        if (live && live.controlEpoch === pin.controlEpoch && live.manifestHash === pin.manifestHash) {
+          pin.retentionDeadline = live.retentionDeadline;
+          armReaderRetention();
+          return;
+        }
+      } catch { /* An unavailable store cannot keep a cached view readable. */ }
+      readerPin = null;
+      consolidator?.trigger();
+    }, Math.max(0, Math.min(2_147_483_647, pin.retentionDeadline - Date.now())));
+    retentionTimer.unref();
+  }
 
   /** One-shot, bounded-backoff retry when another SQLite reader holds WAL frames. */
   function schedulePrivacyCleanup(root: string): void {
@@ -584,14 +608,7 @@ export default function (pi: ExtensionAPI) {
         maxUnusedDays: latest.config.schedule.maxUnusedDays });
       if (!readerPin) return;
       sectionMap.pi_memory = renderMemorySection(readerPin, ctx.cwd);
-      if (readerPin.retentionDeadline !== null) {
-        retentionTimer = setTimeout(() => {
-          readerPin = null;
-          retentionTimer = null;
-          consolidator?.trigger();
-        }, Math.max(0, Math.min(2_147_483_647, readerPin.retentionDeadline - Date.now())));
-        retentionTimer.unref();
-      }
+      armReaderRetention();
     } catch { /* Memory failure must not stop the user's foreground task. */ }
     finally { readerDb?.close(); }
   });

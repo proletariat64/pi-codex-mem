@@ -189,3 +189,52 @@ test("a handbook lesson read counts its task-local sources even when references 
   const noteOnly = await call("read", { path: "MEMORY.md", startLine: 13, maxLines: 1 });
   assert.deepEqual(noteOnly.details.items[0]!.sourceIds, [], "an unrelated task's sources must not be refreshed");
 });
+
+test("a 128-source task keeps metadata bounded and records complete validated detail support", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "pi-many-sources-")); const db = openStateDb(root);
+  t.after(() => { db.close(); rmSync(root, { recursive: true, force: true }); });
+  const ids = Array.from({ length: 128 }, (_, index) => index.toString(16).padStart(64, "0"));
+  for (const sourceId of ids) {
+    recordSnapshot(db, {
+      workspace: { workspaceKey: "workspace", repoKey: null, checkoutKey: null, cwdReal: root,
+        gitCommonDir: null, gitTopLevel: null, gitBranch: null, gitHead: null },
+      session: { sessionKey: sourceId, path: join(root, `${sourceId}.jsonl`), headerId: sourceId,
+        parentKey: null, branchId: "branch", mode: "tui" },
+      revision: { sourceId, lineageKey: sourceId, revisionHash: "revision", leafId: "u1",
+        snapshotPath: join(root, `${sourceId}.json`), snapshotHash: "snapshot", sourceTime: NOW }, capturedAt: NOW,
+    });
+    enqueueExtraction(db, { sourceId, memoryVersion: "v1", promptHash: "extract", now: NOW });
+    const [job] = claimDueExtractions(db, { owner: "extractor", now: NOW, limit: 1 }); assert.ok(job);
+    assert.equal(commitExtraction(db, job, { memoryVersion: "v1", promptHash: "extract",
+      model: { provider: "fixture", modelId: "extract" }, rawMemory: "text", rolloutSummary: "text",
+      rolloutSlug: "decision", outputHash: textHash("text"), outcome: "succeeded", usage: { input: 1, output: 1 } }, NOW + 1), true);
+  }
+  const snapshot = selectConsolidation(db, { memoryVersion: "v1", now: NOW + 2 });
+  const lease = claimConsolidation(db, { memoryVersion: "v1", owner: "writer", promptHash: "writer", now: NOW + 2 }); assert.ok(lease);
+  const directory = join(root, "versions/v1/generations/many");
+  const sourcePaths = ids.map(id => evidencePath(id, "decision"));
+  const handbook = `# Task Group: Types\nscope: project\napplies_to: repo\n## Task 1: Choice\n### rollout_summary_files\n${sourcePaths.map(path => `- ${path}`).join("\n")}\n### keywords\n- TypeScript\n### learnings\n- TypeScript chosen\n`;
+  const files = { "memory_summary.md": MINIMAL_V1_SUMMARY, "MEMORY.md": handbook,
+    ...Object.fromEntries(sourcePaths.map(path => [path, "text"])) };
+  for (const [name, text] of Object.entries(files)) {
+    const target = join(directory, name); mkdirSync(join(target, ".."), { recursive: true }); writeFileSync(target, text);
+  }
+  const manifest = JSON.stringify({ memoryVersion: "v1", controlEpoch: snapshot.controlEpoch,
+    sources: ids.map((sourceId, index) => ({ sourceId, path: sourcePaths[index] })),
+    fileHashes: Object.fromEntries(Object.entries(files).map(([path, text]) => [path, textHash(text)])) });
+  writeFileSync(join(directory, "manifest.json"), manifest);
+  assert.equal(commitGeneration(db, { lease, snapshot, generation: { memoryVersion: "v1", generationId: "many",
+    directory, inputHash: "many", manifestHash: textHash(manifest) }, now: NOW + 3 }), true);
+  const view = acquireReadView({ db, root, memoryVersion: "v1", now: NOW + 4 }); assert.ok(view);
+  const tools = createMemoryTools({ root, db: () => db, view: () => view,
+    consumer: () => ({ consumerSession: "reader", runId: "run" }), now: () => NOW + 5 });
+  for (const name of ["read", "list", "search"]) {
+    const output = await tools.find(tool => tool.name === `pi_memory_${name}`)!.execute("call",
+      { path: "MEMORY.md", startLine: 4, maxLines: 1, queries: ["Task Group"], match: "any" }, undefined);
+    assert.equal(output.details.error, undefined); assert.equal(output.details.truncated, true);
+    assert.equal(output.details.items[0]!.omittedSourceIds, 116);
+    assert.deepEqual(output.details.items[0]!.sourceIds, ids.slice(0, 12));
+    assert.ok(Buffer.byteLength(JSON.stringify(output)) <= 16_384);
+  }
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM memory_usage").get()!.n, 128);
+});

@@ -10,6 +10,7 @@ import { getPublishedGeneration, recordSourceUsage } from "../store/consolidatio
 
 export interface MemoryItem {
   path: string; startLine: number; endLine: number; sourceIds: string[]; content?: string; truncated?: boolean;
+  sourceIdsTruncated?: boolean; omittedSourceIds?: number;
 }
 export interface MemoryToolDetails {
   memoryVersion?: string; generationId?: string; items: MemoryItem[];
@@ -49,6 +50,10 @@ function result(details: MemoryToolDetails) {
 
 /** All data access stays within a host-selected immutable pin, revalidated at each boundary. */
 export function createMemoryTools(input: MemoryToolsInput): AgentTool<TSchema, MemoryToolDetails>[] {
+  const detailSources = new WeakMap<MemoryToolDetails, string[]>();
+  const sourceMetadata = (sourceIds: string[]) => sourceIds.length <= 12 ? { sourceIds } : {
+    sourceIds: sourceIds.slice(0, 12), sourceIdsTruncated: true, omittedSourceIds: sourceIds.length - 12,
+  };
   const tool = (name: string, description: string, parameters: TSchema,
     operation: (args: Record<string, unknown>, view: MemoryReadView, manifest: StagingManifest, db: DatabaseSync, now: number) => MemoryToolDetails): AgentTool<TSchema, MemoryToolDetails> => ({
     name, label: name, description, parameters,
@@ -80,7 +85,7 @@ export function createMemoryTools(input: MemoryToolsInput): AgentTool<TSchema, M
         if (Buffer.byteLength(JSON.stringify(output)) > CAP) throw new Error("response_too_large");
         if (name === "pi_memory_read" && details.items.length) {
           const consumer = input.consumer();
-          if (consumer) for (const sourceId of new Set(details.items.flatMap(item => item.sourceIds))) {
+          if (consumer) for (const sourceId of detailSources.get(details) ?? []) {
             recordSourceUsage(db, { memoryVersion: view.memoryVersion, sourceId, ...consumer, now });
           }
           valid();
@@ -142,7 +147,7 @@ export function createMemoryTools(input: MemoryToolsInput): AgentTool<TSchema, M
       } catch { throw new Error("invalid_cursor"); }
     }
     const output: MemoryToolDetails = { memoryVersion: view.memoryVersion, generationId: view.generationId, items: [], truncated: false, cursor: null };
-    const update = () => { output.truncated = offset < items.length || output.items.some(item => item.truncated);
+    const update = () => { output.truncated = offset < items.length || output.items.some(item => item.truncated || item.sourceIdsTruncated);
       output.cursor = offset < items.length ? Buffer.from(JSON.stringify({ memoryVersion: view.memoryVersion, generationId: view.generationId, queryHash, offset })).toString("base64url") : null; };
     update();
     while (offset < items.length && output.items.length < limit) {
@@ -171,7 +176,7 @@ export function createMemoryTools(input: MemoryToolsInput): AgentTool<TSchema, M
       if (args.match === "all" ? matches.every(Boolean) : matches.some(Boolean)) {
         const content = clip(line);
         items.push({ path, startLine: index + 1, endLine: index + 1, content,
-          sourceIds: attribution[index]!, ...(content !== line ? { truncated: true } : {}) });
+          ...sourceMetadata(attribution[index]!), ...(content !== line ? { truncated: true } : {}) });
       }
       });
     }
@@ -182,7 +187,7 @@ export function createMemoryTools(input: MemoryToolsInput): AgentTool<TSchema, M
   }, { additionalProperties: false }), (args, view, manifest) => {
     const items = paths(args, view, manifest).map(path => {
       const text = read(view, manifest, path);
-      return { path, startLine: 1, endLine: text.split("\n").length, sourceIds: sources(manifest, path, text) };
+      return { path, startLine: 1, endLine: text.split("\n").length, ...sourceMetadata(sources(manifest, path, text)) };
     });
     return page(args, view, JSON.stringify(["list", args.path ?? "."]), items, boundedInteger(args.limit, 50, 100));
   }),
@@ -201,13 +206,14 @@ export function createMemoryTools(input: MemoryToolsInput): AgentTool<TSchema, M
     while (end < lines.length && details.items.length < limit) {
       const line = lines[end]!; const content = clip(line);
       details.items.push({ path: args.path, startLine: end + 1, endLine: end + 1, content,
-        sourceIds: attribution[end]!, ...(content !== line ? { truncated: true } : {}) });
+        ...sourceMetadata(attribution[end]!), ...(content !== line ? { truncated: true } : {}) });
       end++;
       if (Buffer.byteLength(JSON.stringify(result(details))) > CAP - 128) { details.items.pop(); end--; break; }
     }
     if (!details.items.length && end < lines.length) throw new Error("response_too_large");
-    details.truncated = end < lines.length || details.items.some(item => item.truncated);
+    details.truncated = end < lines.length || details.items.some(item => item.truncated || item.sourceIdsTruncated);
     details.nextStartLine = end < lines.length ? end + 1 : null;
+    detailSources.set(details, [...new Set(attribution.slice(start - 1, end).flat())]);
     return details;
   })];
 }

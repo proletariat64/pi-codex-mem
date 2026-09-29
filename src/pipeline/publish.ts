@@ -64,14 +64,14 @@ export function publishGeneration(opts: {
     const entries = (hashes: Record<string, string>) => Object.entries(hashes).sort(([a], [b]) => a.localeCompare(b));
     const sources = [...opts.snapshot.sources].sort((a, b) => a.sourceId < b.sourceId ? -1 : a.sourceId > b.sourceId ? 1 : 0).map(source => [source.sourceId, source.extractionId,
       evidencePath(source.sourceId, source.rolloutSlug), source.outputHash, source.cwd, source.workspaceKey]);
-    const notes = [...opts.snapshot.notes].sort((a, b) => a.noteId < b.noteId ? -1 : a.noteId > b.noteId ? 1 : 0).map(note => [note.noteId, notePath(note.noteId), note.textHash, note.scope]);
+    const notes = [...opts.snapshot.notes].sort((a, b) => a.noteId < b.noteId ? -1 : a.noteId > b.noteId ? 1 : 0).map(note => [note.noteId, notePath(note.noteId), note.textHash, note.scope, note.action ?? "remember", note.createdAt ?? 0]);
     if (manifest.schemaVersion !== 1 || manifest.memoryVersion !== "v2" ||
         manifest.selectionHash !== opts.snapshot.selectionHash || manifest.controlEpoch !== opts.snapshot.controlEpoch ||
         manifest.promptHash !== opts.lease.promptHash || manifest.inputHash !== opts.inputHash ||
         !manifest.fileHashes || JSON.stringify(entries(manifest.fileHashes)) !== JSON.stringify(entries(validated.fileHashes)) ||
         !Array.isArray(manifest.sources) || JSON.stringify(manifest.sources.map(source =>
           [source.sourceId, source.extractionId, source.path, source.outputHash, source.cwd, source.workspaceKey])) !== JSON.stringify(sources) ||
-        !Array.isArray(manifest.notes) || JSON.stringify(manifest.notes.map(note => [note.noteId, note.path, note.textHash, note.scope])) !== JSON.stringify(notes)) {
+        !Array.isArray(manifest.notes) || JSON.stringify(manifest.notes.map(note => [note.noteId, note.path, note.textHash, note.scope, note.action, note.createdAt])) !== JSON.stringify(notes)) {
       throw new Error("v2 publication manifest does not match validated selection");
     }
   }

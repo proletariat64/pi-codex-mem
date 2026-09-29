@@ -102,7 +102,7 @@ test("schema 8 upgrades preserve existing extraction data and privacy revocation
   db.exec(`DROP TRIGGER generation_source_version; DROP TRIGGER generation_source_version_update;
     DROP TRIGGER pipeline_generation_version; DROP TABLE note_applications; DROP TABLE generation_sources;
     DROP TABLE generations; DROP TABLE memory_usage; DROP TABLE source_stats; DROP TABLE notes;
-    ALTER TABLE pipeline_state DROP COLUMN active_generation_id; DELETE FROM schema_migrations WHERE version = 9;`);
+    ALTER TABLE pipeline_state DROP COLUMN active_generation_id; DELETE FROM schema_migrations WHERE version >= 9;`);
   db.close();
   const upgraded = openStateDb(root);
   t.after(() => upgraded.close());

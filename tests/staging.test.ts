@@ -23,7 +23,7 @@ test("writer can read deterministic note IDs and scope in the host manifest befo
       textHash: createHash("sha256").update(text).digest("hex"), scope: "/repo-a" }] };
     const stage = buildStaging({ root, jobId: "note-scope", snapshot, promptHash: "prompt" });
     const manifest = JSON.parse(readWorkspaceUtf8(stage.directory, "manifest.json"));
-    assert.deepEqual(manifest.notes, [{ noteId: "local-note", path: "notes/local-note.md", textHash: snapshot.notes[0]!.textHash, scope: "/repo-a" }]);
+    assert.deepEqual(manifest.notes, [{ noteId: "local-note", path: "notes/local-note.md", textHash: snapshot.notes[0]!.textHash, scope: "/repo-a", action: "remember", createdAt: 0 }]);
     const tools = createWorkspaceTools(stage.directory);
     const read = await tools.find((tool) => tool.name === "workspace_read")!.execute("read", { path: "manifest.json" });
     assert.match(JSON.stringify(read), /\/repo-a/);

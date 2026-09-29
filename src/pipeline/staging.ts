@@ -21,7 +21,7 @@ export interface StagingManifest {
   contentKey: string;
   retentionDeadline: number | null;
   sources: { sourceId: string; extractionId: string; path: string; outputHash: string; cwd: string; workspaceKey: string }[];
-  notes: { noteId: string; path: string; textHash: string; scope: string }[];
+  notes: { noteId: string; path: string; textHash: string; scope: string; action?: string; createdAt?: number }[];
   fileHashes: Record<string, string>;
   diffFallbackReason?: "privacy_or_retention" | "size";
 }
@@ -130,7 +130,8 @@ export function buildStaging(options: { root: string; jobId: string; snapshot: C
     const path = notePath(note.noteId);
     if (files.has(path)) throw new Error("duplicate note path");
     files.set(path, text);
-    return { noteId: note.noteId, path, textHash: note.textHash, scope: note.scope };
+    return { noteId: note.noteId, path, textHash: note.textHash, scope: note.scope,
+      action: note.action ?? "remember", createdAt: note.createdAt ?? 0 };
   });
   const contentKey = textHash(JSON.stringify({ memoryVersion, selectionHash: snapshot.selectionHash, sourceHashes: sourceManifest, notes: noteManifest, promptHash, controlEpoch: snapshot.controlEpoch, summaryBytes: options.summaryBytes ?? 9999 }));
   let priorDir = options.priorDir;

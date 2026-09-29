@@ -10,7 +10,7 @@ export interface SelectedExtraction {
   workspaceKey: string; cwd: string; sourceUpdatedAt: number; outputHash: string;
   rolloutSummary: string; rolloutSlug: string; rawMemory: string | null;
 }
-export interface ActiveNote { noteId: string; textPath: string; textHash: string; scope: string }
+export interface ActiveNote { noteId: string; textPath: string; textHash: string; scope: string; action?: string; createdAt?: number }
 export interface ConsolidationSnapshot {
   memoryVersion: MemoryVersion; baseGenerationId: string | null; controlEpoch: number;
   sources: SelectedExtraction[]; notes: ActiveNote[]; selectionHash: string;
@@ -137,7 +137,7 @@ function selectSnapshot(db: DatabaseSync, opts: {
     ORDER BY usageCount DESC, eligibilityTime DESC, sourceId LIMIT ?`)
     .all(opts.memoryVersion, opts.now - maxUnusedDays * DAY_MS, maxSources) as unknown as
     (SelectedExtraction & { usageCount: number; eligibilityTime: number; rank: number; outcome: string })[];
-  const notes = db.prepare(`SELECT note_id AS noteId, text_path AS textPath, text_hash AS textHash, scope
+  const notes = db.prepare(`SELECT note_id AS noteId, text_path AS textPath, text_hash AS textHash, scope, action, created_at AS createdAt
     FROM notes WHERE status = 'active' ORDER BY note_id`).all() as unknown as ActiveNote[];
   const state = db.prepare(`SELECT p.active_generation_id AS baseGenerationId, s.control_epoch AS controlEpoch
     FROM pipeline_state p CROSS JOIN store_state s WHERE p.memory_version = ? AND s.singleton = 1`)
@@ -148,7 +148,7 @@ function selectSnapshot(db: DatabaseSync, opts: {
     maxUnusedDays,
     sources: [...selected].sort((a, b) => a.sourceId.localeCompare(b.sourceId)).map(s =>
       [s.sourceId, s.extractionId, s.outputHash, s.lineageKey, s.sessionKey, s.workspaceKey, s.cwd, s.sourceUpdatedAt]),
-    notes: notes.map(n => [n.noteId, n.textHash, n.scope, n.textPath]) })).digest("hex");
+    notes: notes.map(n => [n.noteId, n.textHash, n.scope, n.textPath, n.action, n.createdAt]) })).digest("hex");
   return { ...state, memoryVersion: opts.memoryVersion, sources: selected, notes,
     selectionHash, retentionDeadline, maxSources, maxUnusedDays };
 }

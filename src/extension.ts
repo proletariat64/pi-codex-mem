@@ -122,6 +122,7 @@ interface RuntimeState {
   db: DatabaseSync | null;
   capture: CaptureResult | null;
   captureError: string | null;
+  readDiagnostic: string | null;
 }
 
 interface ExplicitMemoryRun {
@@ -140,6 +141,7 @@ export default function (pi: ExtensionAPI) {
     db: null,
     capture: null,
     captureError: null,
+    readDiagnostic: null,
   };
   const activityOwner = randomUUID();
   let scheduler: ExtractionScheduler | null = null;
@@ -765,6 +767,7 @@ export default function (pi: ExtensionAPI) {
       else if (ctx.hasUI) ctx.ui.notify(`pi-memory: model default not saved — ${saved.reason}`, "warning");
     }
     readerPin = null;
+    state.readDiagnostic = null;
     if (retentionTimer) clearTimeout(retentionTimer);
     retentionTimer = null;
     const latest = state.config;
@@ -789,7 +792,16 @@ export default function (pi: ExtensionAPI) {
         maxUnusedDays: latest.config.schedule.maxUnusedDays,
         extractionPromptHash: latest.config.version === "v1" ? v1PromptHash() : v2PromptHash() });
       if (!readerPin) return;
-      sectionMap.pi_memory = renderMemorySection(readerPin, ctx.cwd);
+      const section = renderMemorySection(readerPin, ctx.cwd);
+      const usage = ctx.getContextUsage?.();
+      const window = usage?.contextWindow ?? ctx.model?.contextWindow;
+      // Same conservative byte/token margin as generation, independent of summaryBytes.
+      if (window && Buffer.byteLength(section, "utf8") > Math.max(0, (window - (usage?.tokens ?? 0)) * 0.7 - 1024)) {
+        state.readDiagnostic = "memory injection omitted: context_budget (generation remains valid)";
+        if (ctx.hasUI) ctx.ui.notify(`pi-memory: ${state.readDiagnostic}`, "warning");
+      } else {
+        sectionMap.pi_memory = section;
+      }
       armReaderRetention();
     } catch { /* Memory failure must not stop the user's foreground task. */ }
     finally { readerDb?.close(); }
@@ -935,6 +947,7 @@ export default function (pi: ExtensionAPI) {
         `generation targets: ${targetVersions(c).join(", ")}`,
         ...(c.dualWrite ? [`dual-write: ${readiness.every(line => line.endsWith(": published")) ? "published both" : "partial"}`] : []),
         ...(state.captureError ? [`capture error: ${state.captureError}`] : []),
+        ...(state.readDiagnostic ? [state.readDiagnostic] : []),
       );
     }
     return lines;

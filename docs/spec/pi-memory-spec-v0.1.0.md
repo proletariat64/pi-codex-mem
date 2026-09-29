@@ -1,9 +1,12 @@
 # Pi Memory — Implementation Specification
 
 **Version:** 0.1.0  
-**Date:** 2026-09-28  
-**Draft revision:** 2 — v1 and v2 are both required for v0.1.0  
-**Status:** Proposed implementation contract, grounded in inspected upstream source  
+**Date:** 2026-09-29
+
+**Draft revision:** 3 — signed-off consolidation validation design
+
+**Status:** Implementation contract; revision 3 validation change signed off by the user on 2026-09-29, implementation pending
+
 **Working package name:** `pi-memory` — a local project name, not a claim that this npm name is available  
 **Target:** A single-user TypeScript extension for pi with memory independent of Codex and Claude-mem
 
@@ -31,6 +34,12 @@ The first supported deployment is one user on Linux with a local filesystem. Cro
 
 The existing `proletariat64/pi-bridge` remains a separate Claude-mem adapter. Its lifecycle and failure-isolation lessons are relevant, but this project does not change that repository's responsibilities or reuse its worker protocol.
 
+### 1.2 Signed-off validation change (2026-09-29)
+
+The user approved the revised Phase 2 contract in Sections 9.4–9.6: port Codex's artifact checks rather than adding content-quality heuristics as publication gates. Retain project/date grouping as an explicit, narrowly scoped pi structural adaptation for both versions, and retain one bounded validator-feedback repair. Preserve existing host storage, access, privacy, and publication safeguards separately from generated-content validation. The reader must use the same version-specific artifact contract.
+
+This supersedes revision 2's universal summary cap, ordered-heading gate, generated-reference/ID/anchor checks, handbook-field checks, and per-bullet source requirements. It does not relax Phase 1 JSON schemas or semantic release criteria. Approval records the design, not completion of implementation or tests. Unchanged operational docs, prompt adaptations, and implementation must be reconciled with this revision before the release gate; they do not override it.
+
 ## 2. Inspected source baseline
 
 All upstream descriptions below refer to these exact commits, not an unspecified moving `main` branch.
@@ -39,6 +48,8 @@ All upstream descriptions below refer to these exact commits, not an unspecified
 |---|---|---|
 | `earendil-works/pi` | `6f7551516b84278eb9da1c340c8e7bc66be1a6ba` | `@earendil-works/pi-coding-agent` package version 0.87.1; Node requirement >=22.19.0 |
 | `openai/codex` | `1cc7e2361237ce7244430ee1d581c77f95c57ac8` | Both memory v1 and v2 are implemented; configuration defaults to v1 |
+
+Revision 3 additionally inspected Codex `c248f6d48b97eb4a2aa56147a0b11b7d763278b9` for artifact validation, writer completion, and nested index formatting [C12]. This supplemental comparison does not repin the vendored prompt families or replace the implementation baseline above.
 
 The source manifest in the implementation MUST record upstream repository, commit, path, content hash, local destination, and a description of every adaptation. The first implementation MUST vendor the relevant prompt templates at these revisions and retain upstream license notices.
 
@@ -411,9 +422,11 @@ Reject absolute paths, `..`, symlinks, device files, and writes outside the vers
 
 No generated executable scripts, automatic installation into pi's skills directory, or implicit command execution in v0.1. Forbidden artifacts must fail v2 publication, not merely disappear from its prompt.
 
-For v1, `MEMORY.md` uses task groups with `scope`, `applies_to`, task-local source references and keywords, followed by supported preferences, reusable knowledge, and failure lessons. Preserve exact safe identifiers, model/user wording, and decision conditions. Do not create one flat chronological log.
+#### 9.4.1 Writer guidance and semantic quality
 
-For both versions, `memory_summary.md` starts with literal `v1` and contains, in order:
+For v1, the writer should organize `MEMORY.md` into task groups with `scope`, `applies_to`, task-local source references and keywords, followed by supported preferences, reusable knowledge, and failure lessons. Preserve exact safe identifiers, model/user wording, and decision conditions. Do not create one flat chronological log. These are prompt and semantic-evaluation requirements, not mandatory fields parsed by the artifact validator.
+
+For both versions, the writer is instructed to start `memory_summary.md` with literal `v1` and use these headings in this order. The narrower hard-validation rules are defined in Section 9.4.2:
 
 1. `## User Profile`
 2. `## User preferences`
@@ -422,21 +435,64 @@ For both versions, `memory_summary.md` starts with literal `v1` and contains, in
 
 The first-line `v1` is the upstream summary-format marker, including in Codex's v2 writer and validator. It is not a pipeline selector. Record the actual memory version in the manifest and database; do not infer it from this first line or rename it to `v2`. [C5, C10]
 
-Default summary maximum is 9,999 UTF-8 bytes for both profiles. v1's bound is a pi design choice. v2 MUST remain strictly below 10,000 bytes regardless of configuration; a configured lower limit is allowed. Reject and repair oversized consolidated summaries rather than cutting them after writing. Test bytes, not JavaScript character count.
+`limits.summaryBytes` (default 9,999) is a writer length target, not an artifact-validity limit. v1 has no additional summary-length rejection. v2 MUST remain strictly below 10,000 UTF-8 bytes regardless of that target; a lower configured target does not make an otherwise valid summary invalid. Reject and permit repair for a v2 summary of 10,000 bytes or more, rather than cutting the persisted artifact after writing. Test UTF-8 bytes, not JavaScript character count. Host request, storage, and foreground-context budgets remain separate resource controls.
 
-For v2, `## What's in Memory` routes directly to selected rollout summaries: recent work uses `### <project scope>` and `#### <YYYY-MM-DD>`; each useful retrieval intent includes the exact staged summary path and one sentence explaining when it matters. The host-supplied pi `session_key` and `source_id` replace Codex thread identifiers in adapted prompts. Older topics use `### Older Memory Topics` with concise project-scoped entries. Supported document, discussion, PR, and implementation pointers may be retained when worth the space, but must never be guessed or normalized into different identifiers. Recent and older grouping is prompt guidance, not proof of a claim's truth.
+For v2, `## What's in Memory` routes directly to selected rollout summaries: recent work uses `### <project scope>` and `#### <YYYY-MM-DD>`; each useful retrieval intent includes the exact staged summary path and one sentence explaining when it matters. The host-supplied pi `session_key` and `source_id` replace Codex thread identifiers in adapted prompts. Older topics use `### Older Memory Topics` with concise project-scoped entries. Supported document, discussion, PR, and implementation pointers may be retained when worth the space, but must never be guessed or normalized into different identifiers. Both versions additionally enforce the minimal recent/older project grouping in Section 9.4.3. This is an explicit departure from Codex's host validator, not proof that a project's label or a date is faithful to the evidence.
 
 Use the conversation's language for substantive memory, preserve exact technical identifiers, and retain original-language evidence for quoted preferences. English structural headings are stable schema markers; Chinese content is supported.
 
-Every v1 task group must cite selected source files or explicit user-note IDs. v1 summary pointers resolve to handbook sections or selected evidence; v2 pointers resolve directly to its selected rollout summaries and may refer to shared note IDs in the manifest. Every retained source reference must exist in the candidate's selected input set. Claims whose only support was removed must be removed. Source-backed corrections outrank older summaries. No new claim can be justified solely by a previous generated claim, including a claim generated by the other version.
+As writer guidance and semantic-quality criteria, v1 task groups should cite selected source files or explicit user-note IDs; v1 summary pointers should resolve to handbook sections or selected evidence; v2 pointers should resolve directly to selected rollout summaries and may cite shared note IDs. References must not be invented. Claims whose only support was removed must be removed. Source-backed corrections outrank older summaries. No new claim can be justified solely by a previous generated claim, including one from the other version. The artifact validator does not inspect generated prose for pointer existence, selected IDs, handbook anchors, source coverage, or keyword matches. A wrong textual reference is a semantic-quality failure, not itself an artifact-format failure; it never grants filesystem or cross-version access.
 
-When no supported sources or notes remain, publish a deterministic minimal summary with the required marker/headings and no invented preferences or pointers. v1 additionally needs a valid minimal handbook; v2 must remain valid without any `MEMORY.md`.
+When no supported sources or notes remain, the host still produces a deterministic minimal summary with the marker/headings and no invented preferences or pointers. v1 additionally receives a minimal handbook; v2 remains valid without any `MEMORY.md`. This is a generation behavior, not a separate exact-template-equality check on all candidate artifacts. Privacy revocation remains mandatory.
+
+#### 9.4.2 Codex-aligned artifact checks
+
+These checks mirror the inspected Codex artifact validator [C5, C12]; Section 9.4.3 lists the sole additional content-structure gate, while Section 9.4.4 retains host safeguards.
+
+| Check | v1 | v2 |
+|---|---|---|
+| Required generated files | `MEMORY.md` must be a regular file; readable UTF-8 `memory_summary.md` | Readable UTF-8 `memory_summary.md`; no generated handbook |
+| Summary first line | Exactly `v1` | Exactly `v1` |
+| Summary length | No artifact-format cap | Strictly below 10,000 UTF-8 bytes |
+| Four section headings | Writer guidance, not a required-heading gate | Each of the four headings must occur on a line, comparing after trimming surrounding whitespace |
+| Heading order, duplicates, extra headings | No additional gate | No additional gate |
+| Handbook task structure, `scope`, `applies_to`, keywords | No content-field gate | Not applicable |
+| Generated references, IDs, anchors, individual bullet citations | No content-reference gate | No content-reference gate |
+
+Do not introduce a topic-block citation check as a substitute for the removed per-line citation check. Passing artifact validation does not certify truthful content or useful recall; Section 19.2 remains the quality gate.
+
+#### 9.4.3 Minimal project/date grouping — approved pi adaptation
+
+Apply the following to topic entries inside `## What's in Memory` in either version. Limit inspection to that section, ending at the next level-two heading; do not interpret bullets in other sections as memory routes. If the section is absent in v1, the grouping check is not applicable; v2 still requires its heading under Section 9.4.2. An empty index is valid and does not require fabricated project/date groups.
+
+- Recent topics must belong to a non-empty `### <project scope>` group and a `#### <YYYY-MM-DD>` date group within that project. A new project resets the date context.
+- A recent date heading must have the exact date shape and represent a real calendar date; reject values such as `2026-02-30`. Do not require it to equal today, match a source timestamp, be sorted, or fall in a guessed recent-day window.
+- Under `### Older Memory Topics`, topic entries must belong to a non-empty `#### <project scope>` group; no date group is required. Entering the older section resets the recent project/date context.
+- Validate each top-level topic together with its indented children. `desc`, `learnings`, and other nested bullets inherit the enclosing topic's scope/date; they do not need repeated headings or citations. Do not flatten all lines matching a bullet regex into independent topics.
+- A non-empty project label can be a project description or a cwd. Do not require equality with the current cwd, filesystem existence, or a predefined project-name list. Evidence-faithful scope/date assignment is assessed semantically, not inferred from syntax.
+
+For example, this is one correctly grouped topic, not three independent routes:
+
+```markdown
+## What's in Memory
+### Local CLI prototype
+#### 2026-09-27
+- Language choice: TypeScript, parser reuse
+  - desc: The prototype's language choice; see MEMORY.md.
+  - learnings: Prefer parser reuse; revisit if profiling shows a bottleneck.
+```
+
+This adaptation checks useful scope/time structure only. Codex's inspected host validator does not enforce it; its writer prompt does specify grouping and nested topic formatting [C12]. Do not claim byte-for-byte validation parity.
+
+#### 9.4.4 Host safety and publication integrity
+
+Retain existing path confinement, symlink/device rejection, physical output allowlists, v1/v2 storage isolation, selected evidence and note integrity checks, sensitive-information scanning, manifest hashes, lease fences, source eligibility, and privacy revocation. These protect host-managed data and access, not the style or correctness of generated prose. A textual mention of an absolute path, unselected ID, or another version's artifact is not itself an access attempt; actual tool operations remain confined. Do not add new safety mechanisms as part of this change.
 
 ### 9.5 Publication protocol
 
 1. Build version-scoped staging and snapshot its memory version, source-selection hash, shared control/invalidation epoch, per-version base generation, and lease fencing token.
 2. Run consolidation, or produce deterministic minimal required files when no sources/notes remain.
-3. Validate required headings, UTF-8/size bounds, path safety, pointer existence, source eligibility, and secret scan. Structural validation does not prove semantic truth; the quality suite covers that separately.
+3. Apply the version-specific artifact checks (9.4.2), minimal project/date grouping (9.4.3), and independent host safety/integrity checks (9.4.4). For repairable artifact failures, follow 9.6 before proceeding. Do not reinstate generated-pointer or keyword checks at publication. Structural validation does not prove semantic truth; the quality suite covers that separately.
 4. Write `manifest.json` with memory version, file hashes, selected same-version extraction IDs, note hashes, and prompt hashes; fsync files and staging directory.
 5. Rename staging to a unique immutable `versions/<memoryVersion>/generations/<generationId>/` on the same filesystem.
 6. In one short SQLite transaction, verify lease token, expected per-version base generation, same-version selection state, and unchanged shared control epoch; mark the generation published and set `pipeline_state[memoryVersion].active_generation_id`. The row must point only to a generation with the same memory version.
@@ -446,9 +502,19 @@ SQLite is the sole publication pointer. There is no second `current` symlink or 
 
 Keep at most two old generations per version for ordinary recovery, plus any currently pinned reader generation. Invalidation/forget overrides recovery retention: no revoked generation can become current or be read through tools.
 
+### 9.6 One bounded artifact repair
+
+Retain the existing validator-feedback repair as an explicit pi adaptation. After the writer completes a turn, a repairable artifact-format or project/date-grouping failure may receive one diagnostic-based repair opportunity in the same confined agent context. Identify the violated rule and affected file/section without inventing missing content or provenance. Revalidate after repair; a second failure ends the job without publication. Keep the previous valid generation only if it has not been revoked. Codex's inspected Phase 2 instead fails invalid completed artifacts without this in-turn repair [C12].
+
+The repair uses the existing call, tool, token, timeout, cancellation, and lease budgets; it grants no extra budget or third repair cycle. Network/auth errors, budget exhaustion, stale leases, privacy revocation, and host-data integrity failures are not content-format mistakes to fix through more model calls. Preserve their existing failure handling. Even a repaired candidate must pass the final pre-publication validation and fencing checks; that check does not grant another repair opportunity. Source-selection and access constraints cannot be relaxed to make a candidate pass.
+
 ## 10. Read path and progressive disclosure
 
 Normal prompt handling uses no memory-related LLM request. Inject exactly one selected-version summary, current workspace applicability, memory version, generation ID, and that version's adapted read guidance in the `pi_memory` section. Dual writing must not concatenate the two summaries or expose two competing guidance sections. If storage is unavailable or invalidated, omit memory and continue the user task.
+
+Publication and reading MUST share the version-specific validity rules in Section 9.4, including the approved grouping adaptation. The reader must not silently reintroduce ordered/unique-heading requirements, a v1 9,999-byte format cap, generated-pointer checks, or a lower `summaryBytes` validity threshold. Continue checking generation/version identity, hashes, paths, eligibility, and revocation.
+
+`summaryBytes` is not an injection eligibility gate. Host context/resource limits remain independent: if the full summary cannot safely be injected, omit the section for that run and expose a resource-budget diagnostic rather than marking the generation invalid, triggering a format repair, or silently truncating/rewriting the stored artifact. This change adds no new budget knob and does not authorize unbounded foreground reads.
 
 The section must label historical content as evidence, not instructions that override current user requests or higher-priority policy. Source text, generated memory, and user-note bodies must never be interpolated into tool definitions or trusted control instructions.
 
@@ -692,7 +758,7 @@ Illustrative complete configuration, with user-selected model references initial
 }
 ```
 
-Set `version` to `"v2"` to select the complete v2 pipeline. Set `dualWrite` to `true` only when both should generate; it never merges their read contexts. `version` accepts only `v1` or `v2`. Require `summaryBytes` between 1,024 and 9,999 and `v2RolloutSummaryBytes` between 1,024 and 9,000; the v2 caps cannot be raised via configuration. These are pi JSON settings, not additions to Codex's `config.toml`.
+Set `version` to `"v2"` to select the complete v2 pipeline. Set `dualWrite` to `true` only when both should generate; it never merges their read contexts. `version` accepts only `v1` or `v2`. Keep the existing configuration ranges: `summaryBytes` between 1,024 and 9,999 and `v2RolloutSummaryBytes` between 1,024 and 9,000. In revision 3, `summaryBytes` is only a writer length target; exceeding it alone cannot invalidate a publication or read view. The v2 consolidated-summary validity cap remains strictly below 10,000 bytes, independent of that target. `v2RolloutSummaryBytes` still bounds Phase 1 extraction; that contract is unchanged. No configuration migration or renamed field is required. These are pi JSON settings, not additions to Codex's `config.toml`.
 
 Timezone controls daily budgets and human-facing dates, not storage timestamps. The initial value comes from the host's configured local timezone; the example matches the user's current timezone.
 
@@ -761,7 +827,7 @@ Disabling or uninstalling this package leaves its data intact. `/memory clear` e
 | No model/auth or incompatible provider | Continue normal pi; valid memory reads remain available; show blocked generation |
 | Offline/rate limit | Schedule retry under budget; do not block prompt submission |
 | Extraction JSON invalid | One bounded repair, then retry/blocked with exact validation reason |
-| Consolidation incomplete/invalid | Discard staging; retain previous valid generation unless revoked |
+| Consolidation incomplete/invalid | One bounded repair for repairable artifact/grouping failure (9.6); if still invalid or incomplete, discard staging and retain previous valid generation only if not revoked |
 | Process killed during write | Recover lease; ignore uncommitted generation; retry safely |
 | Two pi instances consolidate | One winner via global lease + publication CAS; loser never publishes |
 | Evidence changes mid-request | Reject stale output or stage for a still-valid historical branch only; never mark it current |
@@ -833,7 +899,7 @@ These are acceptance targets, not measured claims. Use bounded SQLite operations
 | T30 | Dual writing with one failed model request | Separate watermarks/retries; successful version remains usable; combined budget is unchanged |
 | T31 | v1 no-output result followed by v2 processing | v2 is still eligible for its own extraction; no repeated jobs after each version is processed |
 | T32 | Forget/correction while v2 is inactive | Both versions are revoked; switching cannot revive deleted or superseded guidance |
-| T33 | Cross-version manifest, source reference, cursor, or DB pointer | Reject mismatch before any content is served or published |
+| T33 | Cross-version manifest, host-managed source link, cursor, or DB pointer | Reject mismatch before any content is served or published; prose mentioning another version is not itself a host-managed link |
 | T34 | Enable second version after snapshot pruning | Reconstruct enrolled evidence read-only or report unavailable; never learn from other-version outputs |
 | T35 | Shared notes during dual writing | Both apply the same active note revision independently; one publication does not mark the other applied |
 | T36 | v2 has no remaining evidence/notes | Publish minimal valid summary without a handbook or invented pointers |
@@ -841,6 +907,15 @@ These are acceptance targets, not measured claims. Use bounded SQLite operations
 | T38 | Config changes, restart, and conflicting commands | Selected version/dual-write persist; unrelated settings survive; only the selected profile is injected |
 
 Run T01–T22 against both memory versions; execute T23–T38 for the stated version/cross-version cases. Use deterministic fake model responses for state-machine and crash tests. These tests do not establish memory quality; use real models for the next gate.
+
+Revision 3 additionally requires focused regression coverage for the approved validator contract (without renumbering the behavioral matrix):
+
+- **v1 acceptance:** arbitrary/empty regular-file handbook; marker-only summary; a valid summary above 9,999 bytes; nested topic/`desc`/`learnings` structure without repeated citations.
+- **v2 acceptance:** reordered, duplicated, or additional section headings; a summary above a configured lower length target but below 10,000 bytes; valid older-project topics without dates.
+- **Both versions' grouping:** accept empty indices and project descriptions that differ from current cwd; child bullets inherit the topic group. Reject recent topics missing a project/date, impossible or malformed recent dates, and older topics missing a project. Validate only the index section even if sections are reordered. Do not enforce today, date order, or source-timestamp equality.
+- **Required failures:** missing required files, non-UTF-8 summary, wrong marker, missing v2 heading, and v2 summary at or above 10,000 bytes. Retain the existing physical-file, secret, tampered-evidence, privacy, and publication-integrity tests.
+- **No extra semantic gates:** fabricated prose references, missing handbook fields, or unsupported prose do not themselves fail format validation; test their consequences in semantic evaluation, while actual unauthorized reads/writes remain blocked.
+- **Repair and reader parity:** a real required-format/grouping failure gets at most one repair opportunity under existing budgets; a second failure never publishes. Otherwise-valid published artifacts remain readable under the same contract; resource-limited injection is diagnosed separately from invalid artifacts.
 
 ### 19.2 Semantic evaluation
 
@@ -922,7 +997,7 @@ Local installation for the developed package is `pi install ./pi-memory`; restar
 
 1. **Source and compatibility baseline:** pin sources, record licenses/adaptations, establish host API tests, implement read-only normalized session fixtures. Exit: branch/compaction/context-edit fixtures are correct.
 2. **Durable capture and both Phase 1 contracts:** implement shared state, version-scoped jobs, leases, model port, budgets, separate prompts/schemas, truncation, and no-output behavior. Exit: discussion-only extraction, v2 field/byte boundaries, and restart tests pass.
-3. **Both consolidation and publication paths:** add confined tools, per-version workspace diffs/allowlists/validators, atomic per-version generation commits, and recovery. Exit: v2 publishes without a handbook; forbidden outputs and cross-version references fail; crash/concurrency tests pass.
+3. **Both consolidation and publication paths:** add confined tools, per-version workspace diffs/allowlists/validators, atomic per-version generation commits, and recovery. Exit: v2 publishes without a handbook; forbidden physical outputs and cross-version host-managed links fail; revision 3 format/grouping/repair regressions and crash/concurrency tests pass.
 4. **Read paths, switching, and controls:** add version-specific injection/retrieval, persistent version selection, bounded dual writing, shared notes/forget, and per-version status/doctor. Exit: no prompt-path network calls, mixed-version context, or revoked-memory readback.
 5. **Quality gate and packaging:** run both real-model evaluations and the switch/dual-write matrix, resolve failing categories, document measured footprint/cost/quality by version and model configuration, and package for pi installation. A v1-only implementation does not satisfy v0.1.0.
 
@@ -943,6 +1018,10 @@ Do not implement synchronization or additional memory backends before the semant
 | Codex state database | New independent SQLite schema |
 | Git-baseline memory workspace | Replace with manifest diff + immutable generations |
 | Codex consolidation subagent | Replace with in-memory pi agent-core and restricted tools |
+| Consolidated artifact validation | Use Codex's version-specific file/marker/size/heading checks; no extra generated-reference, handbook-field, per-bullet, or heading-order gates |
+| Project/date grouping | Explicit signed-off pi structural adaptation for v1/v2; validate topic scope and valid dates, not semantic truth or repeated child citations |
+| Artifact repair | Retain one bounded validator-feedback repair before failure; unlike the inspected Codex completed-writer failure path |
+| Summary length target | Keep `summaryBytes` as writer guidance, separate from artifact validity and host resource limits; v2's <10,000-byte validity cap remains |
 | Codex quota metadata | Replace with explicit provider-neutral budgets |
 | Codex private citation format | Replace with ordinary evidence references and tool metadata |
 | Generated skills/scripts | v1 prose procedures only; none in v2; no auto-registered executable skills |
@@ -980,6 +1059,8 @@ The implementation-basis links below are pinned to the inspected commits; C11 ad
 - **C10 — v2 prompts:** [stage_one_system_v2.md](https://github.com/openai/codex/blob/1cc7e2361237ce7244430ee1d581c77f95c57ac8/codex-rs/memories/write/templates/memories/stage_one_system_v2.md), [consolidation_v2.md](https://github.com/openai/codex/blob/1cc7e2361237ce7244430ee1d581c77f95c57ac8/codex-rs/memories/write/templates/memories/consolidation_v2.md), [read_path_v2.md](https://github.com/openai/codex/blob/1cc7e2361237ce7244430ee1d581c77f95c57ac8/codex-rs/ext/memories/templates/memories/read_path_v2.md).
 
 - **C11 — Codex 0.157.1 feature gate and version defaults:** [features/src/lib.rs](https://github.com/openai/codex/blob/rust-v0.157.1/codex-rs/features/src/lib.rs), [config/src/types.rs](https://github.com/openai/codex/blob/rust-v0.157.1/codex-rs/config/src/types.rs).
+
+- **C12 — Revision 3 validation comparison (2026-09-29):** [workspace.rs L71–129](https://github.com/openai/codex/blob/c248f6d48b97eb4a2aa56147a0b11b7d763278b9/codex-rs/memories/write/src/workspace.rs#L71-L129), [phase2.rs L405–473](https://github.com/openai/codex/blob/c248f6d48b97eb4a2aa56147a0b11b7d763278b9/codex-rs/memories/write/src/phase2.rs#L405-L473), [consolidation.md L604–664](https://github.com/openai/codex/blob/c248f6d48b97eb4a2aa56147a0b11b7d763278b9/codex-rs/memories/write/templates/memories/consolidation.md#L604-L664). Supplemental fixed revision only; no vendored-template repin.
 
 ### Pi
 

@@ -57,7 +57,7 @@ test(`${memoryVersion === "v2" ? "T27 v2: " : ""}${memoryVersion} extraction pub
           assert.ok(evidence, "writer receives staged evidence paths from workspace_list");
           const handbook = `# Task Group: TypeScript choice\nscope: ${cwd}\napplies_to: ${cwd}\n\n## Task 1: Use TypeScript\n\n### rollout_summary_files\n- ${evidence}\n\n### keywords\n- TypeScript\n\n### learnings\n- User chose TypeScript for typed interfaces.\n`;
           const summary = memoryVersion === "v1" ?
-            `v1\n\n## User Profile\n\n## User preferences\n- Use TypeScript for typed interfaces in this project.\n\n## General Tips\n\n## What's in Memory\n- TypeScript choice: MEMORY.md; ${evidence}\n` :
+            `v1\n\n## User Profile\n\n## User preferences\n- Use TypeScript for typed interfaces in this project.\n\n## General Tips\n\n## What's in Memory\n### ${cwd}\n#### ${new Date(now).toISOString().slice(0, 10)}\n- TypeScript choice: MEMORY.md; ${evidence}\n` :
             `v1\n\n## User Profile\n\n## User preferences\n\n## General Tips\n\n## What's in Memory\n\n### ${cwd}\n\n#### ${new Date(now).toISOString().slice(0, 10)}\n\n- ${evidence} — User chose TypeScript for typed interfaces; read for the decision's scope and exact wording.\n`;
           content = [...(memoryVersion === "v1" ? [{ type: "toolCall" as const, id: "handbook", name: "workspace_write", arguments: { path: "MEMORY.md", content: handbook } }] : []),
             { type: "toolCall", id: "summary", name: "workspace_write", arguments: { path: "memory_summary.md", content: summary } }];
@@ -113,6 +113,12 @@ test(`${memoryVersion === "v2" ? "T27 v2: " : ""}${memoryVersion} extraction pub
   assert.match(JSON.stringify(await read()), /TypeScript/);
   const usage = new DatabaseSync(join(agentDir, "memory", "state.sqlite"));
   assert.equal(usage.prepare("SELECT COUNT(*) AS n FROM memory_usage").get()!.n, 1, "detail use is deduplicated within one foreground run");
+  await mock.fire("before_agent_start", event, { ...ctx,
+    getContextUsage: () => ({ tokens: 32_000, contextWindow: 32_768, percent: 98 }) });
+  assert.equal(event.systemPromptOptions.sections.pi_memory, undefined, "resource-limited injection is omitted");
+  assert.match(JSON.stringify(await read()), /TypeScript/, "budget omission does not invalidate the generation or detail tools");
+  await mock.fire("before_agent_start", event, ctx);
+  assert.match(event.systemPromptOptions.sections.pi_memory!, /TypeScript/, "injection recovers when context is available");
   usage.exec("UPDATE source_stats SET last_used_at = NULL");
   usage.prepare("UPDATE source_revisions SET source_time = ?").run(Date.now() - 30 * 86_400_000 + 150);
   await mock.fire("before_agent_start", event, ctx);

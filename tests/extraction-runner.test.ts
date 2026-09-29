@@ -46,12 +46,12 @@ function setup(t: test.TestContext, items?: { entryId: string; role: string; ori
 }
 
 function fakePort(replies: MemoryResponse[]) {
-  const calls: { text: string; tools: Context["tools"]; signal: AbortSignal }[] = [];
+  const calls: { text: string; tools: Context["tools"]; signal: AbortSignal; version: "v1" | "v2" }[] = [];
   const port: MemoryModelPort = {
     resolve: () => ({ provider: "mock", modelId: "extract", contextWindow: 200_000, maxTokens: 8_000 }),
     request: async (_model: ResolvedMemoryModel, context: Context,
-      options: { signal: AbortSignal; maxTokens: number; timeoutMs: number; toolChoice: "none" }) => {
-      calls.push({ text: JSON.stringify(context), tools: context.tools, signal: options.signal });
+      options: Parameters<MemoryModelPort["request"]>[2]) => {
+      calls.push({ text: JSON.stringify(context), tools: context.tools, signal: options.signal, version: options.version });
       const response = replies.shift();
       if (!response) throw new Error("no fake reply");
       return response;
@@ -250,6 +250,20 @@ test("one invalid JSON reply gets exactly one budgeted repair; no-output records
   assert.equal((db.prepare("SELECT COUNT(*) AS n FROM budget_reservations").get() as { n: number }).n, 2);
   assert.equal((db.prepare("SELECT outcome FROM extractions").get() as { outcome: string }).outcome, "no_output");
   assert.equal((db.prepare("SELECT attempt_count FROM jobs").get() as { attempt_count: number }).attempt_count, 2);
+});
+
+test("malformed JSON repair explicitly rejects a trailing brace without relaxing schema", async (t) => {
+  const { db, job, root } = setup(t);
+  const extraBrace = '{"raw_memory":"decision","rollout_summary":"summary","rollout_slug":"choice"}}';
+  const valid = extraBrace.slice(0, -1);
+  const { port, calls } = fakePort([response(extraBrace), response(valid)]);
+  const result = await runV1Extraction({ db, root, job, modelRef, port, now: NOW + 1,
+    timezone: "UTC", limits, signal: new AbortController().signal });
+  assert.deepEqual(result, { status: "succeeded" });
+  assert.equal(calls.length, 2);
+  assert.match(calls[1]?.text ?? "", /Prior response/);
+  assert.equal(calls[1]?.version, "v1");
+  assert.equal((db.prepare("SELECT raw_memory FROM extractions").get() as { raw_memory: string }).raw_memory, "decision");
 });
 
 test("a late provider response cannot commit after its source revision is superseded", async (t) => {

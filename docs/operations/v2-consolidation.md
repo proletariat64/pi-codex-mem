@@ -18,13 +18,17 @@ to Pi session/source identifiers and exact staged paths without modifying upstre
 files. Existing time, request, context, tool, daily-budget and repair limits apply.
 
 The summary uses literal `v1` as its format marker while the manifest/database use
-`v2` as the pipeline version. It has the four required headings and remains at most
-9,999 UTF-8 bytes regardless of an oversized configuration. Recent retrieval routes
-use project/date groups and exact selected rollout paths; older topics retain scope.
-No remaining evidence or notes produces only the deterministic minimal summary.
+`v2` as the pipeline version. It has the four required headings (presence, not order
+or uniqueness) and stays strictly below 10,000 UTF-8 bytes. `summaryBytes` is a writer
+target, not a lower validity cap. Recent index topics require a project and valid
+calendar-date group; older topics require a project. Nested children inherit grouping
+and need no repeated citation. Empty indices are valid. Exact source pointers remain
+writer guidance and semantic-quality criteria, not an extra format gate.
+No remaining evidence or notes still produces the deterministic minimal summary.
 
-V2 validation checks allowed files and directories, evidence/note integrity, pointers,
-identifiers, grouping and secrets. Publication repeats validation before fsync/rename,
+V2 keeps host checks for allowed files/directories, evidence/note integrity and secrets.
+These are distinct from generated-text validation; integrity failures are not repaired
+through another model call. Repairable format/grouping failures get one bounded repair. Publication repeats validation before fsync/rename,
 so caller-bypassed validation cannot publish a forbidden handbook, raw-memory file
 or skill. The existing SQLite CAS checks the same-version selection/base, lease
 fence and shared epoch. Readers serve only the selected immutable generation.

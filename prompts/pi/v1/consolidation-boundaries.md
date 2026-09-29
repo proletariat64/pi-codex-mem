@@ -24,8 +24,8 @@ Optional procedures are Markdown prose only; no scripts, templates or executable
 files. workspace_delete removes only optional skills/<slug>/SKILL.md, never evidence.
 Upstream housekeeping suggestions to delete rollout summaries do not apply.
 
-Each MEMORY.md task group must have scope, applies_to, task-local source references
-and keywords. Cite only selected staged rollout summary paths or explicit note IDs
+Writer quality guidance (not extra format-validation fields): organize MEMORY.md
+into task groups with scope, applies_to, task-local source references and keywords. Cite only selected staged rollout summary paths or explicit note IDs
 from the manifest. Prior generated claims are continuity aids, not sole evidence.
 Host source_id and session_key replace upstream thread identifiers; preserve them
 exactly. The summary must start with literal v1, then these headings in order:
@@ -33,7 +33,14 @@ exactly. The summary must start with literal v1, then these headings in order:
 ## User preferences
 ## General Tips
 ## What's in Memory
-The summary byte limit is supplied below. Check UTF-8 bytes rather than characters.
+The supplied summary length target is guidance, not a v1 artifact-size gate.
+Host format validation requires both files and the summary's first-line marker;
+heading order, handbook fields, and individual citations are not rejection rules.
+When What's in Memory contains topics, recent topics need a non-empty ### project
+and a real-calendar #### YYYY-MM-DD group. Older Memory Topics uses ### Older Memory Topics
+then #### project, without a date requirement. Nested desc/learnings inherit the
+topic's project/date and need no repeated citation. An empty index is valid.
+Use source-faithful dates, not today's date by default.
 Write memory_summary.md last, after MEMORY.md and optional procedures are complete.
 Preserve the conversation's language and exact safe identifiers; retain uncertainty.
 Do not guess missing sources or infer outcomes from omitted evidence. Finish with a

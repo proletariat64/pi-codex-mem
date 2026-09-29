@@ -225,7 +225,7 @@ async function runScenario(t: test.TestContext, memoryVersion: "v1" | "v2", scen
           assert.ok(evidence, "writer receives staged rollout evidence through restricted workspace tools");
           const handbook = `# Task Group: ${scenario.id} decision\nscope: ${cwd}\napplies_to: ${cwd}\n\n## Task 1: Decision\n\n### rollout_summary_files\n- ${evidence}\n\n### keywords\n- TypeScript\n\n### learnings\n- ${scenario.summary}\n`;
           const summary = memoryVersion === "v1"
-            ? `v1\n\n## User Profile\n\n## User preferences\n\n## General Tips\n\n## What's in Memory\n- ${scenario.summary}: MEMORY.md; ${evidence}\n`
+            ? `v1\n\n## User Profile\n\n## User preferences\n\n## General Tips\n\n## What's in Memory\n### ${cwd}\n#### 2026-09-29\n- ${scenario.summary}: MEMORY.md; ${evidence}\n`
             : `v1\n\n## User Profile\n\n## User preferences\n\n## General Tips\n\n## What's in Memory\n\n### ${cwd}\n\n#### 2026-09-29\n\n- ${scenario.summary} ${evidence}\n`;
           content = [
             ...(memoryVersion === "v1" ? [{ type: "toolCall" as const, id: "handbook", name: "workspace_write", arguments: { path: "MEMORY.md", content: handbook } }] : []),

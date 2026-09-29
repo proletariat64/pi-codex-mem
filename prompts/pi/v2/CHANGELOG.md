@@ -8,3 +8,13 @@ Adapted prompts derived from `prompts/upstream/v2/` live in this directory. Ever
 | `prompts/upstream/v2/read_path_v2.md` | `read_path.md` | Selected version/generation/workspace metadata, historical-evidence labeling, direct summary-first retrieval from exact staged rollout paths, ordinary Markdown citations, no handbook lookup or original-session browsing. |
 
 Vendored upstream files remain byte-identical. Prompt hashes cover the runtime renderer revision and version-specific boundaries.
+
+## Revision 3 — signed-off validation parity
+
+The consolidation boundary now separates writer guidance from hard validation.
+Codex file/marker checks apply to v1; v2 additionally requires four headings by
+presence and a summary below 10,000 UTF-8 bytes. `summaryBytes` is a writer target.
+Both versions retain minimal project/calendar-date grouping; nested topic children
+inherit grouping without per-bullet citations. Prose pointers, handbook fields and
+heading order are not extra gates. One repair is retained for format/grouping errors,
+not host integrity failures. Upstream prompts remain unchanged.

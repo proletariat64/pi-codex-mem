@@ -10,6 +10,7 @@ import { defaultConfig, type MemoryVersion } from "../src/config.ts";
 import { openStateDb } from "../src/store/db.ts";
 import { claimConsolidation } from "../src/store/consolidation.ts";
 import { consolidationPromptHash, runConsolidation } from "../src/pipeline/consolidate.ts";
+import { validateSummaryFormat } from "../src/pipeline/artifacts.ts";
 import type { ConsolidationModelPort } from "../src/pipeline/model-port.ts";
 
 const NOW = Date.UTC(2026, 8, 1, 12);
@@ -269,12 +270,11 @@ test("transport observers count spent requests and transient Retry-After hints s
   assert.equal(started, 1);
 });
 
-test("one oversized UTF-8 summary gets a bounded repair in the same Agent context before succeeding", async (t) => {
-  const setup = fixture(t);
+test("v2 oversized UTF-8 summary gets one bounded repair in the same Agent context", async (t) => {
+  const setup = fixture(t, "v2");
   const oversized = summary.replace("## User Profile", "## User Profile\n" + "界".repeat(3_400));
   const { port, calls } = fakePort([
-    reply([tool("workspace_write", { path: "MEMORY.md", content: handbook }),
-      tool("workspace_write", { path: "memory_summary.md", content: oversized })], "toolUse"),
+    reply([tool("workspace_write", { path: "memory_summary.md", content: oversized })], "toolUse"),
     reply([{ type: "text", text: "Written." }]),
     reply([tool("workspace_write", { path: "memory_summary.md", content: summary })], "toolUse"),
     reply([{ type: "text", text: "Repaired." }]),
@@ -282,9 +282,7 @@ test("one oversized UTF-8 summary gets a bounded repair in the same Agent contex
   let validations = 0;
   assert.deepEqual(await run(setup, port, { validateOutputs: () => {
     validations++;
-    if (Buffer.byteLength(readFileSync(join(setup.directory, "memory_summary.md"), "utf8")) > 9999) {
-      throw new Error("summary exceeds UTF-8 byte cap");
-    }
+    validateSummaryFormat(readFileSync(join(setup.directory, "memory_summary.md"), "utf8"), "v2");
   } }), { status: "succeeded" });
   assert.equal(validations, 2);
   assert.equal(calls.length, 4);
@@ -292,6 +290,46 @@ test("one oversized UTF-8 summary gets a bounded repair in the same Agent contex
   assert.match(JSON.stringify(calls[2]?.context), /summary exceeds UTF-8 byte cap/);
   assert.match(JSON.stringify(calls[2]?.context), /界/);
   assert.equal((setup.db.prepare("SELECT SUM(call_count) AS n FROM budget_usage").get() as { n: number }).n, 4);
+});
+
+test("missing v2 heading gets one general diagnostic repair without citation instructions", async (t) => {
+  const setup = fixture(t, "v2");
+  const bad = summary.replace("## General Tips\n", "");
+  const { port, calls } = fakePort([
+    reply([tool("workspace_write", { path: "memory_summary.md", content: bad })], "toolUse"),
+    reply([{ type: "text", text: "Written." }]),
+    reply([tool("workspace_write", { path: "memory_summary.md", content: summary })], "toolUse"),
+    reply([{ type: "text", text: "Repaired." }]),
+  ]);
+  let validations = 0;
+  assert.deepEqual(await run(setup, port, { validateOutputs: () => {
+    validations++;
+    validateSummaryFormat(readFileSync(join(setup.directory, "memory_summary.md"), "utf8"), "v2");
+  } }), { status: "succeeded" });
+  assert.equal(validations, 2);
+  const diagnostic = JSON.stringify(calls[2]?.context);
+  assert.match(diagnostic, /summary missing required heading: ## General Tips/);
+  assert.match(diagnostic, /sole validation repair opportunity/);
+  assert.doesNotMatch(diagnostic, /Check EVERY bullet|exact selected source path or note ID/);
+  assert.equal(readFileSync(join(setup.directory, "memory_summary.md"), "utf8"), summary);
+});
+
+test("host input integrity failure blocks without repair or exposing evidence to model", async (t) => {
+  const setup = fixture(t, "v2");
+  const { port, calls } = fakePort([
+    reply([tool("workspace_write", { path: "memory_summary.md", content: summary })], "toolUse"),
+    reply([{ type: "text", text: "Written." }]),
+  ]);
+  let validations = 0;
+  assert.deepEqual(await run(setup, port, { validateOutputs: () => {
+    validations++;
+    throw new Error("selected source evidence missing or changed: rollout_summaries/source.md");
+  } }), { status: "blocked", reason: "artifact_integrity_failed" });
+  assert.equal(validations, 1);
+  assert.equal(calls.length, 2, "host integrity failure must not trigger repair request");
+  assert.doesNotMatch(JSON.stringify(calls), /selected source evidence missing or changed/);
+  assert.equal((setup.db.prepare("SELECT SUM(call_count) AS n FROM budget_usage").get() as { n: number }).n, 2);
+  assert.equal((setup.db.prepare("SELECT status FROM jobs WHERE job_id = ?").get(setup.lease.jobId) as { status: string }).status, "leased");
 });
 
 test("a second invalid artifact response blocks without another repair or marking the leased job successful", async (t) => {
@@ -306,11 +344,10 @@ test("a second invalid artifact response blocks without another repair or markin
   let validations = 0;
   assert.deepEqual(await run(setup, port, { validateOutputs: () => {
     validations++;
-    if (readFileSync(join(setup.directory, "memory_summary.md"), "utf8").split("\n")[0] !== "v1") {
-      throw new Error("summary first-line marker must be literal v1");
-    }
+    validateSummaryFormat(readFileSync(join(setup.directory, "memory_summary.md"), "utf8"), "v1");
   } }), { status: "blocked", reason: "validation_failed" });
   assert.equal(validations, 2);
-  assert.equal(calls.length, 4);
+  assert.equal(calls.length, 4, "one repair only; no fifth model request after second rejection");
+  assert.equal((setup.db.prepare("SELECT SUM(call_count) AS n FROM budget_usage").get() as { n: number }).n, 4);
   assert.equal((setup.db.prepare("SELECT status FROM jobs WHERE job_id = ?").get(setup.lease.jobId) as { status: string }).status, "leased");
 });

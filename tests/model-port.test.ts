@@ -29,7 +29,7 @@ test("pi model port resolves the configured model and streams through the regist
   assert.equal(port.resolve({ provider: "other", modelId: "extract" }), undefined);
   assert.ok(model);
   const result = await port.request(model, { systemPrompt: "system", messages: [], tools: [] },
-    { signal: new AbortController().signal, maxTokens: 6_000, timeoutMs: 120_000, toolChoice: "none" });
+    { signal: new AbortController().signal, maxTokens: 6_000, timeoutMs: 120_000, toolChoice: "none", version: "v1" });
   assert.equal(result.stopReason, "error", "fulfilled stream result is not success");
   assert.equal(result.errorMessage, "401 unauthorized");
   assert.deepEqual(result.usage, { input: 2, output: 0 });
@@ -37,6 +37,34 @@ test("pi model port resolves the configured model and streams through the regist
   assert.equal(calls[0]?.options.apiKey, undefined);
   assert.equal(calls[0]?.options.toolChoice, "none");
   assert.deepEqual(calls[0]?.tools, []);
+});
+
+test("Codex extraction enforces version-specific JSON schema without dropping request text options", async () => {
+  const requests: Record<string, unknown>[] = [];
+  const registry = { find: (provider: string, id: string) => ({ provider, id, contextWindow: 160_000, maxTokens: 8_000 }),
+    streamSimple: (_model: unknown, _context: unknown, options: { onPayload: (value: unknown) => unknown }) => {
+      requests.push(options.onPayload({ model: "gpt-6-luna", text: { verbosity: "low" } }) as Record<string, unknown>);
+      return { result: async () => ({ stopReason: "stop", content: [{ type: "text", text: "{}" }],
+        usage: { input: 1, output: 1 } }) };
+    },
+  } as unknown as ExtensionContext["modelRegistry"];
+  const port = createRegistryModelPort(registry);
+  for (const version of ["v1", "v2"] as const) {
+    const model = port.resolve({ provider: "openai-codex", modelId: "gpt-6-luna" }); assert.ok(model);
+    await port.request(model, { systemPrompt: "system", messages: [], tools: [] },
+      { signal: new AbortController().signal, maxTokens: 6_000, timeoutMs: 120_000, toolChoice: "none", version });
+  }
+  for (const [i, fields] of [["raw_memory", "rollout_summary", "rollout_slug"],
+    ["rollout_summary", "rollout_slug"]].entries()) {
+    const request = requests[i]!;
+    assert.equal(request.model, "gpt-6-luna");
+    const text = request.text as { verbosity: string; format: { strict: boolean; schema: { required: string[];
+      additionalProperties: boolean } } };
+    assert.equal(text.verbosity, "low");
+    assert.equal(text.format.strict, true);
+    assert.deepEqual(text.format.schema.required, fields);
+    assert.equal(text.format.schema.additionalProperties, false);
+  }
 });
 
 test("pi model port counts cached read and write once in total input budget units", async (t) => {
@@ -48,7 +76,7 @@ test("pi model port counts cached read and write once in total input budget unit
   const port = createRegistryModelPort(registry);
   const model = port.resolve({ provider: "mock", modelId: "cached" }); assert.ok(model);
   const result = await port.request(model, { systemPrompt: "system", messages: [], tools: [] },
-    { signal: new AbortController().signal, maxTokens: 6_000, timeoutMs: 120_000, toolChoice: "none" });
+    { signal: new AbortController().signal, maxTokens: 6_000, timeoutMs: 120_000, toolChoice: "none", version: "v1" });
   assert.deepEqual(result.usage, { input: 10_000, output: 20 });
   const root = mkdtempSync(join(tmpdir(), "pi-cached-budget-"));
   const db = openStateDb(root);

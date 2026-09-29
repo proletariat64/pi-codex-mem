@@ -130,6 +130,13 @@ test("T33 cross: version and generation mismatched cursors cannot serve content"
     "ordinary publication does not change the run's immutable pin");
 });
 
+test("a new extraction policy cannot read a published generation containing old-policy sources", (t) => {
+  const { db, root, publish } = fixture(t);
+  publish("v1");
+  assert.ok(acquireReadView({ db, root, memoryVersion: "v1", now: NOW + 5, extractionPromptHash: "extract" }));
+  assert.equal(acquireReadView({ db, root, memoryVersion: "v1", now: NOW + 5, extractionPromptHash: "new-policy" }), null);
+});
+
 test("literal case folding is opt-in and all matching requires every query on the line", async (t) => {
   const { publish } = fixture(t); const { call, path } = publish("v2");
   assert.equal((await call("search", { queries: ["typescript"], match: "any" })).details.items.length, 0);

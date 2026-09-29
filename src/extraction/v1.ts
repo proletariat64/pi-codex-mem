@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { redactSensitive } from "../sensitive.ts";
+import { renderTemplate } from "../template.ts";
 
 export interface V1Output {
   raw_memory: string;
@@ -60,10 +61,19 @@ export function parseV1Output(response: string, maxBytes: number): V1ParseResult
   return { ok: true, output, outcome, outputHash: digest(JSON.stringify(output)) };
 }
 
+/** Bump the policy version when the renderer, schema, or final evidence selection changes.
+ * A new hash queues fresh work even for a prior succeeded/no-output revision. */
+export function extractionPromptHash(system: string, template: string, version: "v1" | "v2"): string {
+  return digest(system + "\n" + template + "\n" + JSON.stringify({
+    version, schemaVersion: 1, rendererVersion: 2, evidenceSelectionVersion: 2,
+    contextByteRatio: 0.7, contextOverhead: 1_024,
+  }));
+}
+
 export function v1PromptHash(): string {
   const system = readFileSync(new URL("../../prompts/upstream/v1/stage_one_system.md", import.meta.url), "utf8");
   const template = readFileSync(new URL("../../prompts/upstream/v1/stage_one_input.md", import.meta.url), "utf8");
-  return digest(system + "\n" + template);
+  return extractionPromptHash(system, template, "v1");
 }
 
 export interface V1RequestInput {
@@ -93,9 +103,8 @@ export function renderV1Request(input: V1RequestInput): {
     ...input.items.map(v1EvidenceLine),
     input.omittedForContext ? `[${input.omittedForContext} evidence items omitted for model context budget]` : "",
   ].filter(Boolean).join("\n");
-  const userPrompt = template
-    .replace("{{ rollout_path }}", JSON.stringify(input.snapshotPath))
-    .replace("{{ rollout_cwd }}", JSON.stringify(input.cwd))
-    .replace("{{ rollout_contents }}", contents);
-  return { systemPrompt, userPrompt, promptHash: digest(systemPrompt + "\n" + template) };
+  const userPrompt = renderTemplate(template, {
+    rollout_path: JSON.stringify(input.snapshotPath), rollout_cwd: JSON.stringify(input.cwd), rollout_contents: contents,
+  });
+  return { systemPrompt, userPrompt, promptHash: extractionPromptHash(systemPrompt, template, "v1") };
 }

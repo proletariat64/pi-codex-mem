@@ -1,5 +1,6 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { MemoryModelPort, MemoryResponse } from "./runner.ts";
+import { normalizeModelUsage } from "../model-usage.ts";
 
 /** Capture the owning runtime's provider registry, never its credentials. */
 export function createRegistryModelPort(registry: ExtensionContext["modelRegistry"]): MemoryModelPort {
@@ -17,7 +18,7 @@ export function createRegistryModelPort(registry: ExtensionContext["modelRegistr
       const text = message.content.flatMap((item) => item.type === "text" ? [item.text] : []).join("");
       return { stopReason: message.stopReason === "pending" ? "error" : message.stopReason,
         text, errorMessage: message.errorMessage,
-        usage: message.usage ? { input: message.usage.input, output: message.usage.output } : undefined };
+        usage: normalizeModelUsage(message.usage) };
     },
   };
 }

@@ -1,10 +1,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openStateDb, recordSnapshot, type SnapshotRecord } from "../src/store/db.ts";
+import { defaultConfig } from "../src/config.ts";
+import { enqueueActiveExtractions } from "../src/extraction/scheduler.ts";
+import { v1PromptHash } from "../src/extraction/v1.ts";
+import { v2PromptHash } from "../src/extraction/v2.ts";
 import {
   claimDueExtractions, commitExtraction, enqueueExtraction, failExtraction,
   recordProcessActivity, reconcileModelCall, renewExtractionLease, reserveModelCall,
@@ -92,6 +97,31 @@ test("one durable v1 job is leased once; an expired lease fences the late respon
   assert.equal(commitExtraction(reopened, second, accepted(), NOW + 181_002), true);
   assert.equal((reopened.prepare("SELECT COUNT(*) AS n FROM extractions").get() as { n: number }).n, 1);
   assert.deepEqual(claimDueExtractions(reopened, { owner: "three", now: NOW + 400_000, limit: 2 }), []);
+});
+
+test("renderer policy upgrade requeues both terminal and in-flight legacy extractions by version", (t) => {
+  const { db } = fixture(t);
+  const oldHash = (version: "v1" | "v2") => {
+    const system = readFileSync(new URL(`../prompts/upstream/${version}/${version === "v1" ? "stage_one_system.md" : "stage_one_system_v2.md"}`, import.meta.url), "utf8");
+    const template = readFileSync(new URL(`../prompts/upstream/${version}/${version === "v1" ? "stage_one_input.md" : "stage_one_input_v2.md"}`, import.meta.url), "utf8");
+    return createHash("sha256").update(system + "\n" + template).digest("hex");
+  };
+  assert.notEqual(v1PromptHash(), oldHash("v1"));
+  assert.notEqual(v2PromptHash(), oldHash("v2"));
+  enqueueExtraction(db, { sourceId: SOURCE_ID, memoryVersion: "v1", promptHash: oldHash("v1"), now: NOW });
+  const [priorV1] = claimDueExtractions(db, { owner: "v1", now: NOW, limit: 1 }); assert.ok(priorV1);
+  assert.equal(commitExtraction(db, priorV1, { ...accepted(), promptHash: priorV1.promptHash, rawMemory: "", rolloutSummary: "",
+    rolloutSlug: "", outcome: "no_output" }, NOW + 1), true);
+  enqueueExtraction(db, { sourceId: SOURCE_ID, memoryVersion: "v2", promptHash: oldHash("v2"), now: NOW + 2 });
+  const [priorV2] = claimDueExtractions(db, { owner: "v2", now: NOW + 2, limit: 1 }); assert.ok(priorV2);
+  const config = defaultConfig("UTC"); config.dualWrite = true;
+  enqueueActiveExtractions(db, NOW + 3, config);
+  assert.equal(db.prepare("SELECT status FROM jobs WHERE job_id = ?").get(priorV2.jobId)!.status, "superseded");
+  assert.equal(commitExtraction(db, priorV2, { ...accepted("v2"), promptHash: priorV2.promptHash }, NOW + 4), false);
+  const next = claimDueExtractions(db, { owner: "updated", now: NOW + 4, limit: 2 });
+  assert.deepEqual(next.map(job => `${job.memoryVersion}:${job.promptHash}`).sort(),
+    [`v1:${v1PromptHash()}`, `v2:${v2PromptHash()}`].sort());
+  assert.equal(db.prepare("SELECT status FROM jobs WHERE job_id = ?").get(priorV1.jobId)!.status, "no_output");
 });
 
 test("v1 no-output leaves v2 independent, and v2 stores NULL raw memory with truncation metadata", (t) => {

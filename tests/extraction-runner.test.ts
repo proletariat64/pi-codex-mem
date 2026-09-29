@@ -186,6 +186,46 @@ test("rendered input fits a conservative 70% context budget and prioritizes user
   assert.match(calls[0]?.text ?? "", /omitted for model context budget/);
 });
 
+for (const version of ["v1", "v2"] as const) test(`${version} final context never separates a short choice from its question`, async (t) => {
+  const question = `QUESTION_UNIQUE options: 1 keep old database; 2 migrate database. ${"context ".repeat(6_000)} Which option?`;
+  const answer = "USE_OPTION_1_UNIQUE";
+  const { db, job, root } = setup(t, [
+    { entryId: "a1", role: "assistant", origin: null, text: question, timestamp: NOW - 20_000 },
+    { entryId: "u1", role: "user", origin: "unknown", text: answer, timestamp: NOW - 10_000 },
+  ], version);
+  const { port, calls } = fakePort([response(version === "v1" ?
+    '{"raw_memory":"","rollout_summary":"","rollout_slug":""}' : '{"rollout_summary":"","rollout_slug":""}')]);
+  port.resolve = () => ({ provider: "mock", modelId: "extract", contextWindow: 60_000, maxTokens: 6_000 });
+  const result = await (version === "v1" ? runV1Extraction : runV2Extraction)({ db, root, job, modelRef, port,
+    now: NOW + 1, timezone: "UTC", limits: { ...limits, v2RolloutSummaryBytes: 9_000 },
+    signal: new AbortController().signal });
+  assert.equal(result.status, "no_output", `${JSON.stringify({ calls: calls.length, error: db.prepare("SELECT error_code FROM jobs WHERE job_id = ?").get(job.jobId)?.error_code })}`);
+  assert.equal(calls.length, 1);
+  const sent = calls[0]!.text;
+  assert.equal(sent.includes("QUESTION_UNIQUE"), sent.includes(answer), "answer must not be shown without its question");
+  assert.match(sent, /evidence items omitted for model context budget/);
+});
+
+for (const version of ["v1", "v2"] as const) test(`${version} model-fit retains a short choice with its fitting question before verbose tool evidence`, async (t) => {
+  const question = `QUESTION_UNIQUE options: 1 keep old database; 2 migrate database. ${"context ".repeat(300)} Which option?`;
+  const answer = "USE_OPTION_1_UNIQUE";
+  const { db, job, root } = setup(t, [
+    { entryId: "a1", role: "assistant", origin: null, text: question, timestamp: NOW - 30_000 },
+    { entryId: "u1", role: "user", origin: "unknown", text: answer, timestamp: NOW - 20_000 },
+    { entryId: "tool1", role: "tool", origin: null, text: "verbose tool log " + "X".repeat(50_000), timestamp: NOW - 10_000 },
+  ], version);
+  const { port, calls } = fakePort([response(version === "v1" ?
+    '{"raw_memory":"","rollout_summary":"","rollout_slug":""}' : '{"rollout_summary":"","rollout_slug":""}')]);
+  port.resolve = () => ({ provider: "mock", modelId: "extract", contextWindow: 60_000, maxTokens: 6_000 });
+  const result = await (version === "v1" ? runV1Extraction : runV2Extraction)({ db, root, job, modelRef, port,
+    now: NOW + 1, timezone: "UTC", limits: { ...limits, v2RolloutSummaryBytes: 9_000 },
+    signal: new AbortController().signal });
+  assert.equal(result.status, "no_output");
+  assert.match(calls[0]!.text, /QUESTION_UNIQUE/);
+  assert.match(calls[0]!.text, /USE_OPTION_1_UNIQUE/);
+  assert.doesNotMatch(calls[0]!.text, /verbose tool log/);
+});
+
 test("a model with insufficient context blocks before spending budget", async (t) => {
   const { db, job, root } = setup(t);
   const { port, calls } = fakePort([]);

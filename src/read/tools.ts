@@ -78,7 +78,8 @@ export function createMemoryTools(input: MemoryToolsInput): AgentTool<TSchema, M
         if (!view || !db) throw new Error("memory_unavailable");
         const valid = () => {
           const generation = getPublishedGeneration(db, view!.memoryVersion, input.now?.() ?? Date.now(),
-            { generationId: view!.generationId, maxUnusedDays: input.maxUnusedDays?.() });
+            { generationId: view!.generationId, maxUnusedDays: input.maxUnusedDays?.(),
+              extractionPromptHash: view!.extractionPromptHash });
           if (!generation || generation.controlEpoch !== view!.controlEpoch || generation.manifestHash !== view!.manifestHash || generation.directory !== view!.directory ||
               resolve(view!.directory) !== resolve(input.root, "versions", view!.memoryVersion, "generations", view!.generationId)) throw new Error("memory_unavailable");
           return generation;

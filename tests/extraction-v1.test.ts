@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { parseV1Output, renderV1Request } from "../src/extraction/v1.ts";
+import { parseV1Output, renderV1Request, v1PromptHash } from "../src/extraction/v1.ts";
 
 const payload = { raw_memory: "Accepted choice: TypeScript", rollout_summary: "User chose TypeScript over Rust after comparing tooling.", rollout_slug: "typescript-choice" };
 
@@ -56,7 +56,9 @@ test("v1 request uses pinned upstream prompt and only normalized, origin-labeled
   const system = readFileSync(join("prompts", "upstream", "v1", "stage_one_system.md"), "utf8");
   const input = readFileSync(join("prompts", "upstream", "v1", "stage_one_input.md"), "utf8");
   assert.equal(request.systemPrompt, system);
-  assert.equal(request.promptHash, createHash("sha256").update(system + "\n" + input).digest("hex"));
+  assert.equal(request.promptHash, v1PromptHash());
+  assert.notEqual(request.promptHash, createHash("sha256").update(system + "\n" + input).digest("hex"),
+    "a renderer fix must queue new work instead of reusing a terminal legacy extraction");
   assert.match(request.userPrompt, /origin=unknown.*User chose TypeScript/s);
   assert.match(request.userPrompt, /source manifest.*src_123/);
   assert.match(request.userPrompt, /2 source items omitted during normalization/);

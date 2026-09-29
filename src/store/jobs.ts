@@ -51,6 +51,13 @@ export function enqueueExtraction(db: DatabaseSync, item: {
        WHERE r.source_id = ? AND r.status = 'captured' AND h.state = 'active' AND h.latest_revision = r.source_id`,
     ).get(item.sourceId);
     if (source) {
+      // A changed renderer/prompt policy must fence in-flight old work before a
+      // late response can publish obsolete evidence. Keep terminal rows as history.
+      db.prepare(`UPDATE jobs SET status = 'superseded', owner = NULL, lease_expires_at = NULL,
+        fence = fence + 1, updated_at = ? WHERE kind = 'extract' AND source_id = ?
+        AND memory_version = ? AND prompt_hash != ?
+        AND status IN ('queued', 'leased', 'retry_wait', 'blocked', 'cancelled')`)
+        .run(item.now, item.sourceId, item.memoryVersion, item.promptHash);
       db.prepare(
         `INSERT INTO jobs
          (job_id, source_id, memory_version, kind, work_key, prompt_hash, config_epoch,
@@ -60,8 +67,9 @@ export function enqueueExtraction(db: DatabaseSync, item: {
            config_epoch = excluded.config_epoch, status = 'queued', attempt_count = 0,
            due_at = excluded.due_at, error_code = NULL, owner = NULL,
            lease_expires_at = NULL, fence = jobs.fence + 1, updated_at = excluded.updated_at
-         WHERE jobs.status IN ('queued', 'retry_wait', 'blocked', 'cancelled')
-           AND jobs.config_epoch != excluded.config_epoch`,
+         WHERE jobs.status = 'superseded' OR
+           (jobs.status IN ('queued', 'retry_wait', 'blocked', 'cancelled')
+            AND jobs.config_epoch != excluded.config_epoch)`,
       ).run(randomUUID(), item.sourceId, item.memoryVersion,
         JSON.stringify(["extract", item.sourceId, item.memoryVersion, item.promptHash]),
         item.promptHash, item.configEpoch ?? "", item.now, item.now, item.now);

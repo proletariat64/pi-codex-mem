@@ -9,7 +9,7 @@ import {
   computeWorkspaceIdentity,
 } from "./identity.ts";
 import { applyContextEdits, normalizeEvidence, NORMALIZATION_POLICY_VERSION, type NormalizeLimits } from "./snapshot.ts";
-import { prunePrivacyRevoked, recordSnapshot } from "./store/db.ts";
+import { prunePrivacyRevoked, recordSnapshot, sourceSuppressed } from "./store/db.ts";
 import { writeSnapshotFile } from "./store/snapshot-files.ts";
 
 /** Capture plain branch values immediately; never retain a pi context for queued work (§6.1). */
@@ -190,6 +190,9 @@ function captureBranch(
     contextEditHash,
   });
   const sourceId = `src_${hash(`${lineageKey}:${revisionHash}`).slice(0, 32)}`;
+  if (sourceSuppressed(input.db, sessionKey, lineageKey)) {
+    return { result: { status: "skipped", reason: "source_suppressed" }, revokedSourceIds: [] };
+  }
   const current = input.db.prepare(
     `SELECT r.source_id, r.snapshot_path FROM branch_heads h
      JOIN source_revisions r ON r.source_id = h.latest_revision
@@ -264,6 +267,10 @@ function captureBranch(
     if ((input.db.prepare("PRAGMA data_version").get() as { data_version: number }).data_version !== dataVersion) {
       input.db.exec("ROLLBACK");
       return null;
+    }
+    if (sourceSuppressed(input.db, sessionKey, lineageKey)) {
+      input.db.exec("ROLLBACK");
+      return { result: { status: "skipped", reason: "source_suppressed" }, revokedSourceIds: [] };
     }
     saved = writeSnapshotFile(input.root, lineageKey, revisionHash, snapshot);
     recordSnapshot(input.db, {

@@ -89,7 +89,7 @@ test("schema 9 notes migrate without changing their text, hash, scope or applica
   publish(root, db, "v1", "legacy", 101);
   db.exec(`ALTER TABLE notes DROP COLUMN consumer_session; ALTER TABLE notes DROP COLUMN run_id;
     ALTER TABLE notes DROP COLUMN user_message_id; ALTER TABLE notes DROP COLUMN origin;
-    DELETE FROM schema_migrations WHERE version = 10;`);
+    DELETE FROM schema_migrations WHERE version >= 10;`);
   db.close(); const migrated = openStateDb(root); t.after(() => migrated.close());
   const row = migrated.prepare("SELECT text_hash, scope, origin, run_id FROM notes WHERE note_id = ?").get(note.noteId);
   assert.deepEqual({ ...row }, { text_hash: note.textHash, scope: "global", origin: "legacy", run_id: null });

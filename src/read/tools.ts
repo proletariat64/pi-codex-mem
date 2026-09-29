@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
@@ -11,6 +12,7 @@ import { getPublishedGeneration, recordSourceUsage } from "../store/consolidatio
 export interface MemoryItem {
   path: string; startLine: number; endLine: number; sourceIds: string[]; content?: string; truncated?: boolean;
   sourceIdsTruncated?: boolean; omittedSourceIds?: number;
+  sourceUnavailable?: boolean;
 }
 export interface MemoryToolDetails {
   memoryVersion?: string; generationId?: string; items: MemoryItem[];
@@ -51,13 +53,23 @@ function result(details: MemoryToolDetails) {
 /** All data access stays within a host-selected immutable pin, revalidated at each boundary. */
 export function createMemoryTools(input: MemoryToolsInput): AgentTool<TSchema, MemoryToolDetails>[] {
   const detailSources = new WeakMap<MemoryToolDetails, string[]>();
-  const sourceMetadata = (sourceIds: string[]) => sourceIds.length <= 12 ? { sourceIds } : {
-    sourceIds: sourceIds.slice(0, 12), sourceIdsTruncated: true, omittedSourceIds: sourceIds.length - 12,
+  const unavailableSources = new Map<string, boolean>();
+  const sourceMetadata = (sourceIds: string[]) => {
+    const shown = sourceIds.slice(0, 12); const db = input.db();
+    const sourceUnavailable = sourceIds.some(id => {
+      if (unavailableSources.has(id)) return unavailableSources.get(id)!;
+      const source = db?.prepare("SELECT s.path FROM source_revisions r JOIN sessions s ON s.session_key = r.session_key WHERE r.source_id = ?").get(id);
+      const unavailable = typeof source?.path === "string" && !existsSync(source.path);
+      unavailableSources.set(id, unavailable); return unavailable;
+    });
+    return { sourceIds: shown, ...(sourceIds.length > 12 ? { sourceIdsTruncated: true, omittedSourceIds: sourceIds.length - 12 } : {}),
+      ...(sourceUnavailable ? { sourceUnavailable: true } : {}) };
   };
   const tool = (name: string, description: string, parameters: TSchema,
     operation: (args: Record<string, unknown>, view: MemoryReadView, manifest: StagingManifest, db: DatabaseSync, now: number) => MemoryToolDetails): AgentTool<TSchema, MemoryToolDetails> => ({
     name, label: name, description, parameters,
     async execute(_id, raw, signal) {
+      unavailableSources.clear();
       let view: MemoryReadView | null = null;
       try {
         if (signal?.aborted) throw new Error("aborted");

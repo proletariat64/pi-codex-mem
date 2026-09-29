@@ -5,6 +5,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { safeWorkspacePath } from "../pipeline/workspace-tools.ts";
 import { cleanupGenerations } from "../pipeline/publish.ts";
 import { redactSensitive } from "../sensitive.ts";
+import { invalidateGeneratedViews } from "./invalidation.ts";
 
 export interface NoteProvenance {
   consumerSession: string | null; runId: string | null; userMessageId: string | null; origin: "command" | "tool";
@@ -15,14 +16,6 @@ export const NOTE_FORGET_EXPLANATION = "Removing this note may make older indepe
 function syncDirectory(path: string): void {
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try { fsyncSync(fd); } finally { closeSync(fd); }
-}
-function invalidate(db: DatabaseSync, reason: string, now: number): void {
-  db.exec("UPDATE store_state SET control_epoch = control_epoch + 1 WHERE singleton = 1");
-  db.prepare("UPDATE pipeline_state SET read_blocked = 1, block_reason = ?, active_generation_id = NULL").run(reason);
-  db.exec("UPDATE generations SET status = 'revoked' WHERE status = 'published'");
-  // Fence obsolete writers before cleaning their private workspace. Late results cannot publish.
-  db.prepare(`UPDATE jobs SET status = 'superseded', owner = NULL, lease_expires_at = NULL,
-    fence = fence + 1, updated_at = ? WHERE kind = 'consolidate' AND status IN ('queued', 'leased', 'retry_wait')`).run(now);
 }
 const epoch = (db: DatabaseSync) => (db.prepare("SELECT control_epoch AS epoch FROM store_state WHERE singleton = 1").get() as { epoch: number }).epoch;
 
@@ -55,7 +48,7 @@ export function addNote(input: {
       consumer_session, run_id, user_message_id, origin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(noteId, action, textPath, textHash, scope, createdAt, provenance.consumerSession,
         provenance.runId, provenance.userMessageId, provenance.origin);
-    if (action === "correct") invalidate(db, "user_correction", now);
+    if (action === "correct") invalidateGeneratedViews(db, "user_correction", now);
     const controlEpoch = epoch(db); db.exec("COMMIT");
     return { noteId, textPath, textHash, scope, controlEpoch };
   } catch (error) {
@@ -78,7 +71,7 @@ export function forgetNote(input: { root: string; db: DatabaseSync; noteId: stri
       if (!/^notes\/[A-Za-z0-9_-]+\.md$/.test(path)) throw new Error("unsafe_note_path");
       textPath = safeWorkspacePath(root, path, true);
       db.prepare("UPDATE notes SET status = 'superseded' WHERE note_id = ?").run(noteId);
-      invalidate(db, "note_forgotten", now);
+      invalidateGeneratedViews(db, "note_forgotten", now);
     }
     db.exec("COMMIT");
   } catch (error) { db.exec("ROLLBACK"); throw error; }

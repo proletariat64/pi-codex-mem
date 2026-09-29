@@ -11,6 +11,7 @@ import { isExcludedWorkspace } from "./workspace-policy.ts";
 import { enrollHistoricalImport, planHistoricalImport } from "./historical-import.ts";
 import {
   formatModelRef,
+  beginClear,
   legacyLockRecovery,
   loadConfig,
   updateConfig,
@@ -41,6 +42,7 @@ import { createMemoryTools, type MemoryConsumer } from "./read/tools.ts";
 import { getPublishedGeneration } from "./store/consolidation.ts";
 import { Type } from "typebox";
 import { addNote, cleanupRevokedNotes, forgetNote, type NoteProvenance } from "./control/notes.ts";
+import { clearMemoryStore, DELETION_LIMITS, forgetEvidence, resumeClear } from "./control/forget.ts";
 
 const EXTENSION_VERSION = "0.1.0";
 
@@ -212,7 +214,10 @@ export default function (pi: ExtensionAPI) {
       if (retentionTimer) clearTimeout(retentionTimer);
       retentionTimer = null;
       try { if (state.db) cleanupRevokedNotes({ root, db: state.db }); }
-      catch { state.captureError = "note cleanup deferred; revoked views remain unavailable"; }
+      catch {
+        state.captureError = "privacy cleanup deferred: revoked views remain unavailable";
+        schedulePrivacyCleanup(root);
+      }
     }
     triggerScheduler();
   }
@@ -273,7 +278,7 @@ export default function (pi: ExtensionAPI) {
           a.control_epoch != s.control_epoch OR p.active_generation_id IS NULL OR
           a.generation_id != p.active_generation_id) LIMIT 1`).get(version, version);
       const revoked = state.db.prepare(`SELECT 1 FROM pipeline_state WHERE memory_version = ? AND read_blocked = 1
-        AND block_reason IN ('user_correction', 'note_forgotten')`).get(version);
+        AND block_reason IN ('user_correction', 'note_forgotten', 'source_forgotten')`).get(version);
       if (pending || revoked) return config;
     }
     return null;
@@ -339,12 +344,17 @@ export default function (pi: ExtensionAPI) {
       try {
         if (state.db) prunePrivacyRevoked(state.db, root);
         else state.db = openStateDb(root);
+        cleanupGenerations({ db: state.db, root, now: Date.now(),
+          pinnedGenerationIds: readerPin ? [readerPin.generationId] : [] });
         ensureScheduler();
         triggerScheduler();
         privacyRetryCount = 0;
         if (state.captureError?.startsWith("privacy cleanup deferred:")) state.captureError = null;
       } catch (err) {
-        notePrivacyCleanupFailure(err, root);
+        if (!notePrivacyCleanupFailure(err, root)) {
+          state.captureError = "privacy cleanup deferred: storage cleanup unavailable; revoked views remain unavailable";
+          schedulePrivacyCleanup(root);
+        }
       }
     }, delay);
     privacyRetryTimer.unref();
@@ -469,12 +479,17 @@ export default function (pi: ExtensionAPI) {
       };
       state.config = { status: "missing", path: join(root, "config.json") };
     } else {
+      if (state.compat.supported && !legacyLockPath(root) && existsSync(join(root, "clear.pending"))) {
+        try {
+          if (resumeClear(root).cleanupPending) state.captureError = "memory clear cleanup pending; memory remains disabled";
+        } catch { state.captureError = "memory clear cleanup pending; memory remains disabled"; }
+      }
       state.config = loadConfig(root, {
         timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
       });
       // On resume, a different selected leaf may be active before any new
       // agent_settled event. Revoke stale heads before future reads (§5.3).
-      if (state.compat.supported && !legacyLockPath(root) && storeSchemaState(root) === "current") {
+      if (state.compat.supported && !legacyLockPath(root) && !existsSync(join(root, "clear.pending")) && storeSchemaState(root) === "current") {
         try {
           state.db = openStateDb(root);
           cleanupGenerations({ db: state.db, root, now: Date.now() });
@@ -895,7 +910,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.registerCommand("memory", {
-    description: "Pi Memory — persistent cross-session memory (status, doctor, import, run, remember, correct, forget note)",
+    description: "Pi Memory — persistent cross-session memory (status, doctor, import, run, remember, correct, forget, clear)",
     handler: async (args, ctx) => {
       const sub = args.trim().split(/\s+/).filter(Boolean)[0] ?? "status";
       if (sub === "remember" || sub === "correct") {
@@ -909,13 +924,42 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       if (sub === "forget") {
-        const match = /^forget\s+note\s+([A-Za-z0-9_-]{1,160})$/.exec(args.trim());
-        if (!match) { if (ctx.hasUI) ctx.ui.notify("usage: /memory forget note <note-id>", "warning"); return; }
+        const match = /^forget\s+(note|source|session)\s+([A-Za-z0-9_-]{1,160})$/.exec(args.trim());
+        if (!match) { if (ctx.hasUI) ctx.ui.notify(`usage: /memory forget source|session|note <concrete-id>. ${DELETION_LIMITS}`, "warning"); return; }
         try {
-          const store = writableNoteStore(ctx); const result = forgetNote({ ...store, noteId: match[1]! });
-          if (result.removed) afterNoteChange(store.root, true);
-          if (ctx.hasUI) ctx.ui.notify(`pi-memory: ${result.removed ? "removed" : "no active note found for"} ${result.noteId}. ${result.explanation}`, "info");
-        } catch { if (ctx.hasUI) ctx.ui.notify("pi-memory: note removal unavailable; committed revocation remains effective", "warning"); }
+          const store = writableNoteStore(ctx);
+          if (match[1] === "note") {
+            const result = forgetNote({ ...store, noteId: match[2]! });
+            if (result.removed) afterNoteChange(store.root, true);
+            if (ctx.hasUI) ctx.ui.notify(`pi-memory: ${result.removed ? "removed" : "no active note found for"} ${result.noteId}. ${result.explanation} ${DELETION_LIMITS}`, "info");
+          } else {
+            const result = forgetEvidence({ ...store, kind: match[1] as "source" | "session", id: match[2]! });
+            if (result.forgotten) afterNoteChange(store.root, true);
+            if (result.cleanupPending) schedulePrivacyCleanup(store.root);
+            if (ctx.hasUI) ctx.ui.notify(`pi-memory: ${result.forgotten ? "forgot" : "no enrolled target found for"} ${match[1]} ${match[2]}. ${result.cleanupPending ? "Cleanup pending; revoked views remain unavailable. " : ""}${result.explanation}`, result.cleanupPending ? "warning" : "info");
+          }
+        } catch { if (ctx.hasUI) ctx.ui.notify("pi-memory: removal unavailable; committed revocation remains effective", "warning"); }
+        return;
+      }
+      if (sub === "clear") {
+        if (args.trim() !== "clear --confirm") { if (ctx.hasUI) ctx.ui.notify(`usage: /memory clear --confirm. ${DELETION_LIMITS}`, "warning"); return; }
+        const root = resolveMemoryRoot();
+        if (!state.compat?.supported || rootPointsIntoForeignMemory(root) || legacyLockPath(root)) {
+          if (ctx.hasUI) ctx.ui.notify("pi-memory: clear unavailable for this store", "warning"); return;
+        }
+        try {
+          const disabled = beginClear(root);
+          if (!disabled.ok) throw new Error(disabled.reason);
+          readerPin = null; foregroundRun = null;
+          if (retentionTimer) clearTimeout(retentionTimer); retentionTimer = null;
+          cancelPrivacyCleanup();
+          await scheduler?.stop(); await consolidator?.stop(); scheduler = null; consolidator = null;
+          const db = state.db ?? openStateDb(root); state.db = null;
+          const result = clearMemoryStore({ root, db, confirmed: true });
+          state.config = loadConfig(root, { create: false }); state.capture = null;
+          state.captureError = result.cleanupPending ? "memory clear cleanup pending; memory remains disabled" : null;
+          if (ctx.hasUI) ctx.ui.notify(`pi-memory: ${result.cleanupPending ? "clear cleanup pending" : "memory cleared"}; capture, reading and generation disabled. ${result.explanation}`, result.cleanupPending ? "warning" : "info");
+        } catch { if (ctx.hasUI) ctx.ui.notify("pi-memory: clear incomplete; retry after resolving configuration/storage errors. Files preserved for recovery.", "warning"); }
         return;
       }
       if (sub === "run") {

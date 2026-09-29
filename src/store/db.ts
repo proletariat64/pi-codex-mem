@@ -36,7 +36,7 @@ export interface SnapshotRecord {
   evidenceRemoved?: boolean;
 }
 
-const SCHEMA_VERSION = 10;
+const SCHEMA_VERSION = 11;
 
 const MIGRATION_1 = `
 CREATE TABLE schema_migrations (
@@ -374,6 +374,12 @@ export function openStateDb(root: string, options?: { busyTimeoutMs?: number }):
         }
         db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(10, Date.now());
       }
+      if (current < 11) {
+        db.exec(`CREATE TABLE IF NOT EXISTS suppression_tombstones (
+          kind TEXT NOT NULL CHECK (kind IN ('lineage', 'session')), identity TEXT NOT NULL,
+          created_at INTEGER NOT NULL, PRIMARY KEY (kind, identity))`);
+        db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(11, Date.now());
+      }
       db.exec("COMMIT");
     } catch (err) {
       db.exec("ROLLBACK");
@@ -546,6 +552,7 @@ export function recordSnapshot(db: DatabaseSync, rec: SnapshotRecord, root?: str
   if (rec.revokedSourceIds?.length && !root) throw new Error("privacy revocation requires the owned memory root");
   if (!transactionOwned) db.exec("BEGIN IMMEDIATE");
   try {
+    if (sourceSuppressed(db, rec.session.sessionKey, rec.revision.lineageKey)) throw new Error("source_suppressed");
     db.prepare(
       `INSERT INTO workspaces (workspace_key, repo_key, checkout_key, cwd, git_branch, git_head, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -649,6 +656,12 @@ export function recordSnapshot(db: DatabaseSync, rec: SnapshotRecord, root?: str
   }
   // An external owner performs post-commit cleanup after its own COMMIT.
   if (!transactionOwned && rec.revokedSourceIds?.length) prunePrivacyRevoked(db, root!);
+}
+
+/** Explicit forget applies to future revisions and, for sessions, future branches. */
+export function sourceSuppressed(db: DatabaseSync, sessionKey: string, lineageKey: string): boolean {
+  return !!db.prepare(`SELECT 1 FROM suppression_tombstones
+    WHERE (kind = 'session' AND identity = ?) OR (kind = 'lineage' AND identity = ?) LIMIT 1`).get(sessionKey, lineageKey);
 }
 
 /** §5.3: on session_tree, retire every head except the active one. */

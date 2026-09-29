@@ -75,6 +75,19 @@ test("literal Chinese search returns pinned evidence with deterministic paging a
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM memory_usage").get()!.n, 0);
 });
 
+test("missing original transcripts keep extracted memory readable with an unavailable-source marker", async (t) => {
+  const { root, db, publish } = fixture(t);
+  const original = join(root, "source.jsonl"); writeFileSync(original, '{"original":"evidence"}\n');
+  const { call, view, path } = publish("v1");
+  assert.equal((await call("read", { path })).details.items[0]!.sourceUnavailable, undefined);
+  unlinkSync(original);
+  const read = await call("read", { path });
+  assert.equal(read.details.error, undefined); assert.equal(read.details.items[0]!.sourceUnavailable, true);
+  assert.match(read.details.items[0]!.content!, /中文决策/);
+  assert.equal(acquireReadView({ root, db, memoryVersion: "v1", now: NOW + 6 })!.generationId, view.generationId);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM suppression_tombstones").get()!.n, 0);
+});
+
 test("v2 reads rollout evidence only and successful detail reads deduplicate versioned usage", async (t) => {
   const { db, publish } = fixture(t); const v1 = publish("v1"); const v2 = publish("v2");
   const listed = await v2.call("list", {});
@@ -195,6 +208,7 @@ test("a 128-source task keeps metadata bounded and records complete validated de
   t.after(() => { db.close(); rmSync(root, { recursive: true, force: true }); });
   const ids = Array.from({ length: 128 }, (_, index) => index.toString(16).padStart(64, "0"));
   for (const sourceId of ids) {
+    writeFileSync(join(root, `${sourceId}.jsonl`), '{"original":"available"}\n');
     recordSnapshot(db, {
       workspace: { workspaceKey: "workspace", repoKey: null, checkoutKey: null, cwdReal: root,
         gitCommonDir: null, gitTopLevel: null, gitBranch: null, gitHead: null },
@@ -228,12 +242,14 @@ test("a 128-source task keeps metadata bounded and records complete validated de
   const view = acquireReadView({ db, root, memoryVersion: "v1", now: NOW + 4 }); assert.ok(view);
   const tools = createMemoryTools({ root, db: () => db, view: () => view,
     consumer: () => ({ consumerSession: "reader", runId: "run" }), now: () => NOW + 5 });
+  unlinkSync(join(root, `${ids[12]}.jsonl`));
   for (const name of ["read", "list", "search"]) {
     const output = await tools.find(tool => tool.name === `pi_memory_${name}`)!.execute("call",
       { path: "MEMORY.md", startLine: 4, maxLines: 1, queries: ["Task Group"], match: "any" }, undefined);
     assert.equal(output.details.error, undefined); assert.equal(output.details.truncated, true);
     assert.equal(output.details.items[0]!.omittedSourceIds, 116);
     assert.deepEqual(output.details.items[0]!.sourceIds, ids.slice(0, 12));
+    assert.equal(output.details.items[0]!.sourceUnavailable, true, "omitted attribution still participates in source availability");
     assert.ok(Buffer.byteLength(JSON.stringify(output)) <= 16_384);
   }
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM memory_usage").get()!.n, 128);

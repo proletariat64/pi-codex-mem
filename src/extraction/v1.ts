@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { redactSensitive } from "../sensitive.ts";
 import { renderTemplate } from "../template.ts";
+import { codexExtractionFormat } from "./format.ts";
 
 export interface V1Output {
   raw_memory: string;
@@ -66,6 +67,7 @@ export function parseV1Output(response: string, maxBytes: number): V1ParseResult
 export function extractionPromptHash(system: string, template: string, version: "v1" | "v2"): string {
   return digest(system + "\n" + template + "\n" + JSON.stringify({
     version, schemaVersion: 1, rendererVersion: 2, evidenceSelectionVersion: 2,
+    codexStructuredOutput: codexExtractionFormat(version),
     contextByteRatio: 0.7, contextOverhead: 1_024,
   }));
 }

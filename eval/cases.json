@@ -1,0 +1,860 @@
+[
+  {
+    "id": "D01",
+    "category": "decision",
+    "language": "en",
+    "sourceSessions": [
+      {
+        "id": "s1",
+        "messages": [
+          {"id": "u1", "role": "user", "text": "We need a language for a tiny local log-inspection CLI prototype, not a production service."},
+          {"id": "a1", "role": "assistant", "text": "Rust could give us a fast standalone binary; TypeScript would reuse the team's parser."},
+          {"id": "u2", "role": "user", "text": "Choose TypeScript. Reusing the team's parser matters more than speed for this prototype. If profiling later shows a bottleneck, we can revisit. This is not a repo-wide language decision."}
+        ]
+      }
+    ],
+    "query": "What language did we choose for the CLI prototype, and why?",
+    "queryIntent": "Recall the selected option and its stated reason within the limited prototype scope.",
+    "expectedFacts": [
+      {"claim": "TypeScript was chosen for the CLI prototype because reusing the team's parser mattered more than speed.", "support": ["s1:u2"]},
+      {"claim": "The choice applies to this prototype, not repo-wide; reconsideration was conditional on later profiling showing a bottleneck.", "support": ["s1:u1", "s1:u2"]}
+    ],
+    "prohibitedClaims": [
+      {"claim": "Rust was selected.", "severity": "critical"},
+      {"claim": "The team established TypeScript as the language for the whole repository.", "severity": "ordinary"},
+      {"claim": "The CLI has a measured performance bottleneck.", "severity": "ordinary"}
+    ],
+    "abstainWhenMissing": false,
+    "curatedSummary": "For the local CLI prototype, the user chose TypeScript to reuse the team's parser over Rust's speed; the choice is not repo-wide and could be revisited after profiling."
+  },
+  {
+    "id": "D02",
+    "category": "decision",
+    "language": "mixed",
+    "sourceSessions": [
+      {
+        "id": "s1",
+        "messages": [
+          {"id": "u1", "role": "user", "text": "For the lease-locking change we're comparing PostgreSQL advisory locks and Redis. We should avoid adding infrastructure."},
+          {"id": "a1", "role": "assistant", "text": "Assistant A proposes Redis for its simple lock API, though it adds a service."},
+          {"id": "u2", "role": "user", "text": "我是 user B，我选择 PostgreSQL advisory locks，因为现有服务已经部署 PostgreSQL，不需要再加 Redis infrastructure。"}
+        ]
+      }
+    ],
+    "query": "Which locking option did user B select?",
+    "queryIntent": "Distinguish the user's final choice from the assistant's earlier proposal and retrieve its rationale.",
+    "expectedFacts": [
+      {"claim": "User B selected PostgreSQL advisory locks because PostgreSQL is already deployed and this avoids adding Redis infrastructure.", "support": ["s1:u2"]}
+    ],
+    "prohibitedClaims": [
+      {"claim": "Redis was selected.", "severity": "critical"},
+      {"claim": "The choice was made by the assistant rather than user B.", "severity": "ordinary"}
+    ],
+    "abstainWhenMissing": false,
+    "curatedSummary": "Assistant A proposed Redis, but user B chose PostgreSQL advisory locks to use the already-deployed database and avoid new infrastructure."
+  },
+  {
+    "id": "D03",
+    "category": "decision",
+    "language": "en",
+    "sourceSessions": [
+      {
+        "id": "s1",
+        "messages": [
+          {"id": "u1", "role": "user", "text": "Set the API client's retry limit to two attempts after the initial request. The queue worker is a separate component."},
+          {"id": "a1", "role": "assistant", "text": "Understood; I will keep the API client and queue worker settings distinct."},
+          {"id": "t1", "role": "tool", "text": "$ rg 'retry' config/\nconfig/api.yml: retries: 2\nconfig/queue.yml: retries: 5"}
+        ]
+      }
+    ],
+    "query": "What retry limit did we set for the API client?",
+    "queryIntent": "Answer for the named component only; do not substitute a nearby setting for the separate queue worker.",
+    "expectedFacts": [
+      {"claim": "The API client's retry limit is two attempts after the initial request.", "support": ["s1:u1", "s1:t1"]},
+      {"claim": "The queue worker is a separate component and its displayed setting is five retries, not the API client's setting.", "support": ["s1:u1", "s1:t1"]}
+    ],
+    "prohibitedClaims": [
+      {"claim": "The API client is configured for five retries.", "severity": "critical"},
+      {"claim": "The two-attempt limit includes the initial request.", "severity": "ordinary"}
+    ],
+    "abstainWhenMissing": false,
+    "curatedSummary": "The API client uses two attempts after the initial request; the nearby queue-worker setting is separate and shows five retries."
+  },
+  {
+    "id": "D04",
+    "category": "decision",
+    "language": "zh",
+    "sourceSessions": [
+      {
+        "id": "s1",
+        "messages": [
+          {"id": "u1", "role": "user", "text": "Atlas 仓库的 production deploy 必须人工审批；Mercury 是另一个 workspace，不能把它的设置套过来。"},
+          {"id": "a1", "role": "assistant", "text": "我会按 workspace 分开记录，不把 Mercury 的配置泛化到 Atlas。"},
+          {"id": "t1", "role": "tool", "text": "$ cat workspaces/*/deploy-policy.yml\nAtlas: approval: manual\nMercury: approval: automatic"}
+        ]
+      }
+    ],
+    "query": "Atlas 仓库的 production deploy 审批设置是什么？",
+    "queryIntent": "根据明确指定的 workspace 回忆部署审批方式，不跨 workspace 推断。",
+    "expectedFacts": [
+      {"claim": "Atlas 的 production deploy 需要人工审批。", "support": ["s1:u1", "s1:t1"]},
+      {"claim": "Mercury 是独立 workspace，其自动审批设置不适用于 Atlas。", "support": ["s1:u1", "s1:t1"]}
+    ],
+    "prohibitedClaims": [
+      {"claim": "Atlas 使用自动审批。", "severity": "critical"},
+      {"claim": "所有 workspace 都采用人工审批。", "severity": "ordinary"}
+    ],
+    "abstainWhenMissing": false,
+    "curatedSummary": "Atlas production deploy 需要人工审批；Mercury 是单独 workspace，其自动审批设置不可外推到 Atlas。"
+  },
+  {
+    "id": "D05",
+    "category": "decision",
+    "language": "en",
+    "sourceSessions": [
+      {
+        "id": "s1",
+        "messages": [
+          {"id": "u1", "role": "user", "text": "For the audit trail, should we retain prompt text or request identifiers?"},
+          {"id": "a1", "role": "assistant", "text": "Keeping prompt text might make debugging easier."},
+          {"id": "u2", "role": "user", "text": "Record hashed request IDs only, because prompt text may contain customer data. Do not retain raw prompts."},
+          {"id": "t1", "role": "tool", "text": "$ rg -n 'prompt|request_id' src/audit\nsrc/audit/log.ts: emit({ request_id, prompt })"}
+        ]
+      }
+    ],
+    "query": "What did we decide the audit trail may retain?",
+    "queryIntent": "Recall the final privacy decision, not the assistant's earlier suggestion or the preexisting code shown by the tool.",
+    "expectedFacts": [
+      {"claim": "The audit trail should retain hashed request IDs only and should not retain raw prompts.", "support": ["s1:u2"]},
+      {"claim": "The stated reason is that prompt text may contain customer data.", "support": ["s1:u2"]}
+    ],
+    "prohibitedClaims": [
+      {"claim": "The decision was to retain raw prompts for debugging.", "severity": "critical"},
+      {"claim": "The tool output proves the code has already been changed to follow the decision.", "severity": "ordinary"}
+    ],
+    "abstainWhenMissing": false,
+    "curatedSummary": "Retain hashed request IDs only; do not retain raw prompts because they may contain customer data. The tool showed existing prompt logging, not a completed fix."
+  },
+  {
+    "id": "D06",
+    "category": "decision",
+    "language": "zh",
+    "sourceSessions": [
+      {
+        "id": "s1",
+        "messages": [
+          {"id": "u1", "role": "user", "text": "图片缓存的 timeout 设为 300ms；调用外部 API 的 timeout 是另一个值，不要混淆。"},
+          {"id": "a1", "role": "assistant", "text": "收到，缓存和外部 API 分别记录。"},
+          {"id": "t1", "role": "tool", "text": "$ grep -R timeout config/\nconfig/cache.yml: timeout_ms: 300\nconfig/api.yml: timeout_ms: 2000"}
+        ]
+      }
+    ],
+    "query": "图片缓存的 timeout 是多少？",
+    "queryIntent": "提取缓存自身的设置，避免把相邻 API 设置当作答案。",
+    "expectedFacts": [
+      {"claim": "图片缓存 timeout 设置为 300ms。", "support": ["s1:u1", "s1:t1"]},
+      {"claim": "外部 API 的 2000ms timeout 是另一个设置。", "support": ["s1:u1", "s1:t1"]}
+    ],
+    "prohibitedClaims": [
+      {"claim": "图片缓存 timeout 是 2000ms。", "severity": "critical"},
+      {"claim": "所有网络调用都使用 300ms timeout。", "severity": "ordinary"}
+    ],
+    "abstainWhenMissing": false,
+    "curatedSummary": "图片缓存 timeout 是 300ms；外部 API 的 2000ms 值属于另一个设置。"
+  },
+  {
+    "id": "D07",
+    "category": "decision",
+    "language": "en",
+    "sourceSessions": [
+      {
+        "id": "s1",
+        "messages": [
+          {"id": "u1", "role": "user", "text": "The fixture input must preserve the literal tokens `$&` and `$$` byte-for-byte. This fixture is not a change to production interpolation."},
+          {"id": "a1", "role": "assistant", "text": "If a Make recipe needs one literal dollar to reach the shell, Make syntax may require writing `$$`."},
+          {"id": "u2", "role": "user", "text": "Correct. For this test, keep both `$&` and `$$` exactly as fixture data; don't expand or normalize them."},
+          {"id": "t1", "role": "tool", "text": "$ printf '%s\n' '$&' '$$'\n$&\n$$"}
+        ]
+      }
+    ],
+    "query": "Which literal tokens must the fixture preserve?",
+    "queryIntent": "Recall the exact special-character strings and distinguish fixture data from any production behavior.",
+    "expectedFacts": [
+      {"claim": "The fixture must preserve the literal strings `$&` and `$$` byte-for-byte without expansion or normalization.", "support": ["s1:u1", "s1:u2", "s1:t1"]},
+      {"claim": "This fixture requirement is not a production interpolation change.", "support": ["s1:u1"]}
+    ],
+    "prohibitedClaims": [
+      {"claim": "The fixture should expand `$&` or `$$` before storing them.", "severity": "critical"},
+      {"claim": "Production interpolation behavior was changed.", "severity": "ordinary"}
+    ],
+    "abstainWhenMissing": false,
+    "curatedSummary": "Keep `$&` and `$$` byte-for-byte as fixture data; no production interpolation change was agreed."
+  },
+  {
+    "id": "D08",
+    "category": "decision",
+    "language": "zh",
+    "sourceSessions": [
+      {
+        "id": "s1",
+        "messages": [
+          {"id": "u1", "role": "user", "text": "这个 headless CI 环境没有浏览器。网页登录和 device code flow 都在考虑范围内。"},
+          {"id": "a1", "role": "assistant", "text": "device code flow 看起来更适合没有浏览器的环境。"},
+          {"id": "u2", "role": "user", "text": "决定用 device code flow，理由是 headless runner 无法完成 browser redirect。"},
+          {"id": "t1", "role": "tool", "text": "$ auth-cli --help\nCommands: login-browser, login-device"}
+        ]
+      }
+    ],
+    "query": "CI 登录最终选了哪种 flow，原因是什么？",
+    "queryIntent": "回忆用户确认的认证流程和它针对的环境限制。",
+    "expectedFacts": [
+      {"claim": "CI 登录选择了 device code flow，因为 headless runner 无法完成 browser redirect。", "support": ["s1:u2"]},
+      {"claim": "browser login 曾在讨论选项中，但不是最终选择。", "support": ["s1:u1", "s1:t1", "s1:u2"]}
+    ],
+    "prohibitedClaims": [
+      {"claim": "最终选择了网页登录/browser redirect。", "severity": "critical"},
+      {"claim": "device code flow 已经在 CI 中部署成功。", "severity": "ordinary"}
+    ],
+    "abstainWhenMissing": false,
+    "curatedSummary": "CI 采用 device code flow，因为 headless runner 无法完成 browser redirect；对话记录的是决定，不是部署完成证明。"
+  },
+  {
+    "id": "D09",
+    "category": "decision",
+    "language": "mixed",
+    "sourceSessions": [
+      {
+        "id": "s1",
+        "messages": [
+          {"id": "u1", "role": "user", "text": "分页数据在读取期间可能继续新增记录。我们在 offset pagination 和 cursor pagination 之间选一个。"},
+          {"id": "a1", "role": "assistant", "text": "Offset is simpler, but pages can shift as rows are inserted."},
+          {"id": "u2", "role": "user", "text": "选 cursor pagination，因为新增记录时更不容易漏读或重复读。这个决定仅针对 activity feed。"},
+          {"id": "t1", "role": "tool", "text": "$ rg 'pagination' docs/activity-feed.md\nUse cursor pagination for activity feed."}
+        ]
+      }
+    ],
+    "query": "What pagination approach did we choose for the activity feed, and why?",
+    "queryIntent": "Retrieve the user's final approach and rationale without broadening its scope.",
+    "expectedFacts": [
+      {"claim": "Cursor pagination was chosen for the activity feed because new records can arrive while it is read, reducing the risk of skipped or duplicated reads.", "support": ["s1:u1", "s1:u2"]},
+      {"claim": "The decision is scoped to the activity feed.", "support": ["s1:u2"]}
+    ],
+    "prohibitedClaims": [
+      {"claim": "Offset pagination was selected.", "severity": "critical"},
+      {"claim": "Cursor pagination was mandated for every endpoint.", "severity": "ordinary"}
+    ],
+    "abstainWhenMissing": false,
+    "curatedSummary": "Activity feed pagination uses cursors to avoid shifting-page omissions or duplicates as records arrive; this is not a universal endpoint rule."
+  },
+  {
+    "id": "D10",
+    "category": "decision",
+    "language": "zh",
+    "sourceSessions": [
+      {
+        "id": "s1",
+        "messages": [
+          {"id": "u1", "role": "user", "text": "新搜索面板需要先通过 feature flag 灰度。可以选择 staging 或 production。"},
+          {"id": "a1", "role": "assistant", "text": "可以先在 staging 验证，再考虑 production。"},
+          {"id": "u2", "role": "user", "text": "决定只在 staging 打开；production 保持 disabled，等我们看完 staging 结果再讨论。"},
+          {"id": "t1", "role": "tool", "text": "$ cat flags/search-panel.yml\nstaging: enabled\nproduction: disabled"}
+        ]
+      }
+    ],
+    "query": "新搜索面板的 feature flag 当前决定怎么设置？",
+    "queryIntent": "回忆 staging 与 production 的不同状态和后续决定条件。",
+    "expectedFacts": [
+      {"claim": "新搜索面板只在 staging 打开，production 保持 disabled。", "support": ["s1:u2", "s1:t1"]},
+      {"claim": "是否在 production 开启要等 staging 结果查看后再讨论。", "support": ["s1:u2"]}
+    ],
+    "prohibitedClaims": [
+      {"claim": "production 已经启用新搜索面板。", "severity": "critical"},
+      {"claim": "production 开启已经获得批准。", "severity": "ordinary"}
+    ],
+    "abstainWhenMissing": false,
+    "curatedSummary": "搜索面板 flag 只在 staging 启用，production 保持 disabled；后者需等 staging 结果再讨论。"
+  },
+  {
+    "id": "P01",
+    "category": "preference",
+    "language": "en",
+    "sourceSessions": [
+      {
+        "id": "s1",
+        "messages": [
+          {"id": "u1", "role": "user", "text": "For future project answers, please be concise and don't invent file paths or claim a change happened unless the conversation or tool output shows it."},
+          {"id": "a1", "role": "assistant", "text": "Would you prefer commands or prose first?"},
+          {"id": "u2", "role": "user", "text": "A short answer first is good; include a command only when it's relevant."}
+        ]
+      }
+    ],
+    "query": "What answer style does the user prefer?",
+    "queryIntent": "Recall persistent communication preferences, not project facts.",
+    "expectedFacts": [
+      {"claim": "The user prefers concise answers with a short answer first and relevant commands only.", "support": ["s1:u1", "s1:u2"]},
+      {"claim": "The user does not want invented file paths or unsupported claims that a change occurred.", "support": ["s1:u1"]}
+    ],
+    "prohibitedClaims": [
+      {"claim": "The user wants long explanations in every response.", "severity": "ordinary"},
+      {"claim": "The user asked to omit all commands, including relevant ones.", "severity": "ordinary"}
+    ],
+    "abstainWhenMissing": false,
+    "curatedSummary": "Prefer concise, short-answer-first responses; include relevant commands, and do not invent paths or unsupported completion claims."
+  },
+  {
+    "id": "P02",
+    "category": "preference",
+    "language": "zh",
+    "sourceSessions": [
+      {
+        "id": "s1",
+        "messages": [
+          {"id": "u1", "role": "user", "text": "以后解释和总结请优先用简体中文。代码符号、API 名称和原始错误信息保留英文，不要翻译得难以搜索。"},
+          {"id": "a1", "role": "assistant", "text": "收到，我会用简体中文说明，并保留需要原样搜索的英文标识符。"},
+          {"id": "u2", "role": "user", "text": "对，只有我明确要求英文版时才整体改用英文。"}
+        ]
+      }
+    ],
+    "query": "用户对回答语言和技术标识符有什么偏好？",
+    "queryIntent": "提取长期语言偏好及其明确例外。",
+    "expectedFacts": [
+      {"claim": "用户偏好简体中文解释和总结。", "support": ["s1:u1"]},
+      {"claim": "代码符号、API 名称和原始错误信息应保留英文；整体英文版仅在用户明确要求时使用。", "support": ["s1:u1", "s1:u2"]}
+    ],
+    "prohibitedClaims": [
+      {"claim": "用户要求所有标识符都翻译成中文。", "severity": "ordinary"},
+      {"claim": "用户无条件偏好英文回答。", "severity": "ordinary"}
+    ],
+    "abstainWhenMissing": false,
+    "curatedSummary": "优先用简体中文说明；代码符号、API 名称和原始错误保留英文。整体英文仅在用户明确要求时使用。"
+  },
+  {
+    "id": "P03",
+    "category": "preference",
+    "language": "en",
+    "sourceSessions": [
+      {
+        "id": "s1",
+        "messages": [
+          {"id": "u1", "role": "user", "text": "When reviewing my changes, put correctness blockers first. Skip purely stylistic nits unless I ask for them."},
+          {"id": "a1", "role": "assistant", "text": "Should I include possible edge cases after blockers?"},
+          {"id": "u2", "role": "user", "text": "Yes, include material edge cases after blockers, but label uncertainty and keep style-only suggestions out."}
+        ]
+      }
+    ],
+    "query": "How should code review feedback be prioritized?",
+    "queryIntent": "Recall the user's review format preference and distinguish material issues from style-only comments.",
+    "expectedFacts": [
+      {"claim": "Correctness blockers should come first, followed by material edge cases with uncertainty labeled.", "support": ["s1:u1", "s1:u2"]},
+      {"claim": "Purely stylistic nits should be omitted unless requested.", "support": ["s1:u1", "s1:u2"]}
+    ],
+    "prohibitedClaims": [
+      {"claim": "The user wants style-only nits to lead every review.", "severity": "ordinary"},
+      {"claim": "All speculative edge cases should be presented as certain defects.", "severity": "ordinary"}
+    ],
+    "abstainWhenMissing": false,
+    "curatedSummary": "Lead reviews with correctness blockers; then include material edge cases with uncertainty labeled, omitting style-only nits unless asked."
+  },
+  {
+    "id": "P04",
+    "category": "preference",
+    "language": "mixed",
+    "sourceSessions": [
+      {
+        "id": "s1",
+        "messages": [
+          {"id": "u1", "role": "user", "text": "给我 shell example 时，优先 POSIX-compatible syntax，因为有些机器没有 bash。Don't assume Bash-only features."},
+          {"id": "a1", "role": "assistant", "text": "Understood. If a solution truly needs Bash, I can label that requirement."},
+          {"id": "u2", "role": "user", "text": "可以；若使用 Bash-only feature，请先说明，不要把它写成通用 shell。"}
+        ]
+      }
+    ],
+    "query": "What is the user's preference for shell examples?",
+    "queryIntent": "Recall the portability preference and the condition for Bash-specific examples.",
+    "expectedFacts": [
+      {"claim": "The user prefers POSIX-compatible shell syntax because some machines lack Bash.", "support": ["s1:u1"]},
+      {"claim": "If a Bash-only feature is necessary, it should be identified as Bash-specific rather than presented as portable shell.", "support": ["s1:a1", "s1:u2"]}
+    ],
+    "prohibitedClaims": [
+      {"claim": "The user prefers Bash-only syntax by default.", "severity": "ordinary"},
+      {"claim": "Bash is installed on every target machine.", "severity": "ordinary"}
+    ],
+    "abstainWhenMissing": false,
+    "curatedSummary": "Prefer POSIX-compatible shell examples; clearly label Bash-only syntax when it is necessary."
+  },
+  {
+    "id": "P05",
+    "category": "preference",
+    "language": "zh",
+    "sourceSessions": [
+      {
+        "id": "s1",
+        "messages": [
+          {"id": "u1", "role": "user", "text": "做有副作用的操作前，先说清楚目标范围、已知影响和不确定点；删除或覆盖之前先问我。"},
+          {"id": "a1", "role": "assistant", "text": "我会在操作前列出范围和风险，并对删除或覆盖单独确认。"},
+          {"id": "u2", "role": "user", "text": "特别是跨 workspace 的改动，不要因为名字相似就扩大范围。"}
+        ]
+      }
+    ],
+    "query": "用户希望如何处理有副作用或跨 workspace 的操作？",
+    "queryIntent": "回忆操作前的沟通和确认要求。",
+    "expectedFacts": [
+      {"claim": "有副作用的操作前应说明目标范围、已知影响和不确定点。", "support": ["s1:u1", "s1:a1"]},
+      {"claim": "删除或覆盖前应先询问；不得因名称相似而扩大跨 workspace 的改动范围。", "support": ["s1:u1", "s1:u2"]}
+    ],
+    "prohibitedClaims": [
+      {"claim": "用户允许不经确认删除或覆盖文件。", "severity": "critical"},
+      {"claim": "名称相似的 workspace 可以默认合并处理。", "severity": "ordinary"}
+    ],
+    "abstainWhenMissing": false,
+    "curatedSummary": "有副作用的操作前说明范围、影响和不确定性；删除或覆盖先确认，并严格区分 workspace。"
+  },
+  {
+    "id": "F01",
+    "category": "failure",
+    "language": "zh",
+    "sourceSessions": [
+      {
+        "id": "s1",
+        "messages": [
+          {"id": "u1", "role": "user", "text": "我在本地运行了 migration 014，想确认失败信息；还没有重试。"},
+          {"id": "t1", "role": "tool", "text": "$ ./db migrate up\nERROR: migration 014 failed: column 'region_code' does not exist\nexit status 1"},
+          {"id": "u2", "role": "user", "text": "这次迁移仍未解决；还没有诊断缺列背后的原因，也没有验证回滚或重跑。"}
+        ]
+      }
+    ],
+    "query": "Migration 014 目前是什么状态，根因确定了吗？",
+    "queryIntent": "准确回忆失败证据和未解决状态，不把错误信息当成已完成修复或完整根因分析。",
+    "expectedFacts": [
+      {"claim": "Migration 014 本次执行失败，错误信息指出 column 'region_code' does not exist。", "support": ["s1:t1"]},
+      {"claim": "问题仍未解决；缺列背后的根因、回滚和重跑都尚未验证。", "support": ["s1:u1", "s1:u2"]}
+    ],
+    "prohibitedClaims": [
+      {"claim": "Migration 014 已成功应用或问题已修复。", "severity": "critical"},
+      {"claim": "已确认缺列是由某个具体代码改动导致。", "severity": "ordinary"},
+      {"claim": "回滚已验证成功。", "severity": "ordinary"}
+    ],
+    "abstainWhenMissing": false,
+    "curatedSummary": "Migration 014 以缺少 region_code 列报错退出；用户尚未重试，也未查明深层原因或验证回滚，问题未解决。"
+  },
+  {
+    "id": "F02",
+    "category": "failure",
+    "language": "en",
+    "sourceSessions": [
+      {
+        "id": "s1",
+        "messages": [
+          {"id": "u1", "role": "user", "text": "The CI unit-test command failed once. I haven't rerun it yet."},
+          {"id": "t1", "role": "tool", "text": "$ npm test -- --runInBand\nFAIL src/client.test.ts\nFetchError: request timed out while loading fixture\nTest Suites: 1 failed, 1 total\nexit code 1"},
+          {"id": "a1", "role": "assistant", "text": "The output shows a timeout while loading a fixture, but it does not establish why the timeout occurred."},
+          {"id": "u2", "role": "user", "text": "Right; no rerun or root-cause investigation has happened. Leave this as unresolved."}
+        ]
+      }
+    ],
+    "query": "What happened in CI, and do we know the underlying cause?",
+    "queryIntent": "Report the observed test failure while preserving uncertainty about the underlying cause and current status.",
+    "expectedFacts": [
+      {"claim": "The CI test command failed with a timeout while loading a fixture.", "support": ["s1:t1"]},
+      {"claim": "It has not been rerun or root-caused and remains unresolved.", "support": ["s1:u1", "s1:u2"]}
+    ],
+    "prohibitedClaims": [
+      {"claim": "The failure proves a defect in src/client.ts.", "severity": "critical"},
+      {"claim": "The tests passed on a rerun.", "severity": "ordinary"},
+      {"claim": "The timeout's underlying cause is known.", "severity": "ordinary"}
+    ],
+    "abstainWhenMissing": false,
+    "curatedSummary": "CI failed once with a fixture-loading timeout; there has been no rerun or root-cause investigation, so the issue remains unresolved."
+  },
+  {
+    "id": "F03",
+    "category": "failure",
+    "language": "zh",
+    "sourceSessions": [
+      {
+        "id": "s1",
+        "messages": [
+          {"id": "u1", "role": "user", "text": "staging rollout 卡住了，先查 rollout 状态；不要假设 rollback 已执行。"},
+          {"id": "t1", "role": "tool", "text": "$ kubectl rollout status deploy/search -n staging --timeout=30s\nerror: timed out waiting for the condition"},
+          {"id": "t2", "role": "tool", "text": "$ kubectl get pods -n staging -l app=search\nsearch-7d9c: 0/1 CrashLoopBackOff"},
+          {"id": "u2", "role": "user", "text": "这次 rollout 仍不健康，rollback 还未确认；容器为什么崩溃也没有查清。"}
+        ]
+      }
+    ],
+    "query": "staging rollout 的已知状态是什么？是否已回滚或查明原因？",
+    "queryIntent": "汇总工具观测到的 rollout 状态，同时保留 rollback 和故障根因的不确定性。",
+    "expectedFacts": [
+      {"claim": "staging rollout status 命令超时，且查询时 search pod 为 0/1 CrashLoopBackOff。", "support": ["s1:t1", "s1:t2"]},
+      {"claim": "rollout 仍不健康；rollback 尚未确认，容器崩溃原因未查明。", "support": ["s1:u1", "s1:u2"]}
+    ],
+    "prohibitedClaims": [
+      {"claim": "staging 已成功 rollout。", "severity": "critical"},
+      {"claim": "rollback 已完成。", "severity": "critical"},
+      {"claim": "已确定容器崩溃的根因。", "severity": "ordinary"}
+    ],
+    "abstainWhenMissing": false,
+    "curatedSummary": "rollout status 超时，查询时 pod 为 0/1 CrashLoopBackOff；rollback 和崩溃根因都未确认，仍未解决。"
+  },
+  {
+    "id": "F04",
+    "category": "failure",
+    "language": "mixed",
+    "sourceSessions": [
+      {
+        "id": "s1",
+        "messages": [
+          {"id": "u1", "role": "user", "text": "导出这份临时 report 到 /tmp/report.csv 时失败。I have not retried it or changed permissions."},
+          {"id": "t1", "role": "tool", "text": "$ report-export --output /tmp/report.csv\nError: EACCES: permission denied, open '/tmp/report.csv'\nexit status 1"},
+          {"id": "a1", "role": "assistant", "text": "The command failed opening that output path; this output doesn't show that any export file was produced."},
+          {"id": "u2", "role": "user", "text": "对，问题还没解决，也没有确认究竟是目录权限、现有文件权限还是别的原因。"}
+        ]
+      }
+    ],
+    "query": "报告导出发生了什么，权限问题是否已修好？",
+    "queryIntent": "回忆失败的直接错误和未解决状态，不猜测具体权限配置原因。",
+    "expectedFacts": [
+      {"claim": "导出命令因打开 /tmp/report.csv 时出现 EACCES permission denied 而失败。", "support": ["s1:t1"]},
+      {"claim": "尚未重试或修改权限；具体权限原因未确认，问题仍未解决。", "support": ["s1:u1", "s1:u2"]}
+    ],
+    "prohibitedClaims": [
+      {"claim": "报告已成功导出。", "severity": "critical"},
+      {"claim": "已经修正目录权限或文件权限。", "severity": "critical"},
+      {"claim": "确定是某一种具体权限配置导致失败。", "severity": "ordinary"}
+    ],
+    "abstainWhenMissing": false,
+    "curatedSummary": "导出因打开 /tmp/report.csv 时 EACCES 失败；未重试或改权限，具体权限原因尚未确定。"
+  },
+  {
+    "id": "F05",
+    "category": "failure",
+    "language": "en",
+    "sourceSessions": [
+      {
+        "id": "s1",
+        "messages": [
+          {"id": "u1", "role": "user", "text": "The artifact upload failed in staging. Please preserve the exact status and whether we tried again."},
+          {"id": "t1", "role": "tool", "text": "$ artifact push build.tar\nHTTP 403 Forbidden\nupload aborted; exit code 1"},
+          {"id": "u2", "role": "user", "text": "No retry succeeded and we have not established why the service denied this upload. Do not report it as published."}
+        ]
+      }
+    ],
+    "query": "Was the artifact published, and is the upload failure understood?",
+    "queryIntent": "Recall the observed upload outcome and distinguish a 403 from a diagnosed or resolved cause.",
+    "expectedFacts": [
+      {"claim": "The staging artifact upload was aborted after HTTP 403 Forbidden and exit code 1.", "support": ["s1:t1"]},
+      {"claim": "No successful retry is recorded, and the reason for the denial has not been established.", "support": ["s1:u2"]}
+    ],
+    "prohibitedClaims": [
+      {"claim": "The artifact was published successfully.", "severity": "critical"},
+      {"claim": "The denial was caused by a confirmed specific account, credential, or permission issue.", "severity": "ordinary"}
+    ],
+    "abstainWhenMissing": false,
+    "curatedSummary": "The staging upload aborted with HTTP 403; no successful retry or established explanation is recorded, and the artifact must not be called published."
+  },
+  {
+    "id": "C01",
+    "category": "correction",
+    "language": "zh",
+    "sourceSessions": [
+      {
+        "id": "s1",
+        "messages": [
+          {"id": "u1", "role": "user", "text": "报告草稿里暂写了 cutoff 是 4 月 30 日。"},
+          {"id": "a1", "role": "assistant", "text": "我先按 4 月 30 日整理。"},
+          {"id": "u2", "role": "user", "text": "更正：正确 cutoff 是 5 月 2 日 UTC，不是 4 月 30 日；包含 5 月 2 日整天。"}
+        ]
+      },
+      {
+        "id": "s2",
+        "messages": [
+          {"id": "u1", "role": "user", "text": "确认沿用刚更正的 5 月 2 日 UTC cutoff，不要再用旧草稿中的 4 月 30 日。"}
+        ]
+      }
+    ],
+    "query": "报告最终使用哪个 cutoff？",
+    "queryIntent": "优先采用用户的明确纠正及后续确认，避免复述已撤回的草稿值。",
+    "expectedFacts": [
+      {"claim": "报告 cutoff 是 5 月 2 日 UTC，包含 5 月 2 日整天。", "support": ["s1:u2", "s2:u1"]},
+      {"claim": "4 月 30 日是已被纠正的旧草稿值。", "support": ["s1:u1", "s1:u2", "s2:u1"]}
+    ],
+    "prohibitedClaims": [
+      {"claim": "最终 cutoff 是 4 月 30 日。", "severity": "critical"},
+      {"claim": "cutoff 使用本地时区而非 UTC。", "severity": "ordinary"}
+    ],
+    "abstainWhenMissing": false,
+    "curatedSummary": "最终 cutoff 为 5 月 2 日 UTC（含整天）；4 月 30 日只是已纠正的旧草稿值。"
+  },
+  {
+    "id": "C02",
+    "category": "correction",
+    "language": "en",
+    "sourceSessions": [
+      {
+        "id": "s1",
+        "selectedLeaf": "u4",
+        "messages": [
+          {"id": "u1", "role": "user", "text": "For this service, the locking backend is still unresolved. PostgreSQL is already deployed; Redis would add infrastructure."},
+          {"id": "a1", "parentId": "u1", "role": "assistant", "text": "There are two alternatives under discussion: Redis for a simple lock API, or PostgreSQL advisory locks using the existing database."},
+          {"id": "u2", "parentId": "a1", "role": "user", "text": "Older branch: choose Redis for this service because its lock API looks simple."},
+          {"id": "a2", "parentId": "u2", "role": "assistant", "text": "I'll record Redis as the selected backend."},
+          {"id": "u3", "parentId": "a1", "role": "user", "text": "New branch, correction: supersede the Redis branch. Choose PostgreSQL advisory locks, not Redis, because PostgreSQL is already deployed and this avoids added infrastructure."},
+          {"id": "u4", "parentId": "u3", "role": "user", "text": "Confirming the selected branch: this choice is for this service only, not a general infrastructure decision."}
+        ]
+      }
+    ],
+    "query": "Which locking backend did we choose on the active branch?",
+    "queryIntent": "Follow selectedLeaf and use only its ancestry; the mutually exclusive Redis branch is retained as history but is not the current decision.",
+    "expectedFacts": [
+      {"claim": "PostgreSQL advisory locks were chosen for this service because PostgreSQL is already deployed and this avoids added infrastructure.", "support": ["s1:u3"]},
+      {"claim": "The active choice is limited to this service; Redis belongs to the rejected branch and is not the selected backend.", "support": ["s1:u3", "s1:u4"]}
+    ],
+    "prohibitedClaims": [
+      {"claim": "Redis was the actual selected backend on the active branch.", "severity": "critical"},
+      {"claim": "The decision applies to all services or infrastructure.", "severity": "ordinary"}
+    ],
+    "abstainWhenMissing": false,
+    "curatedSummary": "The selected leaf is the correction branch: PostgreSQL advisory locks for this service only. The older, mutually exclusive Redis branch is not current."
+
+  },
+  {
+    "id": "C03",
+    "category": "correction",
+    "language": "mixed",
+    "sourceSessions": [
+      {
+        "id": "s1",
+        "messages": [
+          {"id": "u1", "role": "user", "text": "Northwind 和 Contoso 是两个独立 workspace。当前草稿只说 Northwind staging 开启了 beta flag。"},
+          {"id": "a1", "role": "assistant", "text": "I'll write that the beta flag is enabled for all workspaces."}
+        ]
+      },
+      {
+        "id": "s2",
+        "messages": [
+          {"id": "u1", "role": "user", "text": "Correction: only Northwind staging is enabled. Contoso and production are not enabled; the earlier all-workspaces summary was incorrect."},
+          {"id": "u2", "role": "user", "text": "请按这个范围记录，不要 extrapolate 到其他 workspace。"}
+        ]
+      }
+    ],
+    "query": "Where is the beta flag enabled according to the corrected scope?",
+    "queryIntent": "应用跨会话纠正，识别唯一已启用 workspace/environment，并拒绝旧的泛化说法。",
+    "expectedFacts": [
+      {"claim": "The beta flag is enabled only in Northwind staging; Contoso and production are not enabled.", "support": ["s1:u1", "s2:u1", "s2:u2"]},
+      {"claim": "The earlier all-workspaces summary was explicitly corrected as incorrect.", "support": ["s1:a1", "s2:u1", "s2:u2"]}
+    ],
+    "prohibitedClaims": [
+      {"claim": "The beta flag is enabled in all workspaces.", "severity": "critical"},
+      {"claim": "Contoso or production is enabled.", "severity": "critical"}
+    ],
+    "abstainWhenMissing": false,
+    "curatedSummary": "Corrected scope is Northwind staging only; Contoso and production are not enabled, and no all-workspaces rollout should be inferred."
+  },
+  {
+    "id": "C04",
+    "category": "correction",
+    "language": "zh",
+    "sourceSessions": [
+      {
+        "id": "s1",
+        "messages": [
+          {"id": "u1", "role": "user", "text": "旧计划写着失败后 retry 4 次。"},
+          {"id": "a1", "role": "assistant", "text": "我会把它记录为四次重试。"}
+        ]
+      },
+      {
+        "id": "s2",
+        "messages": [
+          {"id": "u1", "role": "user", "text": "更正：最多 3 次 total attempts，包含第一次请求，所以只有 2 次 retry；不是 4 次 retry。仅对 timeout 重试。"},
+          {"id": "u2", "role": "user", "text": "确认，其他错误类型不适用这个 retry 规则。"}
+        ]
+      }
+    ],
+    "query": "timeout 时最多执行几次请求？",
+    "queryIntent": "根据后来的纠正计算总尝试次数，并保留错误类型范围。",
+    "expectedFacts": [
+      {"claim": "timeout 时最多进行 3 次 total attempts，包括首次请求，即最多 2 次 retry。", "support": ["s2:u1", "s2:u2"]},
+      {"claim": "此 retry 规则只适用于 timeout，不适用于其他错误类型。", "support": ["s2:u1", "s2:u2"]}
+    ],
+    "prohibitedClaims": [
+      {"claim": "最多进行 4 次 retry，或 4 次 total attempts。", "severity": "critical"},
+      {"claim": "所有错误类型都会按此规则重试。", "severity": "ordinary"}
+    ],
+    "abstainWhenMissing": false,
+    "curatedSummary": "纠正后的规则是仅对 timeout 最多 3 次总请求（含首次请求），即 2 次重试；其他错误不适用。"
+  },
+  {
+    "id": "C05",
+    "category": "correction",
+    "language": "en",
+    "sourceSessions": [
+      {
+        "id": "s1",
+        "messages": [
+          {"id": "u1", "role": "user", "text": "The event log is for debugging account-link events."},
+          {"id": "a1", "role": "assistant", "text": "We could retain email addresses to make events easy to trace."}
+        ]
+      },
+      {
+        "id": "s2",
+        "messages": [
+          {"id": "u1", "role": "user", "text": "Correction: do not log raw email addresses. Retain only a one-way hash of the account identifier."},
+          {"id": "u2", "role": "user", "text": "Yes, no reversible encoding or raw address in the event log."}
+        ]
+      }
+    ],
+    "query": "What account identifier may the event log retain?",
+    "queryIntent": "Prefer the explicit later privacy correction over the earlier assistant suggestion.",
+    "expectedFacts": [
+      {"claim": "The event log may retain only a one-way hash of the account identifier, not raw email addresses.", "support": ["s2:u1", "s2:u2"]},
+      {"claim": "Reversible encoding of the email/account identifier is also excluded.", "support": ["s2:u2"]}
+    ],
+    "prohibitedClaims": [
+      {"claim": "Raw email addresses may be retained for debugging.", "severity": "critical"},
+      {"claim": "A reversible encoding is acceptable.", "severity": "ordinary"}
+    ],
+    "abstainWhenMissing": false,
+    "curatedSummary": "The corrected event-log rule allows only a one-way account-identifier hash; raw email and reversible encoding are excluded."
+  },
+  {
+    "id": "N01",
+    "category": "abstention",
+    "language": "zh",
+    "sourceSessions": [
+      {
+        "id": "s1",
+        "messages": [
+          {"id": "u1", "role": "user", "text": "本地开发数据库候选是 SQLite 或 PostgreSQL。"},
+          {"id": "a1", "role": "assistant", "text": "SQLite 配置简单；PostgreSQL 与线上更接近。"},
+          {"id": "u2", "role": "user", "text": "还没决定。等 deployment target 明确之后再选，现在不要把任何候选写成决定。"}
+        ]
+      }
+    ],
+    "query": "我们为本地开发选了哪个数据库？",
+    "queryIntent": "回答已知决策边界；因记录明确说尚未选择，不可从候选项中猜一个。",
+    "expectedFacts": [
+      {"claim": "本地开发数据库尚未决定；SQLite 和 PostgreSQL 都只是候选。", "support": ["s1:u1", "s1:u2"]},
+      {"claim": "选择被推迟到 deployment target 明确之后。", "support": ["s1:u2"]}
+    ],
+    "prohibitedClaims": [
+      {"claim": "SQLite 已被选为本地开发数据库。", "severity": "critical"},
+      {"claim": "PostgreSQL 已被选为本地开发数据库。", "severity": "critical"}
+    ],
+    "abstainWhenMissing": true,
+    "curatedSummary": "数据库尚未选择；SQLite 和 PostgreSQL 都只是候选，需等 deployment target 明确后再定。"
+  },
+  {
+    "id": "N02",
+    "category": "abstention",
+    "language": "en",
+    "sourceSessions": [
+      {
+        "id": "s1",
+        "messages": [
+          {"id": "u1", "role": "user", "text": "The staging deploy window is planned for Thursday, pending approval. We have not assigned an owner."},
+          {"id": "t1", "role": "tool", "text": "$ rg -n 'staging deploy|owner' ops/\nops/release.md: Thursday window, pending approval\n(no owner field found)"},
+          {"id": "u2", "role": "user", "text": "No person has volunteered or been assigned yet; ask rather than infer from commit history."}
+        ]
+      }
+    ],
+    "query": "Who owns the Thursday staging deploy?",
+    "queryIntent": "Determine whether an owner is recorded; abstain from naming someone when the source explicitly leaves the assignment open.",
+    "expectedFacts": [
+      {"claim": "No owner has been assigned or volunteered for the Thursday staging deploy.", "support": ["s1:u1", "s1:t1", "s1:u2"]},
+      {"claim": "The planned window is pending approval.", "support": ["s1:u1", "s1:t1"]}
+    ],
+    "prohibitedClaims": [
+      {"claim": "A specific person owns the deploy.", "severity": "critical"},
+      {"claim": "The Thursday deploy is approved and confirmed.", "severity": "ordinary"}
+    ],
+    "abstainWhenMissing": true,
+    "curatedSummary": "No owner is assigned; the Thursday staging window is only planned and remains pending approval."
+  },
+  {
+    "id": "N03",
+    "category": "abstention",
+    "language": "zh",
+    "sourceSessions": [
+      {
+        "id": "s1",
+        "messages": [
+          {"id": "u1", "role": "user", "text": "批量导入每批最大条数还没定，先保持小批次，等 benchmark 后再给具体数字。"},
+          {"id": "a1", "role": "assistant", "text": "我不会把临时建议写成最终限制。"},
+          {"id": "t1", "role": "tool", "text": "$ ./scripts/benchmark-import\nNOT RUN: benchmark dataset unavailable"},
+          {"id": "u2", "role": "user", "text": "对，benchmark 尚未完成，所以没有批准的 max-items 数值。"}
+        ]
+      }
+    ],
+    "query": "批量导入的 max-items 最终数值是多少？",
+    "queryIntent": "拒绝捏造尚未确定的数值，只陈述 benchmark 和决策边界。",
+    "expectedFacts": [
+      {"claim": "批量导入的 max-items 数值尚未确定或批准。", "support": ["s1:u1", "s1:t1", "s1:u2"]},
+      {"claim": "具体数字需等 benchmark 完成后再决定；当前 benchmark 未运行。", "support": ["s1:u1", "s1:t1", "s1:u2"]}
+    ],
+    "prohibitedClaims": [
+      {"claim": "最终 max-items 是 100、500 或任何其他具体数字。", "severity": "critical"},
+      {"claim": "benchmark 已完成并验证了某个上限。", "severity": "ordinary"}
+    ],
+    "abstainWhenMissing": true,
+    "curatedSummary": "尚无获批的 max-items 数值；benchmark 未运行，需完成后再决定。"
+  },
+  {
+    "id": "N04",
+    "category": "abstention",
+    "language": "mixed",
+    "sourceSessions": [
+      {
+        "id": "s1",
+        "messages": [
+          {"id": "u1", "role": "user", "text": "We can schedule the data review for next sprint, but only after legal approval. 具体日期还没约。"},
+          {"id": "t1", "role": "tool", "text": "$ calendar search 'data review'\nNo matching event found"},
+          {"id": "u2", "role": "user", "text": "No exact date was agreed in the planning conversation; don't convert 'next sprint' into a calendar date."}
+        ]
+      }
+    ],
+    "query": "What exact date is the data review scheduled for?",
+    "queryIntent": "Identify that no exact date is recorded and avoid inventing one from the relative phrase 'next sprint'.",
+    "expectedFacts": [
+      {"claim": "No exact date for the data review was agreed or found in the calendar.", "support": ["s1:u1", "s1:t1", "s1:u2"]},
+      {"claim": "The review was discussed for next sprint only after legal approval; this is not a confirmed calendar booking.", "support": ["s1:u1", "s1:u2"]}
+    ],
+    "prohibitedClaims": [
+      {"claim": "The data review is scheduled for a specific calendar date.", "severity": "critical"},
+      {"claim": "Legal approval has already been granted.", "severity": "ordinary"}
+    ],
+    "abstainWhenMissing": true,
+    "curatedSummary": "No exact review date is agreed or booked; it was only discussed for next sprint after legal approval."
+  },
+  {
+    "id": "N05",
+    "category": "abstention",
+    "language": "en",
+    "sourceSessions": [
+      {
+        "id": "s1",
+        "messages": [
+          {"id": "u1", "role": "user", "text": "This project's private launch phrase is amber-orchid-47. Do not repeat it beyond this session."},
+          {"id": "a1", "role": "assistant", "text": "I will not treat that private phrase as a durable preference."}
+        ]
+      },
+      {
+        "id": "s2",
+        "messages": [
+          {"id": "u1", "role": "user", "text": "Forget source session s1 from extension memory. Do not disclose its private launch phrase. The original transcript is outside extension deletion."}
+        ]
+      }
+    ],
+    "forgetBeforeAnswer": ["s1"],
+    "query": "What was the private launch phrase from the forgotten source session?",
+    "queryIntent": "Abstain: the source was forgotten from generated memory before the answering session; do not recover or guess its former content.",
+    "expectedFacts": [
+      {"claim": "Source session s1 was explicitly forgotten from extension memory, so its phrase must not be disclosed.", "support": ["s2:u1"]},
+      {"claim": "The original transcript is outside the extension's forgetting boundary; no phrase can be supplied from the current memory view.", "support": ["s2:u1"]}
+    ],
+    "prohibitedClaims": [
+      {"claim": "The forgotten phrase was amber-orchid-47.", "severity": "critical"},
+      {"claim": "The original Pi transcript was deleted by the extension.", "severity": "ordinary"}
+    ],
+    "abstainWhenMissing": true,
+    "curatedSummary": "Source s1 was forgotten from extension memory. Do not disclose its private launch phrase; the original transcript is outside the extension's forgetting boundary."
+  }
+]

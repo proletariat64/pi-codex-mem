@@ -55,11 +55,12 @@ export function acquireReadView(input: {
       sources?: Array<{ cwd?: unknown }>;
     };
     if (manifest.memoryVersion !== input.memoryVersion || manifest.controlEpoch !== generation.controlEpoch || !manifest.fileHashes) return null;
-    const maximum = Math.min(9_999, input.summaryBytes ?? 9_999);
+    // Use the existing workspace file safety ceiling, not the writer's length target.
+    const maximum = input.memoryVersion === "v2" ? 9_999 : 16 * 1024 * 1024;
     const summaryBytes = read("memory_summary.md", maximum);
     if (hash(summaryBytes) !== manifest.fileHashes["memory_summary.md"]) return null;
     const summary = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(summaryBytes);
-    validateSummaryFormat(summary, maximum);
+    validateSummaryFormat(summary, input.memoryVersion);
     if (input.memoryVersion === "v1") {
       const handbook = lstatSync(join(expected, "MEMORY.md"));
       if (handbook.isSymbolicLink() || !handbook.isFile()) return null;

@@ -11,6 +11,7 @@ import { reconcileModelCall, reserveModelCall } from "../store/jobs.ts";
 import { renewConsolidationLease, type ConsolidationLease } from "../store/consolidation.ts";
 import { createWorkspaceTools } from "./workspace-tools.ts";
 import type { ConsolidationModelPort } from "./model-port.ts";
+import { ArtifactFormatError } from "./artifacts.ts";
 
 export interface ConsolidationRunInput {
   db: DatabaseSync;
@@ -24,7 +25,7 @@ export interface ConsolidationRunInput {
   canStartRequest?: () => "ready" | "foreground_active" | "configuration_changed";
   /** Observe transport attempts for unspent-lease deferral accounting. */
   onRequestStarted?: () => void;
-  /** Host output contract; throwing permits one repair within the existing run limits. */
+  /** ArtifactFormatError permits one repair; other failures are host-integrity errors. */
   validateOutputs?: () => void;
 }
 
@@ -49,7 +50,7 @@ export function consolidationPromptHash(config: MemoryConfig, version: MemoryVer
     timeoutMs: TOTAL_TIMEOUT_MS, outputTokens: OUTPUT_TOKENS,
     outputAllowlist: version === "v1" ? ["MEMORY.md", "memory_summary.md", "skills/<slug>/SKILL.md"] : ["memory_summary.md"],
     toolExecution: "sequential", contextByteRatio: 0.7, contextOverhead: 1_024,
-    maxValidationRepairs: 1, validationDiagnosticBytes: 512,
+    maxValidationRepairs: 1, validationDiagnosticBytes: 512, artifactPolicyVersion: 3,
   })).digest("hex");
 }
 
@@ -60,7 +61,7 @@ function renderWriter(config: MemoryConfig, version: MemoryVersion): string {
     .replaceAll("{{ memory_extensions_folder_structure }}", "- notes/<note-id>.md: host-staged read-only shared user-note snapshot")
     .replaceAll("{{ memory_extensions_primary_inputs }}", "- `notes/*.md`: read-only shared active user notes; cite explicit note IDs")
     .replaceAll("thread_id=", "session_key=").replaceAll("source thread identifier", "pi session identifier") +
-    "\n\n" + adaptation(version) + `\nSummary maximum: ${Math.min(9999, config.limits.summaryBytes)} UTF-8 bytes.\n`;
+    "\n\n" + adaptation(version) + `\nSummary length target: ${config.limits.summaryBytes} UTF-8 bytes (guidance, not an extra validation cap).\n`;
 }
 
 function providerFailure(message: string | undefined): ConsolidationRunResult {
@@ -233,6 +234,10 @@ export async function runConsolidation(input: ConsolidationRunInput): Promise<Co
             !turn.message.content.some((item) => item.type === "toolCall")) {
           try { input.validateOutputs(); }
           catch (error) {
+            if (!(error instanceof ArtifactFormatError)) {
+              halt({ status: "blocked", reason: "artifact_integrity_failed" });
+              return { action: "end" };
+            }
             if (repairs >= 1) {
               halt({ status: "blocked", reason: "validation_failed" });
               return { action: "end" };

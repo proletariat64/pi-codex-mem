@@ -1,6 +1,7 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { MemoryModelPort, MemoryResponse } from "./runner.ts";
 import { normalizeModelUsage } from "../model-usage.ts";
+import { withCodexExtractionFormat } from "./format.ts";
 
 /** Capture the owning runtime's provider registry, never its credentials. */
 export function createRegistryModelPort(registry: ExtensionContext["modelRegistry"]): MemoryModelPort {
@@ -14,7 +15,10 @@ export function createRegistryModelPort(registry: ExtensionContext["modelRegistr
     async request(modelRef, context, options): Promise<MemoryResponse> {
       const model = registry.find(modelRef.provider, modelRef.modelId);
       if (!model) throw new Error("model not found");
-      const message = await registry.streamSimple(model, context, options).result();
+      const { version, ...requestOptions } = options;
+      const message = await registry.streamSimple(model, context, model.provider === "openai-codex"
+        ? { ...requestOptions, onPayload: payload => withCodexExtractionFormat(payload, version) }
+        : requestOptions).result();
       const text = message.content.flatMap((item) => item.type === "text" ? [item.text] : []).join("");
       return { stopReason: message.stopReason === "pending" ? "error" : message.stopReason,
         text, errorMessage: message.errorMessage,

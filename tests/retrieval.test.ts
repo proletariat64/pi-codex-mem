@@ -26,7 +26,7 @@ function fixture(t: test.TestContext) {
       snapshotPath: join(root, "snapshot.json"), snapshotHash: "snapshot", sourceTime: NOW - 86_400_000 },
     capturedAt: NOW,
   });
-  function publish(version: "v1" | "v2", id = `generation-${version}`, text = "中文决策\nTypeScript chosen\n中文理由\n", handbook?: string) {
+  function publish(version: "v1" | "v2", id = `generation-${version}`, text = "中文决策\nTypeScript chosen\n中文理由\n", handbook?: string, summary = MINIMAL_V1_SUMMARY) {
     enqueueExtraction(db, { sourceId: "source", memoryVersion: version, promptHash: "extract", now: NOW });
     const [job] = claimDueExtractions(db, { owner: "extractor", now: NOW, limit: 1 });
     if (job) assert.equal(commitExtraction(db, job, { memoryVersion: version, promptHash: "extract",
@@ -39,7 +39,7 @@ function fixture(t: test.TestContext) {
     assert.ok(lease);
     const directory = join(root, "versions", version, "generations", id);
     const path = evidencePath("source", "decision");
-    const files: Record<string, string> = { "memory_summary.md": MINIMAL_V1_SUMMARY, [path]: text,
+    const files: Record<string, string> = { "memory_summary.md": summary, [path]: text,
       "notes/private.md": "private note", "raw_memories.md": "private raw", "phase2_workspace_diff.md": "private diff" };
     if (version === "v1") {
       files["MEMORY.md"] = handbook ?? `# Decision\n中文决策 ${path}\n`;
@@ -62,6 +62,16 @@ function fixture(t: test.TestContext) {
   }
   return { root, db, publish };
 }
+
+test("reader accepts revision 3 format independently of lower writer targets", (t) => {
+  const { root, db, publish } = fixture(t);
+  const v1 = `v1\n${"x".repeat(12_000)}`;
+  publish("v1", undefined, undefined, "", v1);
+  assert.equal(acquireReadView({ root, db, memoryVersion: "v1", now: NOW + 4, summaryBytes: 1024 })?.summary, v1);
+  const v2 = `v1\n## What's in Memory\n### Prototype\n#### 2026-09-27\n- Choice\n  - desc: no repeated citation\n## General Tips\n${"x".repeat(1500)}\n## User preferences\n## User Profile\n`;
+  publish("v2", undefined, undefined, undefined, v2);
+  assert.equal(acquireReadView({ root, db, memoryVersion: "v2", now: NOW + 4, summaryBytes: 1024 })?.summary, v2);
+});
 
 test("literal Chinese search returns pinned evidence with deterministic paging and no usage", async (t) => {
   const { db, publish } = fixture(t); const { call, path } = publish("v1");

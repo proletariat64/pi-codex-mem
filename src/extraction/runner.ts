@@ -11,6 +11,7 @@ import {
   type LeasedJob,
 } from "../store/jobs.ts";
 import { parseV1Output, renderV1Request, v1EvidenceLine } from "./v1.ts";
+import type { ExtractionVersion } from "./format.ts";
 import { parseV2Output, renderV2Request, type V2RequestInput } from "./v2.ts";
 
 export interface ResolvedMemoryModel {
@@ -30,7 +31,7 @@ export interface MemoryResponse {
 export interface MemoryModelPort {
   resolve(ref: ModelRef): ResolvedMemoryModel | undefined;
   request(model: ResolvedMemoryModel, context: Context, options: {
-    signal: AbortSignal; maxTokens: number; timeoutMs: number; toolChoice: "none";
+    signal: AbortSignal; maxTokens: number; timeoutMs: number; toolChoice: "none"; version: ExtractionVersion;
   }): Promise<MemoryResponse>;
 }
 
@@ -162,7 +163,7 @@ function retryAfterMs(message: string | undefined): number | undefined {
 
 /** Bounded request: abort on timeout or shutdown, and renew the fenced lease. */
 async function requestWithLease(input: V1RunInput, model: ResolvedMemoryModel,
-  context: Context, maxTokens: number): Promise<MemoryResponse> {
+  context: Context, maxTokens: number, version: ExtractionVersion): Promise<MemoryResponse> {
   const controller = new AbortController();
   const onAbort = () => controller.abort();
   input.signal.addEventListener("abort", onAbort, { once: true });
@@ -180,7 +181,7 @@ async function requestWithLease(input: V1RunInput, model: ResolvedMemoryModel,
   try {
     if (controller.signal.aborted) throw new Error("aborted");
     return await Promise.race([
-      input.port.request(model, context, { signal: controller.signal, maxTokens, timeoutMs: 120_000, toolChoice: "none" }),
+      input.port.request(model, context, { signal: controller.signal, maxTokens, timeoutMs: 120_000, toolChoice: "none", version }),
       new Promise<never>((_, reject) => {
         controller.signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
       }),
@@ -266,7 +267,7 @@ async function runExtraction(input: V1RunInput, version: "v1" | "v2"): Promise<V
     }
     let response: MemoryResponse;
     try {
-      response = await requestWithLease(input, model, context, estimate.output);
+      response = await requestWithLease(input, model, context, estimate.output, version);
     } catch (err) {
       reconcileModelCall(input.db, reservationId, undefined);
       const cancelled = input.signal.aborted;

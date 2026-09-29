@@ -37,6 +37,7 @@ import { createConsolidationModelPort } from "./pipeline/model-port.ts";
 import { acquireReadView, type MemoryReadView } from "./read/view.ts";
 import { renderMemorySection } from "./read/inject.ts";
 import { cleanupGenerations } from "./pipeline/publish.ts";
+import { createMemoryTools, type MemoryConsumer } from "./read/tools.ts";
 
 const EXTENSION_VERSION = "0.1.0";
 
@@ -133,6 +134,7 @@ export default function (pi: ExtensionAPI) {
   let runtimePort: ReturnType<typeof createRegistryModelPort> | null = null;
   let consolidationPort: ReturnType<typeof createConsolidationModelPort> | null = null;
   let readerPin: MemoryReadView | null = null;
+  let foregroundRun: MemoryConsumer | null = null;
   let retentionTimer: NodeJS.Timeout | null = null;
   let heartbeat: NodeJS.Timeout | null = null;
   let privacyRetryTimer: NodeJS.Timeout | null = null;
@@ -140,6 +142,21 @@ export default function (pi: ExtensionAPI) {
   let foregroundIdle = true;
   let activeCwd = "";
   let activeMode = "";
+
+  for (const tool of createMemoryTools({ root: resolveMemoryRoot(), db: () => state.db,
+    view: () => readerPin, consumer: () => foregroundRun,
+    maxUnusedDays: () => state.config?.status === "ok" ? state.config.config.schedule.maxUnusedDays : 30 })) {
+    pi.registerTool({ ...tool, async execute(id, args, signal, _update, ctx) {
+      const root = resolveMemoryRoot(); const config = loadConfig(root, { create: false });
+      if (!state.compat?.supported || !foregroundRun || config.status !== "ok" || !config.config.enabled ||
+          !config.config.read || flagMode() === "off" || rootPointsIntoForeignMemory(root) ||
+          legacyLockPath(root) || isExcludedWorkspace(ctx.cwd, config.config.excludedWorkspaces)) {
+        return { content: [{ type: "text", text: "Memory unavailable." }],
+          details: { items: [], truncated: false, cursor: null, error: "memory_unavailable" } };
+      }
+      return tool.execute(id, args, signal);
+    } });
+  }
 
   pi.registerFlag("pi-memory-mode", {
     description: "Pi Memory runtime mode: off | read | read-write (overrides config)",
@@ -262,6 +279,8 @@ export default function (pi: ExtensionAPI) {
   }
 
   function markForegroundSettled(): void {
+    foregroundRun = null;
+    readerPin = null;
     if (heartbeat) clearInterval(heartbeat);
     heartbeat = null;
     foregroundIdle = true;
@@ -309,6 +328,7 @@ export default function (pi: ExtensionAPI) {
     runtimePort = null;
     consolidationPort = null;
     readerPin = null;
+    foregroundRun = null;
     if (retentionTimer) clearTimeout(retentionTimer);
     retentionTimer = null;
     if (state.db) clearProcessActivity(state.db, activityOwner);
@@ -479,6 +499,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
+    foregroundRun = null;
     cancelPrivacyCleanup();
     if (heartbeat) clearInterval(heartbeat);
     heartbeat = null;
@@ -506,6 +527,12 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("before_agent_start", (event, ctx) => {
     markForegroundActive(ctx);
+    let consumerSession: string = activityOwner;
+    try {
+      const file = ctx.sessionManager.getSessionFile(); const header = ctx.sessionManager.getHeader();
+      if (file && header) consumerSession = computeSessionKey(getAgentDir(), file, header.id);
+    } catch { /* Ephemeral sessions still get a process-local consumer identity. */ }
+    foregroundRun = { consumerSession, runId: randomUUID() };
     const opts = event.systemPromptOptions as { sections?: unknown } | undefined;
     if (opts && typeof opts === "object" && "sections" in opts) {
       state.promptSections = "confirmed";

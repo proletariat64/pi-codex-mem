@@ -19,6 +19,7 @@ function mockPi() {
       return () => {};
     },
     registerCommand: (name: string, def: never) => commands.set(name, def),
+    registerTool: () => {},
   };
   return { pi, handlers, commands };
 }

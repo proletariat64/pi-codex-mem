@@ -45,7 +45,20 @@ import { addNote, cleanupRevokedNotes, forgetNote, type NoteProvenance } from ".
 import { clearMemoryStore, DELETION_LIMITS, forgetEvidence, resumeClear } from "./control/forget.ts";
 import { createVersionRun, finishVersionRun, setDualWrite, setMemoryVersion, versionRunConfig, type VersionRunGrant, type VersionRunTarget } from "./control/switch.ts";
 
+import {
+  canAccessStore, canReadMemory, canWriteNote, canCaptureTranscript,
+  canGenerateMemory, canExtractMemory, canConsolidateMemory, canImportHistory, canCreateConfig,
+  type MemoryMode, type WorkspaceFacts,
+} from "./runtime-policy.ts";
+
 const EXTENSION_VERSION = "0.1.0";
+
+/** Sample workspace paths only after the operation's other configuration gates pass. */
+function recheckEligibilityWithWorkspace<T extends WorkspaceFacts>(config: MemoryConfig, cwd: string,
+  facts: T, eligible: (facts: T) => boolean): boolean {
+  return eligible(facts) && eligible({ ...facts,
+    workspaceExcluded: isExcludedWorkspace(cwd, config.excludedWorkspaces) });
+}
 
 /** Parse command words without invoking a shell or splitting quoted paths. */
 function importWords(text: string): string[] | null {
@@ -66,9 +79,6 @@ function importWords(text: string): string[] | null {
   if (started) words.push(word);
   return words;
 }
-
-/** Effective runtime mode (spec §6.3): flag > config-derived. */
-type MemoryMode = "off" | "read" | "read-write";
 
 /** The independent pi memory root (spec §5.1). Never Codex or Claude-mem data. */
 function resolveMemoryRoot(): string {
@@ -167,13 +177,15 @@ export default function (pi: ExtensionAPI) {
     maxUnusedDays: () => state.config?.status === "ok" ? state.config.config.schedule.maxUnusedDays : 30 })) {
     pi.registerTool({ ...tool, async execute(id, args, signal, _update, ctx) {
       const root = resolveMemoryRoot(); const config = loadConfig(root, { create: false });
-      if (!state.compat?.supported || !foregroundRun || config.status !== "ok" || !config.config.enabled ||
-          !config.config.read || flagMode() === "off" || rootPointsIntoForeignMemory(root) ||
-          legacyLockPath(root) || isExcludedWorkspace(ctx.cwd, config.config.excludedWorkspaces)) {
-        return { content: [{ type: "text", text: "Memory unavailable." }],
-          details: { items: [], truncated: false, cursor: null, error: "memory_unavailable" } };
+      if (state.compat?.supported && foregroundRun && config.status === "ok") {
+        const facts = { config: config.config, flag: flagMode(), workspaceExcluded: false };
+        if (canReadMemory(facts) && canAccessMemoryStore(root) &&
+            recheckEligibilityWithWorkspace(config.config, ctx.cwd, facts, canReadMemory)) {
+          return tool.execute(id, args, signal);
+        }
       }
-      return tool.execute(id, args, signal);
+      return { content: [{ type: "text", text: "Memory unavailable." }],
+        details: { items: [], truncated: false, cursor: null, error: "memory_unavailable" } };
     } });
   }
   pi.registerTool({ name: "pi_memory_note", label: "Remember or correct memory",
@@ -195,9 +207,9 @@ export default function (pi: ExtensionAPI) {
 
   function writableNoteStore(ctx: ExtensionContext): { root: string; db: DatabaseSync } {
     const root = resolveMemoryRoot(); const config = loadConfig(root, { create: false });
-    if (!state.compat?.supported || rootPointsIntoForeignMemory(root) || legacyLockPath(root) || config.status !== "ok" ||
-        !config.config.enabled || flagMode() === "off" || flagMode() === "read" ||
-        isExcludedWorkspace(ctx.cwd, config.config.excludedWorkspaces)) throw new Error("memory_write_unavailable");
+    if (!canAccessMemoryStore(root) || config.status !== "ok" ||
+        !recheckEligibilityWithWorkspace(config.config, ctx.cwd, { config: config.config, flag: flagMode(), workspaceExcluded: false },
+          canWriteNote)) throw new Error("memory_write_unavailable");
     state.db ??= openStateDb(root);
     ensureScheduler(ctx);
     return { root, db: state.db };
@@ -247,6 +259,14 @@ export default function (pi: ExtensionAPI) {
     type: "string",
   });
 
+  /** Preserve short-circuit host/root probes; no policy function performs IO. */
+  function canAccessMemoryStore(root: string): boolean {
+    const supported = Boolean(state.compat?.supported);
+    const foreignRoot = supported && rootPointsIntoForeignMemory(root);
+    const legacyLocked = supported && !foreignRoot && Boolean(legacyLockPath(root));
+    return canAccessStore({ supported, foreignRoot, legacyLocked });
+  }
+
   function flagMode(): MemoryMode | undefined {
     const raw = pi.getFlag("pi-memory-mode");
     if (raw === "off" || raw === "read" || raw === "read-write") return raw;
@@ -268,20 +288,22 @@ export default function (pi: ExtensionAPI) {
     const loaded = loadConfig(root, { create: false });
     if (loaded.status !== "ok") return null;
     const config = loaded.config;
-    if (!config.enabled || !config.generate || flagMode() === "off" || flagMode() === "read" ||
-        isExcludedWorkspace(activeCwd, config.excludedWorkspaces)) return null;
+    if (!recheckEligibilityWithWorkspace(config, activeCwd, { config, flag: flagMode(), workspaceExcluded: false,
+        persistent: persistentCapture, mode: activeMode }, canGenerateMemory)) return null;
     return config;
   }
 
   function eligibleExtractionConfig(root: string): MemoryConfig | null {
     const config = eligibleGenerationConfig(root);
-    return config?.captureModes.includes(activeMode as MemoryConfig["captureModes"][number]) ? config : null;
+    return config && canExtractMemory({ config, flag: flagMode(), workspaceExcluded: false,
+      persistent: persistentCapture, mode: activeMode }) ? config : null;
   }
 
   function eligibleConsolidationConfig(root: string): MemoryConfig | null {
     const config = eligibleGenerationConfig(root);
     if (!config || !state.db) return null;
-    if (config.captureModes.includes(activeMode as MemoryConfig["captureModes"][number])) return config;
+    const facts = { config, flag: flagMode(), workspaceExcluded: false, persistent: persistentCapture, mode: activeMode };
+    if (canConsolidateMemory(facts, { available: true, reconciliationPending: false })) return config;
     // Explicit notes must reconcile even when automatic transcript capture is disabled in this runtime.
     for (const version of targetVersions(config)) {
       const pending = state.db.prepare(`SELECT 1 FROM notes n
@@ -293,7 +315,7 @@ export default function (pi: ExtensionAPI) {
           a.generation_id != p.active_generation_id) LIMIT 1`).get(version, version);
       const revoked = state.db.prepare(`SELECT 1 FROM pipeline_state WHERE memory_version = ? AND read_blocked = 1
         AND block_reason IN ('user_correction', 'note_forgotten', 'source_forgotten')`).get(version);
-      if (pending || revoked) return config;
+      if (canConsolidateMemory(facts, { available: true, reconciliationPending: Boolean(pending || revoked) })) return config;
     }
     return null;
   }
@@ -303,7 +325,7 @@ export default function (pi: ExtensionAPI) {
     if (ctx?.modelRegistry && !consolidationPort) consolidationPort = createConsolidationModelPort(ctx.modelRegistry);
     if (!state.db || !state.compat?.supported || !runtimePort) return;
     const root = resolveMemoryRoot();
-    if (rootPointsIntoForeignMemory(root) || legacyLockPath(root)) return;
+    if (!canAccessMemoryStore(root)) return;
     const port = runtimePort;
     if (!consolidator && consolidationPort) {
       const writerPort = consolidationPort;
@@ -541,7 +563,7 @@ export default function (pi: ExtensionAPI) {
       }
       state.config = loadConfig(root, {
         timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
-        create: state.compat.supported && persistentCapture && flagMode() !== "off" && flagMode() !== "read",
+        create: canCreateConfig({ supported: state.compat.supported, persistent: persistentCapture, flag: flagMode() }),
       });
       if (state.config.status === "invalid") state.captureError = state.config.problems.join("; ");
       else if (state.config.status === "missing" && state.config.reason) state.captureError = state.config.reason;
@@ -611,14 +633,12 @@ export default function (pi: ExtensionAPI) {
 
   function captureNow(ctx: ExtensionContext, options?: { busyTimeoutMs?: number }): void {
     const root = resolveMemoryRoot();
-    if (!state.compat?.supported || rootPointsIntoForeignMemory(root) || legacyLockPath(root)) return;
+    if (!canAccessMemoryStore(root)) return;
     // §6.3: captureModes is independent of generate (which only controls
     // model calls). Explicit read/off flags must not write new evidence.
     const config = loadConfig(root, { create: false });
-    if (config.status !== "ok" || !config.config.enabled ||
-        !config.config.captureModes.includes(ctx.mode) ||
-        isExcludedWorkspace(ctx.cwd, config.config.excludedWorkspaces) ||
-        flagMode() === "off" || flagMode() === "read") return;
+    if (config.status !== "ok" || !recheckEligibilityWithWorkspace(config.config, ctx.cwd,
+        { config: config.config, flag: flagMode(), workspaceExcluded: false, mode: ctx.mode }, canCaptureTranscript)) return;
     try {
       if (!ctx.sessionManager.getSessionFile() || !ctx.sessionManager.getHeader() || !ctx.sessionManager.getLeafId()) {
         state.capture = { status: "ephemeral", reason: "persistent session header/path/leaf unavailable" };
@@ -676,7 +696,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_tree", (_event, ctx) => {
     const root = resolveMemoryRoot();
-    if (!state.compat?.supported || rootPointsIntoForeignMemory(root) || legacyLockPath(root)) return;
+    if (!canAccessMemoryStore(root)) return;
     try {
       // A resumed session can navigate before its first settlement. Reopen
       // an initialized store rather than leaving the old head eligible.
@@ -754,17 +774,18 @@ export default function (pi: ExtensionAPI) {
     const root = resolveMemoryRoot();
     state.config = loadConfig(root, { create: false });
     const cfg = state.config;
-    if (state.compat?.supported && persistentCapture && cfg.status === "ok" && cfg.config.enabled && cfg.config.generate &&
-        ctx.model && cfg.config.captureModes.includes(ctx.mode) &&
-        flagMode() !== "off" && flagMode() !== "read" &&
-        !rootPointsIntoForeignMemory(root) && !legacyLockPath(root) &&
-        !isExcludedWorkspace(ctx.cwd, cfg.config.excludedWorkspaces) &&
-        (cfg.config.models.extract === null || cfg.config.models.consolidate === null)) {
-      const ref = { provider: ctx.model.provider, modelId: ctx.model.id };
-      const saved = updateConfig(root, (current) => ({ ...current,
-        models: { extract: current.models.extract ?? ref, consolidate: current.models.consolidate ?? ref } }));
-      if (saved.ok) state.config = { status: "ok", config: saved.config, path: join(root, "config.json") };
-      else if (ctx.hasUI) ctx.ui.notify(`pi-memory: model default not saved — ${saved.reason}`, "warning");
+    if (state.compat?.supported && persistentCapture && cfg.status === "ok" && ctx.model) {
+      const facts = { config: cfg.config, flag: flagMode(), workspaceExcluded: false,
+        persistent: persistentCapture, mode: ctx.mode };
+      if (canExtractMemory(facts) && canAccessMemoryStore(root) &&
+          recheckEligibilityWithWorkspace(cfg.config, ctx.cwd, facts, canExtractMemory) &&
+          (cfg.config.models.extract === null || cfg.config.models.consolidate === null)) {
+        const ref = { provider: ctx.model.provider, modelId: ctx.model.id };
+        const saved = updateConfig(root, (current) => ({ ...current,
+          models: { extract: current.models.extract ?? ref, consolidate: current.models.consolidate ?? ref } }));
+        if (saved.ok) state.config = { status: "ok", config: saved.config, path: join(root, "config.json") };
+        else if (ctx.hasUI) ctx.ui.notify(`pi-memory: model default not saved — ${saved.reason}`, "warning");
+      }
     }
     readerPin = null;
     state.readDiagnostic = null;
@@ -776,9 +797,10 @@ export default function (pi: ExtensionAPI) {
     if (!sections || typeof sections !== "object" || Array.isArray(sections)) return;
     const sectionMap = sections as Record<string, string>;
     delete sectionMap.pi_memory;
-    if (!state.compat?.supported || typeof ctx.cwd !== "string" || latest.status !== "ok" || !latest.config.enabled ||
-        !latest.config.read || flagMode() === "off" || rootPointsIntoForeignMemory(root) ||
-        legacyLockPath(root) || isExcludedWorkspace(ctx.cwd, latest.config.excludedWorkspaces)) return;
+    if (!state.compat?.supported || typeof ctx.cwd !== "string" || latest.status !== "ok") return;
+    const readFacts = { config: latest.config, flag: flagMode(), workspaceExcluded: false };
+    if (!canReadMemory(readFacts) || !canAccessMemoryStore(root) ||
+        !recheckEligibilityWithWorkspace(latest.config, ctx.cwd, readFacts, canReadMemory)) return;
     let readerDb: DatabaseSync | undefined;
     try {
       if (!state.db) {
@@ -1006,11 +1028,9 @@ export default function (pi: ExtensionAPI) {
     };
     const root = resolveMemoryRoot();
     const cfg = loadConfig(root, { create: false });
-    if (!state.compat?.supported || !persistentCapture || rootPointsIntoForeignMemory(root) || legacyLockPath(root) ||
-        cfg.status !== "ok" || !cfg.config.enabled || !cfg.config.generate ||
-        !cfg.config.captureModes.includes(ctx.mode) ||
-        flagMode() === "off" || flagMode() === "read" ||
-        isExcludedWorkspace(ctx.cwd, cfg.config.excludedWorkspaces)) {
+    if (!state.compat?.supported || !persistentCapture || !canAccessMemoryStore(root) || cfg.status !== "ok" ||
+        !recheckEligibilityWithWorkspace(cfg.config, ctx.cwd, { config: cfg.config, flag: flagMode(), workspaceExcluded: false,
+          persistent: persistentCapture, mode: ctx.mode }, canExtractMemory)) {
       report("blocked by host, configuration, mode, or workspace policy", "warning");
       return;
     }
@@ -1088,7 +1108,7 @@ export default function (pi: ExtensionAPI) {
         const root = resolveMemoryRoot();
         const match = sub === "version" ? /^version\s+(v1|v2)$/.exec(args.trim()) : /^dual-write\s+(on|off)$/.exec(args.trim());
         if (!match) { if (ctx.hasUI) ctx.ui.notify(`usage: /memory ${sub} ${sub === "version" ? "v1|v2" : "on|off"}`, "warning"); return; }
-        if (!state.compat?.supported || rootPointsIntoForeignMemory(root) || legacyLockPath(root)) {
+        if (!canAccessMemoryStore(root)) {
           if (ctx.hasUI) ctx.ui.notify("pi-memory: configuration update unavailable", "warning"); return;
         }
         const saved = sub === "version" ? setMemoryVersion(root, match[1] as MemoryVersion) : setDualWrite(root, match[1] === "on");
@@ -1133,7 +1153,7 @@ export default function (pi: ExtensionAPI) {
       if (sub === "clear") {
         if (args.trim() !== "clear --confirm") { if (ctx.hasUI) ctx.ui.notify(`usage: /memory clear --confirm. ${DELETION_LIMITS}`, "warning"); return; }
         const root = resolveMemoryRoot();
-        if (!state.compat?.supported || rootPointsIntoForeignMemory(root) || legacyLockPath(root)) {
+        if (!canAccessMemoryStore(root)) {
           if (ctx.hasUI) ctx.ui.notify("pi-memory: clear unavailable for this store", "warning"); return;
         }
         try {
@@ -1208,8 +1228,8 @@ export default function (pi: ExtensionAPI) {
           for (const item of report.unsupported) lines.push(`${item.path}: unsupported — ${item.reason}`);
           for (const item of report.deferred) lines.push(`${item.path}: deferred — ${item.reason}`);
           if (run) {
-            if (!state.compat?.supported || rootPointsIntoForeignMemory(root) || legacyLockPath(root) || cfg.status !== "ok" ||
-                !cfg.config.enabled || flagMode() === "off" || flagMode() === "read") {
+            if (!canAccessMemoryStore(root) || cfg.status !== "ok" ||
+                !canImportHistory({ config: cfg.config, flag: flagMode() })) {
               ctx.ui.notify("pi-memory: import blocked by unsupported host, memory root, legacy lock, configuration, or runtime mode", "warning");
               return;
             }

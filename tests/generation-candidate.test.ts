@@ -41,12 +41,29 @@ function fixture(t: test.TestContext) {
 }
 
 for (const version of ["v1", "v2"] as const) {
+  test(`${version} lease rejects an opposite-version candidate before staging or writer access`, t => {
+    const f = fixture(t);
+    const legitimate = f.prepare(version);
+    const other = version === "v1" ? "v2" : "v1";
+    const snapshot = selectConsolidation(f.db, { memoryVersion: other, now: NOW });
+    const job = f.db.prepare("SELECT * FROM jobs WHERE job_id = ?").get(legitimate.lease.jobId);
+    assert.throws(() => prepareGenerationCandidate({ db: f.db, root: f.root, config: f.config,
+      lease: legitimate.lease, snapshot, signal: new AbortController().signal,
+      clock: () => { assert.fail("mismatched candidates must be rejected before clock or prior access"); } }),
+    /publication version mismatch/);
+    assert.equal(existsSync(join(f.root, "versions", other, "staging", `${legitimate.lease.jobId}-${legitimate.lease.fence}`)), false);
+    assert.equal(existsSync(legitimate.staging), true);
+    assert.deepEqual(f.db.prepare("SELECT * FROM jobs WHERE job_id = ?").get(legitimate.lease.jobId), job);
+    assert.equal(getPublishedGeneration(f.db, other, NOW), null);
+    legitimate.candidate.dispose();
+  });
+
   test(`${version} candidate publishes validated artifacts and releases only its staging path`, t => {
     const f = fixture(t);
     const { candidate, staging } = f.prepare(version);
     assert.equal("directory" in candidate, false);
     assert.equal("manifest" in candidate, false);
-    assert.equal(candidate.isUnchanged(), false);
+    assert.equal(candidate.checkUnchanged(), false);
     candidate.writeMinimal();
     assert.equal(candidate.publish(), true);
     const generation = f.published(version);
@@ -74,9 +91,9 @@ for (const version of ["v1", "v2"] as const) {
     first.candidate.dispose();
     const generation = f.published(version);
     const next = f.prepare(version);
-    assert.equal(next.candidate.isUnchanged(), true);
+    assert.equal(next.candidate.checkUnchanged(), true);
     writeFileSync(join(next.staging, "memory_summary.md"), "invalid summary\n");
-    assert.throws(() => next.candidate.isUnchanged());
+    assert.throws(() => next.candidate.checkUnchanged());
     assert.equal(f.db.prepare("SELECT status FROM jobs WHERE job_id = ?").get(next.lease.jobId)?.status, "leased");
     next.candidate.dispose();
     assert.equal(existsSync(next.staging), false);
@@ -125,7 +142,7 @@ for (const version of ["v1", "v2"] as const) {
     // A manifest can have valid JSON yet differ from the DB-selected artifact proof.
     writeFileSync(join(generation.directory, "manifest.json"), "{}\n");
     const next = f.prepare(version);
-    assert.equal(next.candidate.isUnchanged(), false);
+    assert.equal(next.candidate.checkUnchanged(), false);
     assert.equal(existsSync(join(next.staging, "memory_summary.md")), false);
     assert.equal(existsSync(join(next.staging, "MEMORY.md")), false);
     next.candidate.writeMinimal();

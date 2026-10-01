@@ -196,7 +196,7 @@ export class ConsolidationScheduler {
     try {
       candidate = prepareGenerationCandidate({ db, root: this.options.root, lease, snapshot, config,
         signal: this.controller.signal, clock });
-      if (candidate.isUnchanged()) {
+      if (candidate.checkUnchanged()) {
         finishConsolidation(db, lease, "succeeded", null, clock(), clock(), { refundAttempt: true });
         this.checkedKeys.set(version, this.key(config, version));
         return [{ status: "unchanged" }];

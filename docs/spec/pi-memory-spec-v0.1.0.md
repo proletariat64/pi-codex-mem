@@ -1,11 +1,13 @@
 # Pi Memory — Implementation Specification
 
 **Version:** 0.1.0  
-**Date:** 2026-09-29
+**Date:** 2026-09-30
 
-**Draft revision:** 3 — signed-off consolidation validation design
+**Revision:** 4 — extension-compatible request-local memory injection and reading
 
-**Status:** Implementation contract; revision 3 validation change signed off by the user on 2026-09-29, implementation pending
+**Status:** Implementation contract; revision 4 approved by the user on 2026-09-30. Revision 3 validation remains signed off. Product implementation and its acceptance tests are pending.
+
+> Implementation authorization update: the user removed exact Pi-version requirements. Support recent daily host releases by the required capabilities, not an exact version allowlist or minimum Pi-version gate. Record the actually exercised host and peer versions as verification evidence; do not require a new multi-version matrix. Historical version references below remain source evidence, not deployment restrictions. Unrelated background/configuration contracts remain unchanged. The user additionally accepts the unavoidable provider cancellation/send race: preserve validation, safe owned-payload removal and best-effort native abort, but do not disable the Codex reader or block acceptance solely because a cached transport can send after cancellation. This exception does not authorize serving a known invalid pin or bypassing read/privacy controls.
 
 **Working package name:** `pi-memory` — a local project name, not a claim that this npm name is available  
 **Target:** A single-user TypeScript extension for pi with memory independent of Codex and Claude-mem
@@ -40,6 +42,14 @@ The user approved the revised Phase 2 contract in Sections 9.4–9.6: port Codex
 
 This supersedes revision 2's universal summary cap, ordered-heading gate, generated-reference/ID/anchor checks, handbook-field checks, and per-bullet source requirements. It does not relax Phase 1 JSON schemas or semantic release criteria. Approval records the design, not completion of implementation or tests. Unchanged operational docs, prompt adaptations, and implementation must be reconciled with this revision before the release gate; they do not override it.
 
+### 1.3 Revision 4 injection/read scope
+
+Revision 4 changes only the foreground injection and reading contract, its diagnostics and acceptance definitions. It MUST NOT require modifications to permission extensions, Pi core, the extension architecture, background extraction/consolidation, generated artifact formats, or user configuration. The decision map is [Efficient, extension-compatible memory injection](https://github.com/proletariat64/pi-codex-mem/issues/40); its linked resolution comments are the design record.
+
+The selected mechanism is one request-local custom carrier injected through `context_with_system`, fixed immediately after the leading system message, with no new memory system section or mixed fallback. Default content is a summary under a 2,500-token policy plus read guidance and pin identity. New foreground runs select eligible generations; tool continuations and in-run compaction normally retain the pin. Safety invalidation overrides caching; a narrowly limited background-recovery exception is specified in Section 6.2.3. Both versions can use a sufficient summary directly and retrieve detail only when necessary.
+
+These decisions describe intended behavior, not a completed product fix. The current extension may still implement the superseded section-injection/conflict-disable behavior until separately authorized implementation. Revision 3 artifact-validation rules and unrelated release requirements remain unchanged.
+
 ## 2. Inspected source baseline
 
 All upstream descriptions below refer to these exact commits, not an unspecified moving `main` branch.
@@ -52,6 +62,8 @@ All upstream descriptions below refer to these exact commits, not an unspecified
 Revision 3 additionally inspected Codex `c248f6d48b97eb4a2aa56147a0b11b7d763278b9` for artifact validation, writer completion, and nested index formatting [C12]. This supplemental comparison does not repin the vendored prompt families or replace the implementation baseline above.
 
 The source manifest in the implementation MUST record upstream repository, commit, path, content hash, local destination, and a description of every adaptation. The first implementation MUST vendor the relevant prompt templates at these revisions and retain upstream license notices.
+
+Revision 4 additionally inspected the user's installed `@earendil-works/pi-coding-agent` **0.99.1** for extension context ordering, forced projection and custom-message conversion. This inspection is foreground source evidence, not an exact-version acceptance restriction; 0.87.1 remains historical source/reproduction evidence, not a second required host matrix. Supplemental Codex commit `bcd6d9ab6b9f26f85d76d0c680b3f88b367bffa0` confirms default budgeted-summary injection and the 2,500-token summary policy [C13]. Neither supplemental check repins the background implementation or vendored prompt families.
 
 ### 2.1 Important findings
 
@@ -88,9 +100,9 @@ Both pipelines are required in this revision. Keep capture, scheduling, model ac
 
 ### 2.3 Compatibility contract
 
-The initial supported host is pi 0.87.1 at the inspected API level, running on Node >=22.19.0 with `node:sqlite` available. The implementation must capability-check `agent_settled`, structured system-prompt sections, branch access, and model-runtime access. Unsupported versions disable the extension's memory behavior with one diagnostic; they must not silently use older event semantics.
+Revision 4 supports recent daily Pi hosts with the required capabilities, running on Node >=22.19.0 with `node:sqlite` available. Pi version numbers are diagnostic/test metadata, not an exact or minimum version allowlist. The implementation must capability-check `agent_settled`, `context_with_system`, the provider pre-request boundary and native whole-run abort, leading system/tool preservation, branch access and model-runtime access. Historical 0.87.1 source findings do not create a multi-version acceptance requirement. Unsupported capabilities disable the affected memory behavior with a diagnostic; never silently revert to section injection or older event semantics. Handler exceptions alone are not a cancellation mechanism: prove the effective pre-send fence on the target host.
 
-Declare pi-provided packages as peer dependencies with `*`, as pi packaging documentation requires; enforce the actual tested host range separately in runtime checks and release documentation. Do not bundle a second copy of pi's registries or classes. [P5]
+Declare pi-provided packages as peer dependencies with `*`, as pi packaging documentation requires; enforce required capabilities at runtime and document actual tested host/peer versions separately, without turning a test snapshot into an exact-version deployment gate. Do not bundle a second copy of pi's registries or classes. [P5]
 
 ## 3. Requirements
 
@@ -133,7 +145,7 @@ flowchart TD
 
 Components:
 
-- **Pi adapter:** registers events, tools, commands, status UI, and the namespaced prompt section.
+- **Pi adapter:** registers events, tools, commands, status UI, request-local memory projection and pre-request validity checks.
 - **Capture adapter:** projects a selected session branch into sanitized, provenance-labeled evidence.
 - **Coordinator:** handles activity state, eligibility, durable jobs, leases, budgets, and cancellation.
 - **Model port:** accesses models through pi's registry without copying credentials or changing the foreground model.
@@ -195,7 +207,7 @@ Forks create a new session identity and preserve parent lineage. Shared ancestor
 
 `generate=false` disables automatic model work for both versions regardless of this table. Global mode, workspace exclusions, and capture policy still apply. Dual writing is opt-in because it makes separate extraction and consolidation requests; it does not double the configured budget.
 
-Changing `version` updates the extension's JSON configuration atomically. A runtime samples validated configuration at startup, before each foreground run, and before claiming a background job or starting its next model request; no filesystem watcher is required. The selected version is pinned with the generation for that entire foreground run. A version switch takes effect for reading at the next `before_agent_start`, not between two tool calls. Concurrent configuration commands must compare the file's prior content hash under a short store-wide control lock; retry a conflict by rereading and applying only the requested field. Manual edits with an invalid schema preserve the file and disable generation as described in Section 14.
+Changing `version` updates the extension's JSON configuration atomically. A runtime samples validated configuration at startup, before each foreground run, and before claiming a background job or starting its next model request; no filesystem watcher is required. The selected memory version is fixed for that foreground run. Its generation normally stays pinned, except for the single classified background-invalidity recovery in Section 6.2.3. A version switch takes effect for reading at the next `before_agent_start`, not between two tool calls. Concurrent configuration commands must compare the file's prior content hash under a short store-wide control lock; retry a conflict by rereading and applying only the requested field. Manual edits with an invalid schema preserve the file and disable generation as described in Section 14.
 
 Switching does not convert, merge, delete, or relabel existing outputs. Use an existing valid generation for the target version; otherwise report `warming_up` and inject no generated memory until that version publishes. Never silently read the other version as a fallback. Switching back can immediately reuse its still-valid generation. Configuration changes cannot retract old memory text already present in the current conversation; evaluate versions in separate fresh pi sessions to avoid that contamination.
 
@@ -215,7 +227,9 @@ Notes, branch retirement, corrections, explicit forgetting, and privacy-related 
 |---|---|---|
 | Extension factory | Register handlers, tools, commands, and flags | Start timers, model calls, or processes |
 | `session_start` | Validate config; open state; restore identities; load published generation; register session activity; schedule eligible prior work | Await memory generation before pi becomes usable |
-| `before_agent_start` | Mark foreground active; capture scope/model metadata; replace `systemPromptOptions.sections.pi_memory` with cached read guidance + summary | Call LLM; append repeated summary messages; replace the whole system prompt |
+| `before_agent_start` | Mark the foreground run active; capture scope/model metadata; prepare an eligible same-version pin and cacheable carrier | Call LLM; add a memory system section; append persistent summary messages; replace the whole system prompt |
+| `context_with_system` | Revalidate and project at most one owned memory carrier into the request copy, after the leading system message | Mutate canonical history; collapse system deltas; split a tool call/result pair; insert memory into unrelated background requests |
+| `before_provider_request` | Revalidate eligibility and budget; safely remove the owned carrier through payload replacement, or abort the foreground run when safe removal cannot be proved | Invent a per-dispatch cancellation return; treat a caught handler exception as blocking dispatch; overwrite another extension's policy; send revoked memory for cache stability |
 | `agent_start` | Mark this session busy; prevent new background requests from this runtime | Treat tool events as independent conversations |
 | `agent_before_settle` | Record final outcome when supplied by the event; do not append continuation work | Return `continue: true` for memory processing |
 | `agent_settled` | Capture an immutable snapshot from the authoritative branch; update activity time; schedule the due job | Assume `agent_end` was equivalent |
@@ -226,28 +240,39 @@ Notes, branch retirement, corrections, explicit forgetting, and privacy-related 
 
 Use `session_start.reason` and `session_shutdown.reason` for reload, new, resume, and fork handling. Old contexts are invalid after replacement. Capture plain values for queued work, never retain an old `ctx` to mutate a new session. [P1, P2]
 
-### 6.2 Prompt integration
+### 6.2 Request-local prompt integration
 
-Use the actual structured section API:
+#### 6.2.1 Carrier, anchor and extension ownership
 
-```typescript
-pi.on("before_agent_start", async (event, ctx) => {
-  const view = await reader.snapshotForTurn(ctx); // bounded local access only
-  if (view.enabled) {
-    event.systemPromptOptions.sections.pi_memory = view.instructions;
-  } else {
-    delete event.systemPromptOptions.sections.pi_memory;
-  }
-});
-```
+Use `context_with_system` to add one custom carrier to a request-local copy. The carrier contains the selected summary representation, version-specific read guidance, memory version and generation identity. Do not add a new `pi_memory` system section, return a replacement full system prompt, use section/context mixed fallback, or persist the carrier through `sendMessage`/`appendEntry`.
 
-This is an API-shape example, not a complete implementation. Pi records system-prompt changes itself. The extractor excludes system messages, including this section, to avoid circular memory.
+Keep the leading system message at index 0; insert immediately after it. With no leading system, insert at index 0 without fabricating a system message. Do not move the carrier toward the latest user on subsequent rounds, change canonical order, or split existing toolCall/toolResult pairs. Preserve other extensions' messages, system deltas and effective tool declarations. Never mutate the input array before successful preparation and validation.
 
-If another extension forces an opaque full system prompt, it can override section-based injection. Diagnose this as a compatibility limitation; do not overwrite the other extension's prompt or silently claim successful injection.
+On the inspected host, ordinary `context` runs before `context_with_system`; second-stage insertion itself does not trigger ordinary system restoration/folding. It cannot undo folding already performed by an earlier handler. Forced projection runs afterward, replaces system messages with its own head and retains non-system custom messages. Its text and tools remain owned by the host/overriding extension; memory must not rewrite their policy. Common complete prompt overrides, either registration order and tool continuations are in scope. An extension explicitly deleting request context is outside the preservation guarantee.
 
-Pin `(memoryVersion, generationId)` for one foreground run. A new generation or selected-version change becomes visible at the next `before_agent_start`. Tools called in that run use the same pin, except that an explicit forget or invalidation can revoke it immediately.
+Custom carriers become user-role content in `convertToLlm`; they are historical evidence, not a newly authored human task or higher-priority instruction. Separate host-generated read guidance/identity from quoted historical data. Source bodies must not escape their evidence framing or enter tool definitions/control fields. `display:false` affects display only, not sending, authorization or capture eligibility.
 
-Before acquiring or serving a view, check the store's control epoch and source-retention eligibility, even when file content is cached. Schedule the earliest known retention deadline as a one-shot event. Expired evidence must not stay readable indefinitely just because no new session was extracted.
+At most one current owned carrier is allowed. Count active memory leftovers in an old section or captured full prompt too: one new custom message does not prove deduplication. Remove only reliably attributable owned leftovers from the request projection. If an unsafe leftover cannot be removed without changing someone else's policy, do not layer another carrier or claim successful revocation; abort the foreground run through native `ctx.abort()` and report a local diagnostic. On 0.99.1, `before_provider_request` replaces the payload but has no single-dispatch cancellation result; its handler exceptions are reported and caught. The abort is whole-run, not a promise that only one provider call is cancelled. Do not destructively edit canonical history or promise deletion of past assistant quotations.
+
+#### 6.2.2 Preparation, pin and cache
+
+A foreground run is one foreground task execution, including its model requests, tool continuations and automatic compaction, not one provider call. At a new run boundary select the latest eligible DB-published generation for the configured version. Pin `(memoryVersion, generationId, controlEpoch, manifestHash)`; retain directory, scope and retention metadata needed for validation. Summary and tools must use the same effective pin.
+
+Normally reuse the pin and carrier throughout that run, including after in-run compaction. Publication of a newer generation alone does not invalidate an otherwise eligible pin or cause a switch. Version changes take effect at the next new run. Standalone compaction does not create a foreground memory grant. Resume, tree/session replacement, reload, shutdown and final settlement invalidate old run-owned cache references; the next foreground run prepares anew.
+
+Cache reuse requires matching pin, workspace/scope, guidance version and effective rendering/budget policy. Avoid non-semantic timestamps or per-request IDs in model-visible carrier text. Reuse is not permission to skip validity checks. Never borrow another session's, run's or version's stale cached carrier after preparation fails.
+
+#### 6.2.3 Revalidation, recovery and dispatch boundary
+
+Revalidate before preparing/reusing a carrier, before each provider dispatch, and before and after each memory-tool operation. Generation eligibility, current control epoch, manifest identity/integrity, retention and the effective read switch must all permit access. A cached retention timestamp or previous successful read is insufficient. Retain the bounded one-shot retention check and request/tool checks.
+
+On invalidation, clear pin-dependent cached content synchronously and reject stale tool output. User forget/correction/clear, read disabling, session/scope replacement and an unclassified epoch change do not grant automatic mid-run recovery: stop serving memory until a new run. Do not infer that an epoch change is harmless from the mere presence of a newer generation.
+
+The confirmed exception permits at most one automatic re-acquisition in a run after a demonstrably ordinary background invalidation (for example expiry/rebuild), only when no user/privacy revocation requires keeping the run blocked. The candidate must be an eligible clean generation of the run's selected version, pass all checks, and atomically replace both carrier and tool pin after the old cache has been cleared. A publication alone never triggers this exception. Reject old-generation cursors; identify already returned older tool evidence as historical rather than relabeling it. Failure, a second invalidation or uncertain provenance stops memory until the next run.
+
+Define dispatch admission at the last supported pre-provider validity check. If invalidation is observed before admission, no current revoked carrier may be dispatched. If invalidation occurs after admission or transport has begun, use native whole-run abort best-effort and block future accesses; do not claim bytes already admitted/sent can be recalled. Before admission, replace the payload only if removing the owned carrier can be proved safe for the effective model input; otherwise abort the whole foreground run. Test abort-signal enforcement before transport and guard ordering on the exercised host; an exception swallowed by the runner is not a fail-closed fence. This race boundary is an explicit limitation, not an instantaneous provider-side erasure guarantee. The accepted host exception also covers a transport that ignores a late native abort before sending: do not claim a universal zero-send guarantee in that case, and do not make upstream remediation a required task or release gate.
+
+Budget-only omission/truncation leaves an otherwise valid pin available to the independently bounded retrieval tools. Privacy/epoch/read-eligibility failures revoke both injection and retrieval. Precise resource handling is in Section 10.
 
 ### 6.3 Runtime modes
 
@@ -277,12 +302,14 @@ Store a sanitized evidence snapshot, not a second unfiltered transcript. Origina
 | Reasoning/thinking blocks | Exclude |
 | Images/audio/binary | Replace with an explicit omitted-media marker; do not invent interpretation |
 | System messages, loaded skills, injected context | Exclude |
-| Own `pi_memory` metadata, retrieval outputs, consolidation messages | Exclude |
+| Own memory carrier, legacy `pi_memory` metadata, retrieval outputs, consolidation messages | Exclude direct payloads from learning evidence; the request-local carrier is not persisted in the first place |
 | Other extensions' custom messages | Exclude by default; future explicit adapters may label their provenance |
 | Compaction/branch summaries | Treat as derived context only when raw evidence is unavailable, never as fresh user statements |
 | Usage, model-change, labels | Keep needed metadata, not learning evidence |
 
 Failed tools are eligible evidence. Tool success alone is not a memory-worthy fact.
+
+Request-local carriers must not be added to canonical session records or directly supplied to the compactor/capture adapter. Memory retrieval results keep their existing exclusion from learning evidence. Assistant quotations, answers based on memory and derived compaction text can nevertheless contain memory-derived facts. This is indirect semantic recirculation; do not claim zero pollution, zero relearning or erasure of previously sent content.
 
 Pi may persist programmatically submitted text as `role=user`. The format alone does not always prove human authorship. Preserve known origin metadata, label unknown origin honestly, and never assert that every user-role message was manually typed. This is an evaluation and integration limitation, not something to guess around.
 
@@ -510,15 +537,21 @@ The repair uses the existing call, tool, token, timeout, cancellation, and lease
 
 ## 10. Read path and progressive disclosure
 
-Normal prompt handling uses no memory-related LLM request. Inject exactly one selected-version summary, current workspace applicability, memory version, generation ID, and that version's adapted read guidance in the `pi_memory` section. Dual writing must not concatenate the two summaries or expose two competing guidance sections. If storage is unavailable or invalidated, omit memory and continue the user task.
+Normal preparation and request projection use no additional memory-related LLM request. When eligible, provide at most one request-local carrier containing the selected-version summary, workspace applicability, pin identity and version-specific guidance under Section 6.2. Dual writing must not combine two versions. Reading disabled/excluded, non-foreground use, no eligible generation, no usable summary, unsafe preparation or invalidation omits the current carrier; ordinary omission continues the task. Unsafe unremovable active leftovers follow Section 6.2.1 rather than being silently sent.
+
+Default content is budgeted summary plus guidance, not an index-only entry. Do not add a host semantic classifier or task-keyword relevance gate. A self-contained task, apparent topic mismatch or cwd absent from source applicability is not itself an omission trigger; explicit configured workspace exclusion still is. The model applies scope/conditions and avoids needless detail retrieval. Not retrieving memory does not refund already included summary tokens.
 
 Publication and reading MUST share the version-specific validity rules in Section 9.4, including the approved grouping adaptation. The reader must not silently reintroduce ordered/unique-heading requirements, a v1 9,999-byte format cap, generated-pointer checks, or a lower `summaryBytes` validity threshold. Continue checking generation/version identity, hashes, paths, eligibility, and revocation.
 
-`summaryBytes` is not an injection eligibility gate. Host context/resource limits remain independent: if the full summary cannot safely be injected, omit the section for that run and expose a resource-budget diagnostic rather than marking the generation invalid, triggering a format repair, or silently truncating/rewriting the stored artifact. This change adds no new budget knob and does not authorize unbounded foreground reads.
+`summaryBytes` is a writer target, not an injection eligibility or persisted-artifact validity gate. Foreground summary representation uses a **2,500-token policy**, separate from the v2 artifact byte cap and from the total request. Do not rewrite the stored artifact, invalidate a valid generation or request writer repair because its foreground representation needs clipping.
 
-The section must label historical content as evidence, not instructions that override current user requests or higher-priority policy. Source text, generated memory, and user-note bodies must never be interpolated into tool definitions or trusted control instructions.
+The complete carrier must fit the request's available input capacity after reserving output and accounting for non-carrier input, including system text, tools and existing conversation. Its budget is the nonnegative remaining capacity, not a newly invented fixed total such as 2,500 tokens. The 2,500 policy limits only summary text; guidance/framing/identity also count toward carrier capacity, and tool declarations/history/retrieval results remain separately accounted input. Use the matching tokenizer when available; otherwise use conservative UTF-8 byte-based upper units with explicit overhead reservation. Report estimates as estimates, not exact provider tokens. Missing reliable capacity/counting information must not authorize an unbounded carrier. This revision adds no configuration migration or new user budget field.
 
-For v1, search `MEMORY.md`, read the relevant task group, and open one or two cited rollout summaries only if needed. For v2, use the injected summary directly when sufficient; read its matching rollout summary when wording, chronology, evidence, or uncertainty could change the answer. Search selected rollout summaries only when a needed route is missing. The v2 reader must never attempt a handbook lookup. Self-contained requests can skip detail retrieval. Stop after a small unsuccessful search rather than browsing every historical source. Historical status is not proof of current repository behavior.
+Apply summary policy first and full-carrier capacity second. Degrade in order: (1) clip summary prose at complete paragraph/line boundaries, retaining fitting complete route units; (2) use a minimal carrier with identity, complete read/safety guidance and only fitting route/scope units; (3) omit the carrier. Preserve UTF-8, intact paths/identifiers and evidence delimiters; never retain a cut route as a valid pointer. Route preservation is budget-bounded, not a guarantee to include all index lines. Choose units in stable original order without semantic ranking. Do not cut safety guidance to keep more evidence. Record omission/truncation locally without echoing bodies. A smaller request budget may reduce the carrier within a run without changing its pin.
+
+Minimal/omitted carriers caused only by budget do not revoke an otherwise valid retrieval pin. Existing per-tool 16-KiB response limits and continuation apply; they are not a claim that accumulated history stays below 16 KiB. Both pin and cached carrier are revoked for privacy/read invalidity instead. No fallback to raw files, another generation/version or a generic file tool may bypass the memory-read contract.
+
+For both versions, use a sufficient summary directly. For v1 detail needs, search `MEMORY.md`, read the matching task group, then one or two cited rollout summaries or optional prose skills only if needed; do not automatically execute a historical procedure. For v2, read the exact matching rollout when wording, chronology, evidence or uncertainty may affect the answer; search selected rollouts only when a necessary route is missing. Do not read a v1 handbook or procedures through v2. Self-contained tasks do not require detail retrieval. Stop after a small unsuccessful search, and verify consequential/changeable claims against current owning sources when warranted: historical status does not prove current behavior.
 
 Register three read-only tools:
 
@@ -806,7 +839,7 @@ No general-purpose standalone CLI is required for v0.1. All core logic remains U
 On source deletion, branch invalidation, context-edit removal, or a user correction/forget:
 
 1. Commit a new shared `control_epoch` and block affected generated memory in both `pipeline_state` rows, including the inactive version. v0.1 may conservatively block both complete views.
-2. Revoke in-memory reader pins at the next tool/prompt boundary. The currently in-flight model request cannot be recalled.
+2. Revoke reader pins and their cached carriers at the next validated preparation/tool/pre-dispatch boundary, including cross-process epoch checks, under Section 6.2.3. User/privacy invalidation cannot trigger automatic recovery in that run. Reject stale tool results. Already admitted/in-flight requests cannot be recalled; cancel best-effort without claiming provider erasure.
 3. For explicit forget, record durable suppression/tombstones before deleting outputs; they prevent startup reimport of the same source lineage. Branch changes instead retire the old head without permanently suppressing it. Context edits invalidate affected revisions; corrections add active correction notes. These temporary changes must not accidentally create permanent source-wide forget tombstones.
 4. Rebuild each enabled version from its remaining eligible same-version evidence and shared active correction notes. For deletion, do not give either consolidator its old potentially contaminated outputs. An inactive version remains blocked until explicitly activated or run and successfully reconciled.
 5. Publish a clean generation for the completing version; unblock only that version after successful validation at the current shared epoch. Success in v1 does not mark v2 reconciled, or vice versa.
@@ -848,12 +881,16 @@ Disabling or uninstalling this package leaves its data intact. `/memory clear` e
 
 Record metadata for capture, skipped eligibility, claimed jobs, provider requests, retries, no-output results, validation failures, generation commits, retrieval, and invalidation. Each event includes IDs, memory version where applicable, duration, bytes, model reference, token/cost data if supplied, and error code. Report per-version usage as a breakdown of the same shared totals, not as separate spending allowances. No prompt bodies, credentials, or full tool results in normal logs.
 
-Status reports the selected version and dual-write targets separately. For each version it distinguishes `warming_up`, `captured`, `pending idle window`, `extracting`, `extracted`, `consolidating`, `published`, `blocked`, and `read invalidated`. “Memory enabled” alone is insufficient evidence that useful data was written or injected.
+Status reports the selected version and dual-write targets separately. Existing writer/scheduler phases remain distinct: `warming_up`, `captured`, `pending idle window`, `extracting`, `extracted`, `consolidating`, `published`, `blocked`, and `read invalidated`.
+
+Foreground carrier diagnostics use three statuses: `disabled` for intentional/unavailable reading; `error` for preparation/integrity/validation failure; `active` for a valid carrier actually projected, with version/generation and full/minimal representation identified. Budget omission must not claim `active` or imply the retrieval pin was revoked. Keep reason codes and local warning counts for clipping, minimal representation, omission and mid-run invalidation; distinguish ordinary invalidation from an integrity error. Deduplicate notifications by run/reason and expose details through status/doctor. No new telemetry, prompt bodies or unsolicited user-visible warning spam; explicit status/doctor/command responses remain informative. The same reason code may not mean both successful projection and known residual conflict.
+
+“Memory enabled” alone is insufficient evidence that useful data was written or injected.
 
 Proposed performance gates on a 2-vCPU, 4-GB Linux host with local SSD and 256 selected sources per version (512 versioned extractions in dual-write mode):
 
-- Cached prompt-section preparation: p95 <20 ms; no network.
-- Bounded state/view refresh: p95 <100 ms; fail open after 200 ms.
+- Cached request-carrier preparation/projection: p95 <20 ms; no network.
+- Bounded state/view refresh: p95 <100 ms; after 200 ms stop the memory operation and continue ordinary Pi without stale memory. Unsafe unremovable carrier residue instead requires the native whole-run abort in Section 6.2.1; timeout never authorizes sending it.
 - Search/read: p95 <250 ms within the configured 16-KiB output budget.
 - Checkpoint hooks: target <100 ms and yield for large sessions; never run synchronous full-history serialization in a tool or provider-stream event.
 - Shutdown-owned work: complete local cleanup/abort within 500 ms; jobs remain recoverable if cleanup is interrupted.
@@ -881,13 +918,13 @@ These are acceptance targets, not measured claims. Use bounded SQLite operations
 | T12 | No reusable signal | No-output result stored once; no repeated extraction churn |
 | T13 | Parallel pi processes | One accepted extraction per revision/version/prompt and one published consolidation winner at a time |
 | T14 | Crash at each publication boundary | Readers see complete old or complete new generation, never a mixture |
-| T15 | Memory tool output appears in session | It is excluded from future extraction; no self-reinforcement loop |
+| T15 | Memory carrier/tool output and assistant quotation | Direct carrier is absent from canonical persistence/capture/compactor input; retrieval learning payload is excluded; assistant quotation is identified as a possible indirect path, not proof of zero relearning |
 | T16 | Correction/forget then provider outage | Revoked memory is unavailable; it is not served because rebuild failed |
 | T17 | Provider credentials rotate or model disappears | Resolve through pi; no copied token; no silent provider fallback |
 | T18 | Hostile transcript asks writer to run shell | Writer has no shell/network-fetch tool and cannot escape staging paths |
 | T19 | Budget exhausted | No next request starts; foreground pi remains usable |
 | T20 | Malformed or branching historic JSONL | No file modification; reject ambiguity or require explicit leaf |
-| T21 | Another extension forces system prompt | Diagnose section-injection conflict; do not silently override it |
+| T21 | Another extension forces full system prompt, either registration order | One current owned carrier survives request projection without rewriting force text/tools or canonical history; no normal-override conflict-disable warning; owned legacy leftovers are counted and safely handled, unsafe residual that cannot be safely removed requires whole-run abort before transport |
 | T22 | Disabled or ephemeral mode | No capture/model generation and no unintended persistent artifacts |
 | T23 | v2 extraction schema | Exactly summary + slug; reject extra raw-memory field; v2 DB raw memory remains NULL |
 | T24 | v2 summary crosses 9,000 bytes with Chinese text | Valid UTF-8 and complete retained pointers; omission metadata/marker; accepted summary <= configured cap |
@@ -916,6 +953,22 @@ Revision 3 additionally requires focused regression coverage for the approved va
 - **Required failures:** missing required files, non-UTF-8 summary, wrong marker, missing v2 heading, and v2 summary at or above 10,000 bytes. Retain the existing physical-file, secret, tampered-evidence, privacy, and publication-integrity tests.
 - **No extra semantic gates:** fabricated prose references, missing handbook fields, or unsupported prose do not themselves fail format validation; test their consequences in semantic evaluation, while actual unauthorized reads/writes remain blocked.
 - **Repair and reader parity:** a real required-format/grouping failure gets at most one repair opportunity under existing budgets; a second failure never publishes. Otherwise-valid published artifacts remain readable under the same contract; resource-limited injection is diagnosed separately from invalid artifacts.
+
+### 19.1.1 Revision 4 foreground acceptance matrix
+
+Use an available recent Pi host for the required deterministic host gate and record its actual host/peer runtime versions. Do not require an exact release or a second mandatory version matrix. The earlier 0.87.1 reproduction is supporting research, not an extra CI/release target. Test both memory versions, both memory/override registration orders and full-prompt override on/off. Preserve the existing focused 42-test failure-lifecycle/doctor regression set, require the new deterministic matrix to pass, and require no false conflict diagnostic for a normal full override. This is a future implementation gate; no existing research result certifies it already passed.
+
+Each combination must exercise multiple user runs, multiple tool continuations, generation publication and invalidation, budget-full/minimal/omitted representations, and synthetic compaction. Assert request contents after context transforms, forced projection and `convertToLlm`, separately from canonical/session contents. Check leading system and tool declaration additions/removals, unchanged force text, exactly attributed current carriers, anchor and tool pairing, and no direct carrier persistence. Include an earlier ordinary handler that folds system state, an explicit deletion outside the guarantee, and owned/ambiguous legacy leftovers.
+
+Boundary tests additionally cover same-run publication without switching, the single allowed clean background re-acquisition, rejection of old cursors, user forget/correction/clear without re-acquisition, read disable, retention expiry, cross-process and unclassified epoch changes, resume/tree/reload/shutdown, cached content invalidation and a race at the pre-dispatch admission point. Cover payload replacement and whole-run `ctx.abort()` separately; a caught exception or invented cancel return must not pass the cancellation test. Validate no stale tool output after revocation, no unsafe carrier admitted after observed invalidation, and no claim to erase an already admitted request.
+
+Budget tests cover guidance/identity overhead, non-carrier context and output reservation, tokenizer/byte-estimate paths, intact UTF-8 and full route units, route sets too large to preserve, zero available capacity, guidance alone too large, valid tools remaining available after budget-only omission, and no artifact rewrite or format repair. Verify diagnostics for full, clipped, minimal, omitted, disabled and invalid states without unsolicited protocol output.
+
+The compulsory matrix is deterministic and does not call a paid model or require a full live agent session for every scenario. Synthetic compaction is labeled synthetic, not actual session integration. Section 19.3's broader existing release gates remain unchanged. Optional provider observations must separately report actual serialized input/tokens, cache metrics supplied by the provider, latency and costs; complete-message prefix length is not any of those. Actual cache/cost measurements and extra multi-version host runs are not revision 4 spec-finalization prerequisites, and no measured benefit is claimed without them.
+
+### 19.1.2 Revision 4 specification-finalization gate
+
+Specification finalization is distinct from implementation acceptance and product release. It requires a reviewed, internally consistent revision covering Sections 2.3, 5.4, 6.2, 7.2, 10, 16, 18, T15/T21 and this matrix; no remaining active section-injection or normal-force-disable requirement; explicit budgets, ownership, invalidation and race boundaries; and the preserve/adapt/depart checklist in Section 22. Decision-map closure means the user approved the text, not that these future tests or the existing semantic release evaluation ran. Existing background contracts and prompt-source pins must remain intact. The user reviews the consolidated diff before the final acceptance ticket/map are closed.
 
 ### 19.2 Semantic evaluation
 
@@ -962,7 +1015,7 @@ Suggested modules:
 | `src/versions/v1.ts`, `src/versions/v2.ts` | Prompt set, JSON schema, writer allowlist, artifact validation, and read guidance |
 | `src/pipeline/consolidate.ts` | Restricted agent-core loop and tools |
 | `src/pipeline/publish.ts` | Staging validation, fsync, generation CAS |
-| `src/read/` | Prompt section, search/read/list, generation pins |
+| `src/read/` | Request-local carrier, budgets, search/read/list, generation pins and revalidation |
 | `src/control/` | Notes, correction, forgetting, invalidation |
 | `src/commands/` | `/memory` interface and diagnostics |
 | `prompts/upstream/v1/`, `prompts/upstream/v2/` | Immutable pinned Codex prompt families |
@@ -1021,7 +1074,12 @@ Do not implement synchronization or additional memory backends before the semant
 | Consolidated artifact validation | Use Codex's version-specific file/marker/size/heading checks; no extra generated-reference, handbook-field, per-bullet, or heading-order gates |
 | Project/date grouping | Explicit signed-off pi structural adaptation for v1/v2; validate topic scope and valid dates, not semantic truth or repeated child citations |
 | Artifact repair | Retain one bounded validator-feedback repair before failure; unlike the inspected Codex completed-writer failure path |
-| Summary length target | Keep `summaryBytes` as writer guidance, separate from artifact validity and host resource limits; v2's <10,000-byte validity cap remains |
+| Summary length target | Keep `summaryBytes` as writer guidance; separate artifact validity, 2,500-token foreground summary policy and available full-carrier request capacity; v2's <10,000-byte artifact cap remains |
+| Default summary and detail retrieval | Preserve default budgeted summary plus progressive evidence; not a route-only default or host semantic prefilter |
+| Codex developer/history contribution | Adapt to one ephemeral Pi `context_with_system` custom carrier converted to user-role evidence, fixed after the leading system; no new memory section or mixed fallback |
+| Refresh boundary | Deliberate Pi run-level pin consistency, including tool/compaction continuations, with one narrowly classified background-invalidity recovery; not Codex's complete historical-context replay/rebuild mechanism |
+| v1 quick pass | Preserve handbook-first detail routing but allow sufficient-summary answers without mandatory handbook lookup, as in existing Pi guidance |
+| Revocation and diagnostics | Pi-specific epoch/retention/integrity checks, coupled cache invalidation and explicit dispatch admission limitation; no claim Codex already supplies this immutable pin protocol |
 | Codex quota metadata | Replace with explicit provider-neutral budgets |
 | Codex private citation format | Replace with ordinary evidence references and tool metadata |
 | Generated skills/scripts | v1 prose procedures only; none in v2; no auto-registered executable skills |
@@ -1032,13 +1090,13 @@ Preserve Apache-2.0 attribution for reused Codex material and applicable MIT not
 
 ## 23. Known limitations and implementation verification
 
-- The user's installed pi version has not been inspected. Compatibility is pinned to the researched host API; older installs may require upgrading or a separately specified adapter.
+- The user's installed Pi 0.99.1 was inspected for the foreground integration contract; it is historical source evidence, not the only permitted host or a required exact test target. The repository's historical 0.87.1 dependency/source evidence does not prove the new mechanism is implemented or tested on the installed host.
 - These are source-level findings, not an end-to-end runtime benchmark. SDK/tool-call plumbing, cancellation timing, SQLite behavior, and provider compatibility must pass the defined implementation gates.
 - Supporting both pipelines does not establish that either has better recall. Default v1 is an upstream-aligned selection, not a measured quality ranking. Switching cannot remove old injected text from an existing conversation; fresh sessions are required for clean comparisons.
 - Prompt quality and model quality remain material. A correct scheduler cannot guarantee faithful extraction or useful recall.
 - Literal retrieval can miss paraphrases. The initial remedy is better routing summaries and keyword coverage, measured through the evaluation suite.
 - A shared user-level pi store is not a security boundary between mutually untrusted projects. v0.1 is for one user's trusted workspaces; exclude sensitive workspaces or disable reading there.
-- Third-party extensions may spoof user-role content or overwrite the prompt. The memory extension must report known provenance and injection limitations rather than claim perfect isolation.
+- Third-party extensions may spoof user-role content or explicitly delete/rewrite context. Normal full system-prompt override is in scope and must not disable the new carrier merely because it exists; intentional context deletion and perfect isolation are not guaranteed. Ambiguous active legacy memory and effective pre-send cancellation require the defined implementation tests.
 - No client-side system can retract content already present in a running model context or retained by a provider. Forgetting blocks future reads and removes this extension's copies.
 
 ## 24. Source references
@@ -1062,6 +1120,8 @@ The implementation-basis links below are pinned to the inspected commits; C11 ad
 
 - **C12 — Revision 3 validation comparison (2026-09-29):** [workspace.rs L71–129](https://github.com/openai/codex/blob/c248f6d48b97eb4a2aa56147a0b11b7d763278b9/codex-rs/memories/write/src/workspace.rs#L71-L129), [phase2.rs L405–473](https://github.com/openai/codex/blob/c248f6d48b97eb4a2aa56147a0b11b7d763278b9/codex-rs/memories/write/src/phase2.rs#L405-L473), [consolidation.md L604–664](https://github.com/openai/codex/blob/c248f6d48b97eb4a2aa56147a0b11b7d763278b9/codex-rs/memories/write/templates/memories/consolidation.md#L604-L664). Supplemental fixed revision only; no vendored-template repin.
 
+- **C13 — Supplemental current-summary policy:** [summary rendering](https://github.com/openai/codex/blob/bcd6d9ab6b9f26f85d76d0c680b3f88b367bffa0/codex-rs/ext/memories/src/prompts.rs#L31-L63), [2,500-token constant](https://github.com/openai/codex/blob/bcd6d9ab6b9f26f85d76d0c680b3f88b367bffa0/codex-rs/ext/memories/src/lib.rs#L16), [v1 template](https://github.com/openai/codex/blob/bcd6d9ab6b9f26f85d76d0c680b3f88b367bffa0/codex-rs/ext/memories/templates/memories/read_path.md), [v2 template](https://github.com/openai/codex/blob/bcd6d9ab6b9f26f85d76d0c680b3f88b367bffa0/codex-rs/ext/memories/templates/memories/read_path_v2.md). Supplemental content-policy check only; no background-source or vendored-template repin.
+
 ### Pi
 
 - **P1 — Extension lifecycle:** [extensions.md](https://github.com/earendil-works/pi/blob/6f7551516b84278eb9da1c340c8e7bc66be1a6ba/packages/coding-agent/docs/extensions.md).
@@ -1073,6 +1133,13 @@ The implementation-basis links below are pinned to the inspected commits; C11 ad
 - **P7 — Agent runtime:** [agent.ts](https://github.com/earendil-works/pi/blob/6f7551516b84278eb9da1c340c8e7bc66be1a6ba/packages/agent/src/agent.ts), [agent types](https://github.com/earendil-works/pi/blob/6f7551516b84278eb9da1c340c8e7bc66be1a6ba/packages/agent/src/types.ts).
 - **P8 — SDK and discovery boundaries:** [sdk.md](https://github.com/earendil-works/pi/blob/6f7551516b84278eb9da1c340c8e7bc66be1a6ba/packages/coding-agent/docs/sdk.md), [sdk.ts](https://github.com/earendil-works/pi/blob/6f7551516b84278eb9da1c340c8e7bc66be1a6ba/packages/coding-agent/src/core/sdk.ts), [full-control example](https://github.com/earendil-works/pi/blob/6f7551516b84278eb9da1c340c8e7bc66be1a6ba/packages/coding-agent/examples/sdk/12-full-control.ts).
 - **P9 — Prompt sections and agent directory:** [system-prompt.ts](https://github.com/earendil-works/pi/blob/6f7551516b84278eb9da1c340c8e7bc66be1a6ba/packages/coding-agent/src/core/system-prompt.ts), [config.ts](https://github.com/earendil-works/pi/blob/6f7551516b84278eb9da1c340c8e7bc66be1a6ba/packages/coding-agent/src/config.ts).
+
+### Revision 4 research and decisions
+
+- [Codex injection and progressive-read lifecycle](https://github.com/proletariat64/pi-codex-mem/issues/41): full host contribution/history trace at the original pinned Codex commit; static test-source inspection, not a Rust test run.
+- [Pi composition and prefix contract](https://github.com/proletariat64/pi-codex-mem/issues/42) and [second-stage projection and fixed anchor](https://github.com/proletariat64/pi-codex-mem/issues/47): installed-host runner/projection/converter evidence, including synthetic scenarios and their stated limitations.
+- [Carrier decision](https://github.com/proletariat64/pi-codex-mem/issues/43), [timing/content decision](https://github.com/proletariat64/pi-codex-mem/issues/44), [revocation/budget decision](https://github.com/proletariat64/pi-codex-mem/issues/45), and [acceptance/finalization](https://github.com/proletariat64/pi-codex-mem/issues/46): user-confirmed design and final review record.
+- Reproduction/document snapshots are stored under repository `tmp/memory-wayfinder/`; Git research branches retain formal source reports. Record the installed package version used for each execution; there is no exact-version requirement. Installed source locations used for the Pi-specific evidence are `dist/core/extensions/runner.js`, `dist/core/agent-session.js` and `dist/core/messages.js`; package/API integrity and native abort ordering must be recorded by the implementation matrix.
 
 ### Existing user project
 

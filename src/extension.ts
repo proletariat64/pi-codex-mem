@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { accessSync, constants as fsConstants, existsSync, lstatSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
@@ -20,9 +20,7 @@ import {
 } from "./config.ts";
 import {
   checkHostCompat,
-  MIN_PI_VERSION,
   REQUIRED_EVENTS,
-  semverAtLeast,
   type CompatResult,
   type HostCapabilities,
 } from "./pi/compat.ts";
@@ -36,7 +34,9 @@ import type { MemoryVersion } from "./config.ts";
 import { ConsolidationScheduler } from "./pipeline/scheduler.ts";
 import { createConsolidationModelPort } from "./pipeline/model-port.ts";
 import { acquireReadView, type MemoryReadView } from "./read/view.ts";
-import { renderMemorySection } from "./read/inject.ts";
+import { renderMemoryCarrier } from "./read/inject.ts";
+import { MemoryRunReader, validateReadView } from "./read/run.ts";
+import { hasUnsafeMemoryResidue, projectMemoryMessages, providerHasLegacyResidue, removeProviderCarrier, requestCapacity } from "./read/projection.ts";
 import { cleanupGenerations } from "./pipeline/publish.ts";
 import { createMemoryTools, type MemoryConsumer } from "./read/tools.ts";
 import { getPublishedGeneration } from "./store/consolidation.ts";
@@ -159,10 +159,14 @@ export default function (pi: ExtensionAPI) {
   let explicitRun: ExplicitMemoryRun | null = null;
   let runtimePort: ReturnType<typeof createRegistryModelPort> | null = null;
   let consolidationPort: ReturnType<typeof createConsolidationModelPort> | null = null;
-  let readerPin: MemoryReadView | null = null;
+  const reader = new MemoryRunReader();
+  // Only dispatch-fence identity and fingerprints survive revocation; no evidence body/view.
+  let projectedIdentity: string | null = null;
+  const pinIdentity = (pin: MemoryReadView) => JSON.stringify([pin.memoryVersion, pin.generationId, pin.controlEpoch, pin.manifestHash]);
+  const projectedFingerprints = new Set<string>();
   let foregroundRun: MemoryConsumer | null = null;
   let foregroundPrompt: string | null = null;
-  let foregroundOptions: { sections?: unknown; forceSystemPrompt?: unknown } | null = null;
+  let foregroundPromptOptions: { forceSystemPrompt?: unknown } | null = null;
   let persistentCapture = true;
   let retentionTimer: NodeJS.Timeout | null = null;
   let heartbeat: NodeJS.Timeout | null = null;
@@ -173,7 +177,7 @@ export default function (pi: ExtensionAPI) {
   let activeMode = "";
 
   for (const tool of createMemoryTools({ root: resolveMemoryRoot(), db: () => state.db,
-    view: () => readerPin, consumer: () => foregroundRun,
+    view: () => reader.pin, consumer: () => foregroundRun,
     maxUnusedDays: () => state.config?.status === "ok" ? state.config.config.schedule.maxUnusedDays : 30 })) {
     pi.registerTool({ ...tool, async execute(id, args, signal, _update, ctx) {
       const root = resolveMemoryRoot(); const config = loadConfig(root, { create: false });
@@ -181,9 +185,17 @@ export default function (pi: ExtensionAPI) {
         const facts = { config: config.config, flag: flagMode(), workspaceExcluded: false };
         if (canReadMemory(facts) && canAccessMemoryStore(root) &&
             recheckEligibilityWithWorkspace(config.config, ctx.cwd, facts, canReadMemory)) {
-          return tool.execute(id, args, signal);
+          if (validateReader(ctx)) {
+            const pin = reader.pin;
+            const output = await tool.execute(id, args, signal);
+            if (reader.pin === pin && validateReader(ctx, false)) {
+              if (output.details?.error !== "memory_unavailable") return output;
+              reader.invalidate("tool_integrity", false, true);
+            }
+          }
         }
       }
+      if (reader.pin) reader.invalidate("read_disabled");
       return { content: [{ type: "text", text: "Memory unavailable." }],
         details: { items: [], truncated: false, cursor: null, error: "memory_unavailable" } };
     } });
@@ -235,7 +247,7 @@ export default function (pi: ExtensionAPI) {
   }
   function afterNoteChange(root: string, corrected: boolean): void {
     if (corrected) {
-      readerPin = null;
+      reader.invalidate("user_correction");
       if (retentionTimer) clearTimeout(retentionTimer);
       retentionTimer = null;
       try { if (state.db) cleanupRevokedNotes({ root, db: state.db }); }
@@ -332,7 +344,7 @@ export default function (pi: ExtensionAPI) {
       consolidator = new ConsolidationScheduler({ db: state.db, root, modelPort: () => writerPort,
         now: Date.now, isForegroundIdle: () => foregroundIdle,
         config: () => eligibleConsolidationConfig(root),
-        pinnedGenerationIds: () => readerPin ? [readerPin.generationId] : [],
+        pinnedGenerationIds: () => reader.pin ? [reader.pin.generationId] : [],
         onError: (err) => { state.captureError = `consolidation failed: ${(err as Error).message}`; },
       });
     }
@@ -379,22 +391,16 @@ export default function (pi: ExtensionAPI) {
   function armReaderRetention(): void {
     if (retentionTimer) clearTimeout(retentionTimer);
     retentionTimer = null;
-    const pin = readerPin;
+    const pin = reader.pin;
     if (!pin || pin.retentionDeadline === null) return;
     retentionTimer = setTimeout(() => {
       retentionTimer = null;
-      if (readerPin !== pin) return;
-      try {
-        const live = state.db ? getPublishedGeneration(state.db, pin.memoryVersion, Date.now(),
-          { generationId: pin.generationId, maxUnusedDays: state.config?.status === "ok" ? state.config.config.schedule.maxUnusedDays : 30,
-            extractionPromptHash: pin.extractionPromptHash }) : null;
-        if (live && live.controlEpoch === pin.controlEpoch && live.manifestHash === pin.manifestHash) {
-          pin.retentionDeadline = live.retentionDeadline;
-          armReaderRetention();
-          return;
-        }
-      } catch { /* An unavailable store cannot keep a cached view readable. */ }
-      readerPin = null;
+      if (reader.pin !== pin) return;
+      const validation = withReaderDb(db => validateReadView(db, resolveMemoryRoot(), pin,
+        state.config?.status === "ok" ? state.config.config.schedule.maxUnusedDays : 30),
+        { valid: false, reason: "validation_unavailable", error: true });
+      if (validation.valid) { armReaderRetention(); return; }
+      reader.invalidate(validation.reason, Boolean(validation.recoverable), Boolean(validation.error));
       consolidator?.trigger();
     }, Math.max(0, Math.min(2_147_483_647, pin.retentionDeadline - Date.now())));
     retentionTimer.unref();
@@ -411,7 +417,7 @@ export default function (pi: ExtensionAPI) {
         if (state.db) prunePrivacyRevoked(state.db, root);
         else state.db = openStateDb(root);
         cleanupGenerations({ db: state.db, root, now: Date.now(),
-          pinnedGenerationIds: readerPin ? [readerPin.generationId] : [] });
+          pinnedGenerationIds: reader.pin ? [reader.pin.generationId] : [] });
         ensureScheduler();
         triggerScheduler();
         privacyRetryCount = 0;
@@ -469,10 +475,13 @@ export default function (pi: ExtensionAPI) {
   }
 
   function markForegroundSettled(): void {
-    foregroundRun = null;
+    reader.release();
+    projectedIdentity = null; projectedFingerprints.clear();
+    if (retentionTimer) clearTimeout(retentionTimer); retentionTimer = null;
+    foregroundRun = null; foregroundPromptOptions = null;
     foregroundPrompt = null;
-    foregroundOptions = null;
-    readerPin = null;
+    foregroundPromptOptions = null;
+    reader.release();
     if (heartbeat) clearInterval(heartbeat);
     heartbeat = null;
     foregroundIdle = true;
@@ -486,7 +495,7 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  async function probeHost(ctx: { sessionManager?: unknown; modelRegistry?: unknown }): Promise<HostCapabilities> {
+  async function probeHost(ctx: { sessionManager?: unknown; modelRegistry?: unknown; abort?: unknown; getSystemPrompt?: unknown }): Promise<HostCapabilities> {
     let hasNodeSqlite = false;
     try {
       await import("node:sqlite");
@@ -496,21 +505,25 @@ export default function (pi: ExtensionAPI) {
     }
     const sm = ctx.sessionManager as { getBranch?: unknown } | undefined;
     const mr = ctx.modelRegistry as { find?: unknown; streamSimple?: unknown } | undefined;
-    const piOk = semverAtLeast(PI_VERSION, MIN_PI_VERSION);
     return {
       nodeVersion: process.versions.node,
+      piVersion: PI_VERSION,
       hasNodeSqlite,
-      // Event support is pinned by host version: registration does not throw
-      // on unknown names, so pi >= MIN_PI_VERSION is the documented proxy.
-      events: piOk ? REQUIRED_EVENTS : [],
-      // Refined at runtime by the before_agent_start probe below.
-      hasStructuredPromptSections: piOk,
+      // Recent host APIs are capability-based; version is diagnostic metadata only.
+      // Real runner/transport tests establish semantics, not registration or method
+      // presence alone. Provider cancellation is best-effort under the accepted send race.
+      hasNativeRunAbort: typeof ctx.abort === "function",
+      hasLeadingSystemPreservation: typeof ctx.getSystemPrompt === "function",
+      hasToolPreservation: typeof pi.getActiveTools === "function" && typeof pi.getAllTools === "function",
+      events: typeof pi.on === "function" ? REQUIRED_EVENTS : [],
       hasBranchAccess: typeof sm?.getBranch === "function",
       hasModelRegistryAccess: typeof mr?.find === "function" && typeof mr?.streamSimple === "function",
     };
   }
 
   pi.on("session_start", async (_event, ctx) => {
+    reader.release(); projectedIdentity = null; projectedFingerprints.clear();
+    foregroundRun = null; foregroundPromptOptions = null;
     cancelPrivacyCleanup();
     if (heartbeat) clearInterval(heartbeat);
     heartbeat = null;
@@ -519,9 +532,8 @@ export default function (pi: ExtensionAPI) {
     consolidator = null;
     runtimePort = null;
     consolidationPort = null;
-    readerPin = null;
-    foregroundRun = null;
-    foregroundOptions = null;
+    reader.release(); projectedIdentity = null; projectedFingerprints.clear();
+    foregroundRun = null; foregroundPromptOptions = null;
     if (retentionTimer) clearTimeout(retentionTimer);
     retentionTimer = null;
     try {
@@ -655,7 +667,7 @@ export default function (pi: ExtensionAPI) {
         },
       });
       cleanupGenerations({ db: state.db, root, now: Date.now(),
-        pinnedGenerationIds: readerPin ? [readerPin.generationId] : [] });
+        pinnedGenerationIds: reader.pin ? [reader.pin.generationId] : [] });
       state.captureError = null;
       if (state.capture.status === "captured" && config.config.generate) {
         for (const version of targetVersions(config.config)) {
@@ -672,18 +684,7 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  function diagnosePromptConflict(ctx: ExtensionContext): boolean {
-    if (foregroundOptions?.forceSystemPrompt === undefined) return false;
-    const diagnosed = state.promptSections === "conflict";
-    state.promptSections = "conflict"; readerPin = null;
-    if (retentionTimer) clearTimeout(retentionTimer); retentionTimer = null;
-    const sections = foregroundOptions.sections;
-    if (sections && typeof sections === "object" && !Array.isArray(sections)) delete (sections as Record<string, string>).pi_memory;
-    if (!diagnosed && ctx.hasUI) ctx.ui.notify("pi-memory: section_injection_conflict — another extension forced a full system prompt; memory injection disabled for this run", "warning");
-    return true;
-  }
-
-  pi.on("agent_start", (_event, ctx) => { markForegroundActive(ctx); diagnosePromptConflict(ctx); });
+  pi.on("agent_start", (_event, ctx) => { markForegroundActive(ctx); });
   pi.on("agent_settled", (_event, ctx) => {
     captureNow(ctx);
     // A brand-new memory root only creates its store on first capture.
@@ -695,6 +696,8 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_before_compact", (_event, ctx) => captureNow(ctx));
 
   pi.on("session_tree", (_event, ctx) => {
+    reader.invalidate("session_replaced"); foregroundRun = null; foregroundPromptOptions = null;
+    if (retentionTimer) clearTimeout(retentionTimer); retentionTimer = null;
     const root = resolveMemoryRoot();
     if (!canAccessMemoryStore(root)) return;
     try {
@@ -709,7 +712,8 @@ export default function (pi: ExtensionAPI) {
       // All previous selected heads are conservatively retired until the
       // new branch is captured and validated (§5.3, T08).
       retireOtherHeads(state.db, key, "");
-      readerPin = null;
+      reader.invalidate("session_replaced");
+      foregroundRun = null; foregroundPromptOptions = null;
       state.capture = null;
       triggerScheduler();
     } catch (err) {
@@ -720,15 +724,15 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
-    foregroundRun = null;
-    foregroundOptions = null;
+    reader.release(); projectedIdentity = null; projectedFingerprints.clear();
+    foregroundRun = null; foregroundPromptOptions = null;
     cancelPrivacyCleanup();
     if (heartbeat) clearInterval(heartbeat);
     heartbeat = null;
     await stopGeneration(ctx);
     scheduler = null;
     consolidator = null;
-    readerPin = null;
+    reader.invalidate("read_invalidated");
     if (retentionTimer) clearTimeout(retentionTimer);
     retentionTimer = null;
     try {
@@ -759,14 +763,13 @@ export default function (pi: ExtensionAPI) {
     foregroundRun = { consumerSession, runId: randomUUID() };
     foregroundPrompt = typeof event.prompt === "string" ? event.prompt : null;
     const opts = event.systemPromptOptions as { sections?: unknown; forceSystemPrompt?: unknown } | undefined;
-    foregroundOptions = opts ?? null;
-    if (opts && typeof opts === "object" && "sections" in opts) {
-      state.promptSections = "confirmed";
-    } else {
-      // A real foreground run without structured sections: injection cannot
-      // work here. Diagnose it (doctor reports this as unavailable) instead
-      // of leaving the capability looking merely unobserved.
-      state.promptSections = "unavailable";
+    foregroundPromptOptions = opts ?? null;
+    // Projection capability does not depend on mutable system sections or a full override.
+    state.promptSections = "confirmed";
+    // A named legacy section is reliably owned. A captured copy in an opaque force prompt
+    // is checked separately, and must not be destructively edited.
+    if (opts?.sections && typeof opts.sections === "object" && !Array.isArray(opts.sections)) {
+      delete (opts.sections as Record<string, unknown>).pi_memory;
     }
     // spec §5.4: sample configuration before each foreground run, so
     // mid-session edits take effect here rather than only at restart.
@@ -787,51 +790,129 @@ export default function (pi: ExtensionAPI) {
         else if (ctx.hasUI) ctx.ui.notify(`pi-memory: model default not saved — ${saved.reason}`, "warning");
       }
     }
-    readerPin = null;
-    state.readDiagnostic = null;
-    if (retentionTimer) clearTimeout(retentionTimer);
-    retentionTimer = null;
     const latest = state.config;
-    if (diagnosePromptConflict(ctx)) return;
-    const sections = opts?.sections;
-    if (!sections || typeof sections !== "object" || Array.isArray(sections)) return;
-    const sectionMap = sections as Record<string, string>;
-    delete sectionMap.pi_memory;
-    if (!state.compat?.supported || typeof ctx.cwd !== "string" || latest.status !== "ok") return;
-    const readFacts = { config: latest.config, flag: flagMode(), workspaceExcluded: false };
-    if (!canReadMemory(readFacts) || !canAccessMemoryStore(root) ||
-        !recheckEligibilityWithWorkspace(latest.config, ctx.cwd, readFacts, canReadMemory)) return;
-    let readerDb: DatabaseSync | undefined;
-    try {
-      if (!state.db) {
-        const path = join(root, "state.sqlite");
-        if (!existsSync(path) || lstatSync(path).isSymbolicLink()) return;
-        readerDb = new DatabaseSync(path, { readOnly: true });
-        readerDb.exec("PRAGMA busy_timeout = 50");
-      }
-      readerPin = acquireReadView({ db: state.db ?? readerDb!, root,
-        memoryVersion: latest.config.version, summaryBytes: latest.config.limits.summaryBytes,
-        maxUnusedDays: latest.config.schedule.maxUnusedDays,
-        extractionPromptHash: latest.config.version === "v1" ? v1PromptHash() : v2PromptHash() });
-      if (!readerPin) return;
-      const section = renderMemorySection(readerPin, ctx.cwd);
-      const usage = ctx.getContextUsage?.();
-      const window = usage?.contextWindow ?? ctx.model?.contextWindow;
-      // Same conservative byte/token margin as generation, independent of summaryBytes.
-      if (window && Buffer.byteLength(section, "utf8") > Math.max(0, (window - (usage?.tokens ?? 0)) * 0.7 - 1024)) {
-        state.readDiagnostic = "memory injection omitted: context_budget (generation remains valid)";
-        if (ctx.hasUI) ctx.ui.notify(`pi-memory: ${state.readDiagnostic}`, "warning");
-      } else {
-        sectionMap.pi_memory = section;
-      }
-      armReaderRetention();
-    } catch (readError) {
-      // Fail open, but keep the failure visible to /memory doctor instead of
-      // a fully silent injection loss (observed as a transient sqlite race
-      // during the #16 smoke tests).
-      state.readDiagnostic = `memory injection skipped: ${(readError as Error).message}`;
+    reader.begin(latest.status === "ok" ? latest.config.version : null, ctx.cwd);
+    projectedIdentity = null; projectedFingerprints.clear();
+    state.readDiagnostic = null;
+    if (retentionTimer) clearTimeout(retentionTimer); retentionTimer = null;
+    if (!state.compat?.supported || latest.status !== "ok") {
+      reader.invalidate("reading_unavailable"); return;
     }
-    finally { readerDb?.close(); }
+    if (!readEligible(ctx)) { reader.invalidate("read_disabled"); return; }
+    reader.pin = acquireReader();
+    if (reader.pin) reader.report("disabled", "prepared");
+    armReaderRetention();
+  });
+
+  function withReaderDb<T>(operation: (db: DatabaseSync) => T, fallback: T): T {
+    let db: DatabaseSync | undefined;
+    try {
+      const root = resolveMemoryRoot(); const path = join(root, "state.sqlite");
+      if (!state.db && (!existsSync(path) || lstatSync(path).isSymbolicLink())) return fallback;
+      db = state.db ?? new DatabaseSync(path, { readOnly: true });
+      if (db !== state.db) db.exec("PRAGMA busy_timeout = 50");
+      return operation(db);
+    } catch { return fallback; }
+    finally { if (db && db !== state.db) db.close(); }
+  }
+  function acquireReader(): MemoryReadView | null {
+    if (!reader.version || state.config?.status !== "ok") return null;
+    const version = reader.version; const config = state.config.config;
+    if (!state.db) {
+      const path = join(resolveMemoryRoot(), "state.sqlite");
+      try {
+        if (!existsSync(path)) { reader.report("disabled", "no_eligible_generation"); return null; }
+        // Configuration's control lock may create an empty SQLite placeholder.
+        // Retaining that handle would bypass capture's later schema initialization.
+        const schema = storeSchemaState(resolveMemoryRoot());
+        if (schema === "absent") { reader.report("disabled", "no_eligible_generation"); return null; }
+        if (schema === "unavailable") { reader.report("error", "preparation_unavailable"); return null; }
+        if (lstatSync(path).isSymbolicLink()) { reader.report("error", "preparation_integrity"); return null; }
+        // Existing read stores also support ephemeral foreground retrieval. Never
+        // create a database here or run migrations/capture while acquiring a pin.
+        state.db = new DatabaseSync(path); state.db.exec("PRAGMA busy_timeout = 50");
+      } catch { reader.report("error", "preparation_unavailable"); return null; }
+    }
+    return withReaderDb(db => {
+      const options = { maxUnusedDays: config.schedule.maxUnusedDays,
+        extractionPromptHash: version === "v1" ? v1PromptHash() : v2PromptHash() };
+      const published = getPublishedGeneration(db, version, Date.now(), options);
+      if (!published) { reader.report("disabled", "no_eligible_generation"); return null; }
+      let failureReason: string = "artifact_integrity";
+      const pin = acquireReadView({ db, root: resolveMemoryRoot(), memoryVersion: version, ...options,
+        onFailure: reason => { failureReason = reason; } });
+      if (!pin) reader.report(failureReason === "artifact_integrity" ? "error" : "disabled", failureReason);
+      return pin;
+    }, null);
+  }
+  function readEligible(ctx: ExtensionContext): boolean {
+    const root = resolveMemoryRoot(); const config = loadConfig(root, { create: false });
+    // Configuration version changes are next-run only; read/privacy switches are immediate.
+    if (!foregroundRun || !state.compat?.supported || config.status !== "ok" ||
+        ctx.cwd !== reader.cwd || !canAccessMemoryStore(root)) return false;
+    state.config = config;
+    return recheckEligibilityWithWorkspace(config.config, ctx.cwd,
+      { config: config.config, flag: flagMode(), workspaceExcluded: false }, canReadMemory);
+  }
+  function validateReader(ctx: ExtensionContext, recover = true): boolean {
+    if (!readEligible(ctx)) { reader.invalidate("read_disabled"); return false; }
+    const pin = reader.pin;
+    if (pin) {
+      const validation = withReaderDb(db => validateReadView(db, resolveMemoryRoot(), pin,
+        state.config?.status === "ok" ? state.config.config.schedule.maxUnusedDays : 30),
+        { valid: false, reason: "validation_unavailable", error: true });
+      if (!validation.valid) {
+        reader.invalidate(validation.reason, Boolean(validation.recoverable), Boolean(validation.error));
+        if (retentionTimer) clearTimeout(retentionTimer); retentionTimer = null;
+      }
+    }
+    if (!reader.pin && recover && reader.recover(acquireReader)) armReaderRetention();
+    return Boolean(reader.pin);
+  }
+  function abortUnsafe(ctx: ExtensionContext, reason: string): void {
+    reader.invalidate(reason, false, true);
+    state.readDiagnostic = `memory foreground error: ${reason}; whole run aborted`;
+    ctx.abort();
+  }
+  pi.on("context_with_system", (event, ctx) => {
+    const messages = projectMemoryMessages(event.messages, null);
+    if (hasUnsafeMemoryResidue(messages) || providerHasLegacyResidue({ instructions: foregroundPromptOptions?.forceSystemPrompt })) {
+      abortUnsafe(ctx, "unsafe_owned_residue"); return { messages };
+    }
+    projectedIdentity = null; projectedFingerprints.clear();
+    if (!foregroundRun || !validateReader(ctx)) return { messages };
+    const capacity = requestCapacity(messages, ctx.model?.contextWindow, ctx.model?.maxTokens);
+    const key = JSON.stringify([reader.pin!.memoryVersion, reader.pin!.generationId, reader.pin!.manifestHash,
+      reader.cwd, capacity, "utf8-upper-v1", "read-guidance-v1"]);
+    const rendered = reader.cache?.key === key ? reader.cache : renderMemoryCarrier(reader.pin!, ctx.cwd, { capacity });
+    reader.cache = { key, ...rendered };
+    if (!validateReader(ctx, false)) return { messages };
+    if (rendered.text === null) {
+      reader.report("disabled", rendered.reason, { representation: "omitted", counting: rendered.counting });
+      return { messages };
+    }
+    projectedIdentity = pinIdentity(reader.pin!);
+    projectedFingerprints.add(createHash("sha256").update(rendered.text).digest("hex"));
+    reader.report("active", rendered.reason, { memoryVersion: reader.pin!.memoryVersion,
+      generationId: reader.pin!.generationId, representation: rendered.representation, counting: rendered.counting });
+    return { messages: projectMemoryMessages(messages, rendered.text) };
+  });
+  pi.on("before_provider_request", (event, ctx) => {
+    if (providerHasLegacyResidue(event.payload)) { abortUnsafe(ctx, "unsafe_owned_residue"); return; }
+    if (!projectedIdentity) return;
+    const valid = validateReader(ctx, false) && pinIdentity(reader.pin!) === projectedIdentity;
+    const payload = event.payload as { max_tokens?: number; max_output_tokens?: number; max_completion_tokens?: number } | null;
+    const output = Math.max(ctx.model?.maxTokens ?? Infinity,
+      payload?.max_tokens ?? payload?.max_output_tokens ?? payload?.max_completion_tokens ?? 0);
+    let serializedBytes = Infinity;
+    try { serializedBytes = Buffer.byteLength(JSON.stringify(event.payload), "utf8") + 1024; } catch { /* Unknown effective input fails closed. */ }
+    const fits = Number.isFinite(ctx.model?.contextWindow) && serializedBytes + output <= ctx.model!.contextWindow;
+    if (valid && fits) return; // dispatch admission: bytes after this boundary cannot be recalled
+    const removed = removeProviderCarrier(event.payload, projectedFingerprints);
+    if (!removed.safe) { abortUnsafe(ctx, "unsafe_provider_residue"); return; }
+    projectedIdentity = null; projectedFingerprints.clear();
+    if (valid) reader.report("disabled", "context_budget", { representation: "omitted", counting: "utf8_upper_estimate" });
+    return removed.payload;
   });
 
   function storeSchemaState(root: string): "absent" | "current" | "unavailable" {
@@ -896,6 +977,12 @@ export default function (pi: ExtensionAPI) {
       legacyControlLock: legacyLockPath(root),
       models: { extract: resolveRef(cfg?.models.extract ?? null), consolidate: resolveRef(cfg?.models.consolidate ?? null) },
       promptSections: state.promptSections,
+      foreground: reader.diagnostic.status === "active" && reader.diagnostic.memoryVersion && reader.diagnostic.generationId
+        ? { status: "active", reason: reader.diagnostic.reason, memoryVersion: reader.diagnostic.memoryVersion,
+          generationId: reader.diagnostic.generationId, representation: reader.diagnostic.representation === "minimal" ? "minimal" : "full",
+          pinAvailable: Boolean(reader.pin), warningCounts: reader.diagnostic.warningCounts }
+        : { status: reader.diagnostic.status === "error" ? "error" : "disabled", reason: reader.diagnostic.reason,
+          pinAvailable: Boolean(reader.pin), warningCounts: reader.diagnostic.warningCounts },
     };
   }
 
@@ -974,6 +1061,8 @@ export default function (pi: ExtensionAPI) {
         `generation targets: ${targetVersions(c).join(", ")}`,
         ...(c.dualWrite ? [`dual-write: ${readiness.every(line => line.endsWith(": published")) ? "published both" : "partial"}`] : []),
         ...(state.captureError ? [`capture error: ${state.captureError}`] : []),
+        `foreground: ${reader.diagnostic.status} (${reader.diagnostic.reason}); ${reader.diagnostic.memoryVersion ?? ""} ${reader.diagnostic.generationId ?? ""} ${reader.diagnostic.representation ?? ""}`,
+        `foreground warnings: ${JSON.stringify(reader.diagnostic.warningCounts)}`,
         ...(state.readDiagnostic ? [state.readDiagnostic] : []),
       );
     }
@@ -1068,7 +1157,7 @@ export default function (pi: ExtensionAPI) {
           } });
         consolidation = consolidationPort ? new ConsolidationScheduler({ db, root, config,
           modelPort: () => consolidationPort, now: Date.now, isForegroundIdle: () => foregroundIdle, request,
-          pinnedGenerationIds: () => readerPin ? [readerPin.generationId] : [],
+          pinnedGenerationIds: () => reader.pin ? [reader.pin.generationId] : [],
           onError: (err) => { state.captureError = `consolidation failed: ${(err as Error).message}`; } }) : null;
         manual = { extraction, consolidation, grant: request, db }; explicitRun = manual;
       }
@@ -1159,7 +1248,7 @@ export default function (pi: ExtensionAPI) {
         try {
           const disabled = beginClear(root);
           if (!disabled.ok) throw new Error(disabled.reason);
-          readerPin = null; foregroundRun = null;
+          reader.invalidate("user_clear"); foregroundRun = null; foregroundPromptOptions = null;
           if (retentionTimer) clearTimeout(retentionTimer); retentionTimer = null;
           cancelPrivacyCleanup();
           await scheduler?.stop(); await consolidator?.stop(); scheduler = null; consolidator = null;

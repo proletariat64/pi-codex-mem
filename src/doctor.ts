@@ -3,7 +3,7 @@
 // calls — the adapter performs those checks before calling this.
 
 import type { CompatResult } from "./pi/compat.ts";
-import type { LoadConfigResult, ModelRef } from "./config.ts";
+import type { LoadConfigResult, MemoryVersion, ModelRef } from "./config.ts";
 
 export type ProbeStatus = "ok" | "warn" | "fail";
 
@@ -12,6 +12,21 @@ export interface DoctorProbe {
   label: string;
   status: ProbeStatus;
   detail: string;
+}
+
+/** Metadata only; active means a carrier was actually projected (spec §18). */
+export interface ForegroundDiagnostic {
+  status: "disabled" | "error" | "active";
+  reason: string;
+  memoryVersion?: MemoryVersion;
+  generationId?: string;
+  /** full, clipped (full with clipping), or minimal when active. */
+  representation?: string;
+  counting?: string;
+  /** Run-local reason counts, without memory bodies or unsolicited notifications. */
+  warningCounts?: Readonly<Record<string, number>>;
+  /** Budget omission can leave the independently bounded retrieval pin available. */
+  pinAvailable?: boolean;
 }
 
 export interface DoctorInput {
@@ -34,8 +49,10 @@ export interface DoctorInput {
       | { status: "unset" }
       | { status: "configured"; ref: ModelRef; resolved: boolean };
   };
-  /** Runtime observation of structured prompt sections (spec §2.3 probe). */
-  promptSections: "confirmed" | "unobserved" | "unavailable" | "conflict";
+  /** Latest request-local carrier observation; absent until adapter reports one. */
+  foreground?: ForegroundDiagnostic;
+  /** @deprecated Ignored: full prompt overrides do not disable the revision 4 carrier. */
+  promptSections?: "confirmed" | "unobserved" | "unavailable" | "conflict";
 }
 
 export interface DoctorReport {
@@ -152,16 +169,42 @@ export function runDoctor(input: DoctorInput): DoctorReport {
   probes.push(modelProbe("model:extract", input.models.extract));
   probes.push(modelProbe("model:consolidate", input.models.consolidate));
 
-  const ps = input.promptSections;
-  probes.push(
-    ps === "conflict"
-      ? { id: "prompt-sections", label: "prompt injection", status: "fail", detail: "section_injection_conflict: another extension forced a full system prompt; pi_memory section injection is disabled" }
-      : ps === "confirmed"
-      ? { id: "prompt-sections", label: "prompt injection", status: "ok", detail: "structured system-prompt sections observed at runtime" }
-      : ps === "unobserved"
-        ? { id: "prompt-sections", label: "prompt injection", status: "warn", detail: "structured sections not yet observed (no foreground run this session)" }
-        : { id: "prompt-sections", label: "prompt injection", status: "fail", detail: "host did not expose structured system-prompt sections — injection would fail" },
-  );
+  const fg = input.foreground;
+  let foregroundProbe: DoctorProbe;
+  if (!fg) {
+    foregroundProbe = {
+      id: "foreground", label: "memory carrier", status: "warn",
+      detail: "request-local carrier not yet observed; enabled configuration alone does not prove projection",
+    };
+  } else {
+    let stateDetail: string;
+    let status: ProbeStatus;
+    if (fg.status === "active") {
+      if (!fg.memoryVersion || !fg.generationId || !["full", "clipped", "minimal"].includes(fg.representation ?? "")) {
+        status = "fail";
+        stateDetail = `error: incomplete_foreground_diagnostic (${fg.reason}); active projection cannot be verified`;
+      } else {
+        status = "ok";
+        stateDetail = `active: ${fg.memoryVersion}/${fg.generationId}, ${fg.representation} carrier projected (${fg.reason})`;
+      }
+    } else {
+      status = fg.status === "error" ? "fail" : "warn";
+      stateDetail = `${fg.status}: ${fg.reason}; no active carrier`;
+    }
+    if (fg.counting) stateDetail += `; counting=${fg.counting}`;
+    const pinDetail = fg.pinAvailable === undefined ? ""
+      : `; retrieval pin ${fg.pinAvailable ? "available" : "unavailable"}`;
+    const counts = Object.entries(fg.warningCounts ?? {})
+      .filter(([, count]) => count > 0)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([reason, count]) => `${reason}=${count}`);
+    foregroundProbe = {
+      id: "foreground", label: "memory carrier",
+      status,
+      detail: `${stateDetail}${pinDetail}${counts.length ? `; warnings: ${counts.join(", ")}` : ""}`,
+    };
+  }
+  probes.push(foregroundProbe);
 
   const ok = probes.every((probe) => probe.status !== "fail");
   return {

@@ -9,7 +9,7 @@ Spoken decisions, rationale, and failures from past sessions become a small, val
 
 ## Installation
 
-Requires Node >= 22.19.0 and pi >= 0.87.1. Install from a local checkout:
+Requires Node >= 22.19.0 and a recent Pi host with the required lifecycle, request-projection and cancellation capabilities. Pi versions are not pinned or checked against an exact allowlist; unsupported capabilities are diagnosed without falling back to system-section injection. Install from a local checkout:
 
 ```sh
 pi install /path/to/pi-codex-mem
@@ -56,7 +56,9 @@ Generation runs when pi is idle; schedules, byte budgets, and daily token/reques
 | `/memory dual-write on|off` | Persist dual-write |
 | `/memory clear --confirm` | Erase all memory data; capture and generation stay disabled until you re-enable them |
 
-During a run, published memory is injected as a `pi_memory` system-prompt section, and the `pi_memory_search` / `pi_memory_read` / `pi_memory_list` tools expose detail evidence. Tools never expose shell or arbitrary file access; every artifact is validated before publication (revision 3 contract).
+During a foreground run, published memory is projected as one request-local `pi_memory` custom carrier immediately after the leading system message. Full system-prompt overrides remain unchanged; the carrier is not appended to canonical history or supplied directly to capture/compaction. Its summary uses a 2,500-token policy and the complete carrier must also fit the remaining request capacity after non-memory input and output reservation. When no matching tokenizer is available, UTF-8 bytes are conservative estimated upper units, not exact provider token counts.
+
+The `pi_memory_search` / `pi_memory_read` / `pi_memory_list` tools expose detail evidence from the same run pin. Budget-only carrier omission does not revoke retrieval; privacy, read-disable, epoch and integrity failures revoke both pin and cached content. Tools never expose shell or arbitrary file access; publication and reading retain the revision 3 artifact contract.
 
 ## Deletion and privacy semantics
 
@@ -68,7 +70,9 @@ During a run, published memory is injected as a `pi_memory` system-prompt sectio
 ## Limitations
 
 - Quality is bounded by the configured models; the release gate evaluated gpt-6-luna (see `docs/operations/release-gate.md`).
-- PROMPT-section injection is skipped (diagnosed via `/memory doctor`) when the context is nearly exhausted or another extension forces a full system prompt.
+- Full system-prompt overrides do not disable memory. Insufficient request capacity clips, minimizes or omits the request-local carrier; `/memory status` and `/memory doctor` report the representation and local reason counts without warning spam.
+- Provider cancellation is best-effort: on the exercised Pi host, a reused Codex WebSocket can still send after `ctx.abort()` at the pre-provider hook. This is an accepted host limitation, not a release blocker or a reason to disable Codex foreground reading. Validity checks and safe stale-carrier removal remain active; no instantaneous zero-send guarantee is claimed.
+- Already admitted/sent memory and assistant quotations cannot be erased by client-side revocation. Direct carrier persistence is prevented; zero indirect recirculation is not guaranteed.
 - No sync, no Bun-binary pi, no additional backends in v0.1.0.
 - English and Chinese are exercised; no claim about other languages.
 

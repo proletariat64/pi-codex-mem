@@ -24,23 +24,27 @@ const hash = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex")
 /** Fail open using only the DB-selected generation; never discover staging or orphans. */
 export function acquireReadView(input: {
   db: DatabaseSync; root: string; memoryVersion: MemoryVersion; now?: number; summaryBytes?: number; maxUnusedDays?: number;
-  extractionPromptHash?: string;
+  extractionPromptHash?: string; generationId?: string;
+  onFailure?: (reason: "refresh_timeout" | "artifact_integrity" | "read_invalidated") => void;
 }): MemoryReadView | null {
   const started = performance.now();
+  const fail = (reason: "refresh_timeout" | "artifact_integrity" | "read_invalidated" = "artifact_integrity") => {
+    input.onFailure?.(reason); return null;
+  };
   try {
     const generation = getPublishedGeneration(input.db, input.memoryVersion, input.now ?? Date.now(),
-      { maxUnusedDays: input.maxUnusedDays, extractionPromptHash: input.extractionPromptHash });
+      { generationId: input.generationId, maxUnusedDays: input.maxUnusedDays, extractionPromptHash: input.extractionPromptHash });
     if (!generation) return null;
     const expected = resolve(input.root, "versions", input.memoryVersion, "generations", generation.generationId);
-    if (resolve(generation.directory) !== expected) return null;
+    if (resolve(generation.directory) !== expected) return fail();
     const tail = relative(resolve(input.root), expected);
-    if (tail.startsWith("..") || tail.startsWith(sep)) return null;
+    if (tail.startsWith("..") || tail.startsWith(sep)) return fail();
     let parent = resolve(input.root);
-    if (!lstatSync(parent).isDirectory() || lstatSync(parent).isSymbolicLink()) return null;
+    if (!lstatSync(parent).isDirectory() || lstatSync(parent).isSymbolicLink()) return fail();
     for (const part of tail.split(sep)) {
       parent = join(parent, part);
       const stat = lstatSync(parent);
-      if (stat.isSymbolicLink() || !stat.isDirectory()) return null;
+      if (stat.isSymbolicLink() || !stat.isDirectory()) return fail();
     }
     const read = (name: string, maximum: number) => {
       const path = join(expected, name);
@@ -49,29 +53,31 @@ export function acquireReadView(input: {
       return readFileSync(path);
     };
     const manifestBytes = read("manifest.json", 1024 * 1024);
-    if (hash(manifestBytes) !== generation.manifestHash) return null;
+    if (hash(manifestBytes) !== generation.manifestHash) return fail();
     const manifest = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(manifestBytes)) as {
       memoryVersion?: unknown; controlEpoch?: unknown; fileHashes?: Record<string, string>;
       sources?: Array<{ cwd?: unknown }>;
     };
-    if (manifest.memoryVersion !== input.memoryVersion || manifest.controlEpoch !== generation.controlEpoch || !manifest.fileHashes) return null;
+    if (manifest.memoryVersion !== input.memoryVersion || manifest.controlEpoch !== generation.controlEpoch || !manifest.fileHashes) return fail();
     // Use the existing workspace file safety ceiling, not the writer's length target.
     const maximum = input.memoryVersion === "v2" ? 9_999 : 16 * 1024 * 1024;
     const summaryBytes = read("memory_summary.md", maximum);
-    if (hash(summaryBytes) !== manifest.fileHashes["memory_summary.md"]) return null;
+    if (hash(summaryBytes) !== manifest.fileHashes["memory_summary.md"]) return fail();
     const summary = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(summaryBytes);
     validateSummaryFormat(summary, input.memoryVersion);
     if (input.memoryVersion === "v1") {
       const handbook = lstatSync(join(expected, "MEMORY.md"));
-      if (handbook.isSymbolicLink() || !handbook.isFile()) return null;
+      if (handbook.isSymbolicLink() || !handbook.isFile()) return fail();
     }
-    if (performance.now() - started > 200) return null;
+    if (performance.now() - started > 200) return fail("refresh_timeout");
     // Epoch/retention can change while reading files; do not serve a stale cache.
     const latest = getPublishedGeneration(input.db, input.memoryVersion, input.now ?? Date.now(),
-      { maxUnusedDays: input.maxUnusedDays, extractionPromptHash: input.extractionPromptHash });
-    if (latest?.generationId !== generation.generationId || latest.controlEpoch !== generation.controlEpoch) return null;
+      { generationId: generation.generationId, maxUnusedDays: input.maxUnusedDays, extractionPromptHash: input.extractionPromptHash });
+    if (latest?.generationId !== generation.generationId || latest.controlEpoch !== generation.controlEpoch) return fail("read_invalidated");
+    if (latest.manifestHash !== generation.manifestHash || latest.directory !== generation.directory) return fail();
+    if (performance.now() - started > 200) return fail("refresh_timeout");
     return { memoryVersion: input.memoryVersion, generationId: generation.generationId, directory: expected,
       controlEpoch: generation.controlEpoch, manifestHash: generation.manifestHash, summary, retentionDeadline: generation.retentionDeadline,
       extractionPromptHash: input.extractionPromptHash, applicability: [...new Set((manifest.sources ?? []).flatMap((source) => typeof source.cwd === "string" ? [source.cwd] : []))] };
-  } catch { return null; }
+  } catch { return fail(); }
 }

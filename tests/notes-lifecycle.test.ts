@@ -9,7 +9,7 @@ import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import extension from "../src/extension.ts";
 import { defaultConfig } from "../src/config.ts";
-import { makeMockPi } from "./mock-pi.ts";
+import { makeMockPi, projectRequest } from "./mock-pi.ts";
 import { openStateDb } from "../src/store/db.ts";
 import { ConsolidationScheduler } from "../src/pipeline/scheduler.ts";
 
@@ -28,7 +28,9 @@ async function fixture(t: test.TestContext, mode: "tui" | "rpc" = "tui") {
   const mock = makeMockPi(); let modeFlag: string | undefined;
   mock.pi.getFlag = () => modeFlag;
   extension(mock.pi); const notifications: string[] = [];
-  const ctx = { cwd, mode, hasUI: true, isIdle: () => true, ui: { notify: (text: string) => notifications.push(text) },
+  const ctx = { cwd, mode, hasUI: true, isIdle: () => true,
+    model: { provider: "mock", id: "memory", contextWindow: 200_000, maxTokens: 8_000 },
+    ui: { notify: (text: string) => notifications.push(text) },
     modelRegistry: { find: () => undefined, streamSimple: () => { throw new Error("no model configured"); } },
     sessionManager: { getBranch: () => [entry], getHeader: () => header, getSessionFile: () => file, getLeafId: () => entry.id } };
   await mock.fire("session_start", {}, ctx);
@@ -54,7 +56,7 @@ test("commands and the natural-language note tool persist notes with host run/me
   assert.match(JSON.stringify(rejected), /invalid_note/); assert.equal(db.prepare("SELECT COUNT(*) AS n FROM notes").get()!.n, 2);
   await command(`forget note ${toolNote.note_id}`);
   assert.ok(notifications.some(text => /older independently supported/.test(text)));
-  assert.equal(readFileSync(join(root, "config.json"), "utf8").includes('"version":"v1"'), true);
+  assert.equal(JSON.parse(readFileSync(join(root, "config.json"), "utf8")).version, "v1");
 });
 
 test("explicit RPC notes schedule both consolidators without capturing or extracting the RPC transcript", async (t) => {
@@ -147,7 +149,8 @@ test("forget retries revoked generation cleanup after a transient storage error 
       await mock.fire("session_start", {}, ctx);
       const event = { systemPromptOptions: { sections: {} as Record<string, string> } };
       await mock.fire("before_agent_start", event, ctx);
-      assert.equal(event.systemPromptOptions.sections.pi_memory, undefined, `${version} switch must not revive forgotten guidance`);
+      assert.equal(event.systemPromptOptions.sections.pi_memory, undefined, "preparation adds no section");
+      assert.equal((await projectRequest(mock, ctx)).memory, undefined, `${version} switch must not revive forgotten guidance`);
     }
     await command("status"); assert.doesNotMatch(notifications.at(-1)!, /cleanup deferred|Cleanup pending/);
   } finally { fs.rmSync = originalRemove; syncBuiltinESMExports(); }
@@ -164,16 +167,17 @@ test("T28 cross: version switching preserves the foreground pin, leaves an unbui
   const start = async () => {
     const sections: Record<string, string> = {};
     await mock.fire("before_agent_start", { prompt: "Remember: answer in Chinese", systemPromptOptions: { sections } }, ctx);
-    return sections;
+    assert.equal(sections.pi_memory, undefined, "preparation adds no system section");
+    return (await projectRequest(mock, ctx)).memory;
   };
   const list = async () => JSON.parse(JSON.stringify(await mock.tools.get("pi_memory_list")!.execute("list", {}, undefined, undefined, ctx as never)));
-  assert.ok((await start()).pi_memory);
+  assert.ok(await start());
   await command("version v2");
   assert.match(notifications.at(-1) ?? "", /v2 readiness: warming_up/);
   assert.equal(JSON.parse(readFileSync(join(root, "config.json"), "utf8")).version, "v2");
   assert.equal((await list()).details.memoryVersion, "v1");
   await mock.fire("agent_settled", {}, ctx);
-  assert.equal((await start()).pi_memory, undefined);
+  assert.equal(await start(), undefined);
   assert.equal((await list()).details.error, "memory_unavailable");
   await command("dual-write on"); await command("status");
   assert.match(notifications.at(-1)!, /v2 readiness: warming_up/);
@@ -182,7 +186,7 @@ test("T28 cross: version switching preserves the foreground pin, leaves an unbui
   assert.match(notifications.at(-1) ?? "", /v1 readiness: published/);
   assert.equal((await list()).details.error, "memory_unavailable", "an unbuilt pin never falls back mid-run");
   await mock.fire("agent_settled", {}, ctx);
-  assert.ok((await start()).pi_memory);
+  assert.ok(await start());
   assert.equal((await list()).details.memoryVersion, "v1");
 });
 
@@ -208,8 +212,10 @@ test("T38 cross: conflicting version commands persist after restart without chan
   await mock.fire("session_start", {}, ctx);
   const event = { systemPromptOptions: { sections: {} as Record<string, string> } };
   await mock.fire("before_agent_start", event, ctx);
-  assert.match(event.systemPromptOptions.sections.pi_memory ?? "", /Memory version: v2/);
-  assert.doesNotMatch(event.systemPromptOptions.sections.pi_memory ?? "", /Memory version: v1/);
+  assert.equal(event.systemPromptOptions.sections.pi_memory, undefined, "preparation adds no system section");
+  const memory = (await projectRequest(mock, ctx)).memory ?? "";
+  assert.match(memory, /Memory version: v2/);
+  assert.doesNotMatch(memory, /Memory version: v1/);
   const list = await mock.tools.get("pi_memory_list")!.execute("list", {}, undefined, undefined, ctx as never);
   assert.equal((list.details as { memoryVersion?: string }).memoryVersion, "v2");
   assert.equal(JSON.parse(readFileSync(configPath, "utf8")).limits.dailyRequests, 7);

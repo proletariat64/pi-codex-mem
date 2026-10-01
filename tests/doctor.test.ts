@@ -18,7 +18,10 @@ function goodInput(): DoctorInput {
       extract: { status: "configured", ref: { provider: "deepseek", modelId: "deepseek-chat" }, resolved: true },
       consolidate: { status: "configured", ref: { provider: "deepseek", modelId: "deepseek-chat" }, resolved: true },
     },
-    promptSections: "confirmed",
+    foreground: {
+      status: "active", reason: "carrier_full", memoryVersion: "v1",
+      generationId: "gen-1", representation: "full", pinAvailable: true,
+    },
   };
 }
 
@@ -26,7 +29,7 @@ test("healthy input produces an ok report covering all sections", () => {
   const report = runDoctor(goodInput());
   assert.equal(report.ok, true);
   const ids = report.probes.map((p) => p.id);
-  for (const id of ["host", "paths", "config", "store", "model:extract", "model:consolidate", "prompt-sections"]) {
+  for (const id of ["host", "paths", "config", "store", "model:extract", "model:consolidate", "foreground"]) {
     assert.ok(ids.includes(id), `missing probe ${id}`);
   }
   assert.ok(report.probes.every((p) => p.status !== "fail"));
@@ -104,12 +107,14 @@ test("a configured model that does not resolve in the registry fails", () => {
   assert.equal(report.ok, false);
 });
 
-test("unobserved prompt sections warn; unavailable fails", () => {
+test("unobserved foreground warns without claiming active injection", () => {
   const input = goodInput();
-  input.promptSections = "unobserved";
-  assert.equal(runDoctor(input).probes.find((p) => p.id === "prompt-sections")?.status, "warn");
-  input.promptSections = "unavailable";
-  assert.equal(runDoctor(input).probes.find((p) => p.id === "prompt-sections")?.status, "fail");
+  delete input.foreground;
+  const report = runDoctor(input);
+  const probe = report.probes.find((p) => p.id === "foreground");
+  assert.equal(probe?.status, "warn");
+  assert.match(probe?.detail ?? "", /not yet observed/);
+  assert.equal(report.ok, true);
 });
 
 test("legacy lock and corrupt control store are reported as failures", () => {
@@ -129,4 +134,87 @@ test("missing config warns instead of failing or creating", () => {
   const report = runDoctor(input);
   assert.equal(report.probes.find((p) => p.id === "config")?.status, "warn");
   assert.equal(report.ok, true);
+});
+
+test("foreground active reports version, generation, and full/clipped/minimal representation", () => {
+  for (const memoryVersion of ["v1", "v2"] as const) {
+    for (const representation of ["full", "clipped", "minimal"] as const) {
+      const input = goodInput();
+      input.foreground = {
+        status: "active", reason: `carrier_${representation}`, memoryVersion,
+        generationId: "gen-current", representation,
+        warningCounts: representation === "minimal" ? { budget_minimal: 1, summary_clipped: 2 } : {},
+      };
+      const report = runDoctor(input);
+      const probe = report.probes.find((p) => p.id === "foreground");
+      assert.equal(report.ok, true);
+      assert.equal(probe?.status, "ok");
+      assert.ok(probe?.detail.includes(`${memoryVersion}/gen-current`));
+      assert.ok(probe?.detail.includes(`${representation} carrier projected`));
+      if (representation === "minimal") assert.match(probe?.detail ?? "", /budget_minimal=1, summary_clipped=2/);
+    }
+  }
+});
+
+test("budget omission is disabled, not active or a revocation of the retrieval pin", () => {
+  const input = goodInput();
+  input.foreground = {
+    status: "disabled", reason: "budget_omitted", pinAvailable: true,
+    warningCounts: { budget_omitted: 2, summary_clipped: 0 },
+  };
+  const report = runDoctor(input);
+  const probe = report.probes.find((p) => p.id === "foreground");
+  assert.equal(report.ok, true);
+  assert.equal(probe?.status, "warn");
+  assert.match(probe?.detail ?? "", /^disabled: budget_omitted; no active carrier; retrieval pin available/);
+  assert.match(probe?.detail ?? "", /budget_omitted=2/);
+  assert.doesNotMatch(probe?.detail ?? "", /summary_clipped=0|revoked/);
+});
+
+test("intentional disabling and ordinary invalidation are warnings, not integrity errors", () => {
+  for (const reason of ["read_disabled", "warming_up", "retention_expired", "control_epoch_changed"]) {
+    const input = goodInput();
+    input.foreground = { status: "disabled", reason, pinAvailable: false };
+    const report = runDoctor(input);
+    const probe = report.probes.find((p) => p.id === "foreground");
+    assert.equal(report.ok, true);
+    assert.equal(probe?.status, "warn");
+    assert.ok(probe?.detail.includes(reason));
+    assert.match(probe?.detail ?? "", /retrieval pin unavailable/);
+  }
+});
+
+test("foreground preparation/integrity errors fail and preserve the reason code", () => {
+  for (const reason of ["preparation_failed", "manifest_mismatch", "unsafe_legacy_residue"]) {
+    const input = goodInput();
+    input.foreground = { status: "error", reason, pinAvailable: false };
+    const report = runDoctor(input);
+    const probe = report.probes.find((p) => p.id === "foreground");
+    assert.equal(report.ok, false);
+    assert.equal(probe?.status, "fail");
+    assert.match(probe?.detail ?? "", /^error:/);
+    assert.ok(probe?.detail.includes(reason));
+  }
+});
+
+test("normal full prompt overrides and legacy section observations never imply carrier conflict", () => {
+  for (const promptSections of ["confirmed", "unobserved", "unavailable", "conflict"] as const) {
+    const input = { ...goodInput(), promptSections };
+    const report = runDoctor(input);
+    assert.equal(report.ok, true);
+    assert.equal(report.probes.find((p) => p.id === "foreground")?.status, "ok");
+    assert.equal(report.probes.some((p) => p.id === "prompt-sections"), false);
+    assert.doesNotMatch(report.format().join("\n"), /section_injection_conflict|full system prompt/);
+  }
+});
+
+test("doctor does not mutate diagnostic counts or config", () => {
+  const input = goodInput();
+  input.foreground = Object.freeze({
+    status: "disabled", reason: "budget_omitted",
+    warningCounts: Object.freeze({ summary_clipped: 2, budget_omitted: 1 }),
+  });
+  const before = JSON.stringify(input);
+  runDoctor(input).format();
+  assert.equal(JSON.stringify(input), before);
 });

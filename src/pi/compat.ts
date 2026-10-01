@@ -1,6 +1,6 @@
 // Host compatibility check (spec §2.3). Pure predicates over a probed
-// capability object so the check is unit-testable; the extension adapter
-// gathers the real capabilities from pi and Node at session_start.
+// capability object; registration alone does not establish event support
+// or an effective pre-send cancellation fence.
 
 export const REQUIRED_EVENTS = [
   "session_start",
@@ -9,6 +9,8 @@ export const REQUIRED_EVENTS = [
   "session_tree",
   "session_shutdown",
   "before_agent_start",
+  "context_with_system",
+  "before_provider_request",
   "agent_start",
   "agent_before_settle",
   "agent_settled",
@@ -19,10 +21,19 @@ export type RequiredEvent = (typeof REQUIRED_EVENTS)[number];
 export interface HostCapabilities {
   /** e.g. process.versions.node */
   nodeVersion: string;
+  /** Actual host version, not this package's dev dependency version. */
+  piVersion: string;
   hasNodeSqlite: boolean;
-  /** Events the host accepted handler registration for. */
+  /** Verified events; registering an unknown name does not prove support. */
   events: readonly string[];
-  hasStructuredPromptSections: boolean;
+  /** Native ctx.abort binding; transport enforcement requires separate host evidence. */
+  hasNativeRunAbort: boolean;
+  /** Request projection preserves the leading system and other extensions' policy. */
+  hasLeadingSystemPreservation: boolean;
+  /** Effective declarations and tool call/result pairs survive request projection. */
+  hasToolPreservation: boolean;
+  /** @deprecated Revision 4 does not require or use section injection. */
+  hasStructuredPromptSections?: boolean;
   /** ctx.sessionManager.getBranch is available. */
   hasBranchAccess: boolean;
   /** ctx.modelRegistry.find + streamSimple are available. */
@@ -35,8 +46,6 @@ export interface CompatResult {
 }
 
 export const MIN_NODE_VERSION = "22.19.0";
-/** Event support is pinned by host version (registration never throws). */
-export const MIN_PI_VERSION = "0.87.1";
 
 function parseVersion(v: string): [number, number, number] | null {
   const m = /^(\d+)\.(\d+)\.(\d+)/.exec(v);
@@ -58,8 +67,9 @@ export function semverAtLeast(version: string, minimum: string): boolean {
 }
 
 /**
- * Check a probed host. Unsupported hosts must disable memory behavior with
- * one diagnostic (spec §2.3) — never silently use older event semantics.
+ * Unsupported hosts disable memory with a diagnostic (spec §2.3), never
+ * silently reverting to system-section injection or older event semantics.
+ * These predicates do not replace the target-host abort/transport tests.
  */
 export function checkHostCompat(caps: HostCapabilities): CompatResult {
   const problems: string[] = [];
@@ -71,11 +81,17 @@ export function checkHostCompat(caps: HostCapabilities): CompatResult {
   }
   for (const event of REQUIRED_EVENTS) {
     if (!caps.events.includes(event)) {
-      problems.push(`host does not support the "${event}" extension event (inferred from pi version < ${MIN_PI_VERSION}; registration alone cannot detect this)`);
+      problems.push(`host does not support the "${event}" extension event (required capability; registration alone cannot detect this)`);
     }
   }
-  if (!caps.hasStructuredPromptSections) {
-    problems.push("host lacks structured system prompt sections (before_agent_start systemPromptOptions.sections)");
+  if (!caps.hasNativeRunAbort) {
+    problems.push("host lacks the native whole-run abort binding (ctx.abort); caught handler exceptions cannot substitute for cancellation");
+  }
+  if (!caps.hasLeadingSystemPreservation) {
+    problems.push("host lacks leading system and extension-policy preservation during request projection");
+  }
+  if (!caps.hasToolPreservation) {
+    problems.push("host lacks effective tool declaration and tool call/result preservation during request projection");
   }
   if (!caps.hasBranchAccess) {
     problems.push("host lacks session branch access (ctx.sessionManager.getBranch)");

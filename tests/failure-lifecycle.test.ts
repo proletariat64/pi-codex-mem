@@ -12,7 +12,7 @@ import { openStateDb } from "../src/store/db.ts";
 import { ConsolidationScheduler } from "../src/pipeline/scheduler.ts";
 import { addNote } from "../src/control/notes.ts";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
-import { makeMockPi } from "./mock-pi.ts";
+import { makeMockPi, projectRequest } from "./mock-pi.ts";
 
 function fixture(t: test.TestContext, version: MemoryVersion, options: { ephemeral?: boolean; flag?: string; configured?: boolean } = {}) {
   const base = fs.mkdtempSync(join(tmpdir(), "pi-failure-lifecycle-")); const cwd = join(base, "repo"); fs.mkdirSync(cwd);
@@ -44,24 +44,34 @@ function fixture(t: test.TestContext, version: MemoryVersion, options: { ephemer
 }
 
 for (const version of ["v1", "v2"] as const) {
-  for (const order of ["before", "after"]) test(`${order === "before" ? `T21 ${version}: ` : ""}${version}: full system prompt override ${order} memory injection is diagnosed without overriding it`, async t => {
-    const f = fixture(t, version); f.config.generate = false;
-    fs.writeFileSync(join(f.root, "config.json"), JSON.stringify(f.config));
+  for (const order of ["before", "after"]) test(`${order === "before" ? `T21 ${version}: ` : ""}${version}: full system prompt override ${order} memory preparation preserves override policy and keeps retrieval available`, async t => {
+    const f = fixture(t, version);
     const db = openStateDb(f.root);
     const writer = new ConsolidationScheduler({ root: f.root, db, config: () => f.config, modelPort: () => null,
       now: Date.now, isForegroundIdle: () => true });
     await writer.runPass(); await writer.stop(); db.close();
+    f.config.generate = false;
+    fs.writeFileSync(join(f.root, "config.json"), JSON.stringify(f.config));
     await f.mock.fire("session_start", {}, f.ctx);
     const options = { sections: { other_extension: "keep" } as Record<string, string>, forceSystemPrompt: order === "before" ? "opaque replacement" : undefined };
     await f.mock.fire("before_agent_start", { systemPromptOptions: options }, f.ctx);
     options.forceSystemPrompt = "opaque replacement";
     await f.mock.fire("agent_start", {}, f.ctx);
+    assert.equal(options.sections.pi_memory, undefined, "preparation never adds a system section");
+    const request = await projectRequest(f.mock, f.ctx, [
+      { role: "system", content: options.forceSystemPrompt, timestamp: 0 },
+      { role: "user", content: "Current task", timestamp: 1 },
+    ]);
+    assert.match(request.memory ?? "", new RegExp(`Memory version: ${version}`));
+    const headless = await projectRequest(f.mock, f.ctx, [{ role: "user", content: "Current task", timestamp: 1 }]);
+    assert.equal(headless.memory, request.memory, "same carrier starts headless context without fabricating a system");
     await f.command("doctor");
-    assert.match(f.notices.at(-1) ?? "", /section_injection_conflict/);
+    assert.doesNotMatch(f.notices.at(-1) ?? "", /section_injection_conflict|whole run aborted/);
+    assert.match(f.notices.at(-1) ?? "", /active: .* carrier projected/);
     assert.equal(options.forceSystemPrompt, "opaque replacement"); assert.equal(options.sections.other_extension, "keep");
     assert.equal(options.sections.pi_memory, undefined);
     const result = await f.mock.tools.get("pi_memory_list")!.execute("list", {}, undefined, undefined, f.ctx as never);
-    assert.match(JSON.stringify(result), /memory_unavailable/); assert.equal(f.requests(), 0);
+    assert.doesNotMatch(JSON.stringify(result), /memory_unavailable/); assert.equal(f.requests(), 0);
   });
 
   for (const configured of [false, true]) test(`${configured ? `T22 ${version}: ` : ""}${version}: an ephemeral lifecycle with configured=${configured} makes no memory artifacts or model requests`, async t => {
@@ -175,7 +185,9 @@ for (const version of ["v1", "v2"] as const) {
     try {
       await assert.doesNotReject(f.mock.fire("before_agent_start", { systemPromptOptions: options }, f.ctx));
       await assert.doesNotReject(Promise.resolve(f.command(`version ${version === "v1" ? "v2" : "v1"}`)));
-      assert.ok(options.sections.pi_memory); assert.deepEqual(fs.readFileSync(join(f.root, "config.json")), original);
+      assert.equal(options.sections.pi_memory, undefined, "pin preparation adds no system section");
+      assert.ok((await projectRequest(f.mock, f.ctx)).memory, "published memory survives failed configuration writes");
+      assert.deepEqual(fs.readFileSync(join(f.root, "config.json")), original);
       assert.ok(f.notices.some(message => message.includes("ENOSPC"))); assert.equal(f.requests(), 0);
     } finally { fs.writeFileSync = write; syncBuiltinESMExports(); }
   });

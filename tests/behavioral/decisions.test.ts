@@ -8,7 +8,7 @@ import { DatabaseSync } from "node:sqlite";
 import { createAssistantMessageEventStream, type Api, type AssistantMessage, type Model, type TranscriptContext } from "@earendil-works/pi-ai";
 import extension from "../../src/extension.ts";
 import { defaultConfig } from "../../src/config.ts";
-import { makeMockPi } from "../mock-pi.ts";
+import { makeMockPi, projectRequest } from "../mock-pi.ts";
 
 /**
  * These tests exercise durable capture, extraction, consolidation, prompt injection,
@@ -276,8 +276,9 @@ async function runScenario(t: test.TestContext, memoryVersion: "v1" | "v2", scen
   await mock.fire("session_start", {}, ctx);
   const event = { systemPromptOptions: { sections: {} as Record<string, string> } };
   await mock.fire("before_agent_start", event, ctx);
-  const prompt = event.systemPromptOptions.sections.pi_memory;
-  assert.ok(prompt, "later session receives memory through its system-prompt section");
+  assert.equal(event.systemPromptOptions.sections.pi_memory, undefined, "pin preparation does not add a system section");
+  const prompt = (await projectRequest(mock, ctx)).memory;
+  assert.ok(prompt, "later session receives memory through its request-local custom carrier");
   assert.match(prompt, new RegExp(`Memory version: ${memoryVersion}`));
   const search = await mock.tools.get("pi_memory_search")!.execute("search", { queries: [scenario.query], match: "any" }, undefined, undefined, ctx as never);
   const evidencePath = (search.details as { items: Array<{ path: string }> }).items.find(item => item.path.startsWith("rollout_summaries/"))?.path;

@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { createAssistantMessageEventStream, type AssistantMessage, type TranscriptContext, type Model, type Api } from "@earendil-works/pi-ai";
 import extension from "../src/extension.ts";
-import { makeMockPi } from "./mock-pi.ts";
+import { makeMockPi, projectRequest } from "./mock-pi.ts";
 import { defaultConfig } from "../src/config.ts";
 
 for (const memoryVersion of ["v1", "v2"] as const) {
@@ -99,11 +99,17 @@ test(`${memoryVersion === "v2" ? "T27 v2: " : ""}${memoryVersion} extraction pub
   const event = { systemPromptOptions: { sections: { pi_memory: "stale section" } as Record<string, string> } };
   const before = extractionCalls + writerCalls;
   await mock.fire("before_agent_start", event, ctx);
-  assert.match(event.systemPromptOptions.sections.pi_memory!, /TypeScript/);
-  assert.match(event.systemPromptOptions.sections.pi_memory!, new RegExp(`Memory version: ${memoryVersion}`));
-  if (memoryVersion === "v2") assert.doesNotMatch(event.systemPromptOptions.sections.pi_memory!, /MEMORY\.md/);
-  assert.match(event.systemPromptOptions.sections.pi_memory!, /generation/i);
-  assert.match(event.systemPromptOptions.sections.pi_memory!, /evidence/i);
+  assert.equal(event.systemPromptOptions.sections.pi_memory, undefined, "legacy section removed; preparation only pins memory");
+  const project = async () => {
+    assert.equal(event.systemPromptOptions.sections.pi_memory, undefined, "canonical options contain no memory section");
+    return (await projectRequest(mock, ctx)).memory;
+  };
+  const memory = await project();
+  assert.match(memory ?? "", /TypeScript/);
+  assert.match(memory ?? "", new RegExp(`Memory version: ${memoryVersion}`));
+  if (memoryVersion === "v2") assert.doesNotMatch(memory ?? "", /MEMORY\.md/);
+  assert.match(memory ?? "", /generation/i);
+  assert.match(memory ?? "", /evidence/i);
   assert.equal(extractionCalls + writerCalls, before, "prompt path makes no model request");
   assert.deepEqual([...mock.tools.keys()].sort(), ["pi_memory_list", "pi_memory_note", "pi_memory_read", "pi_memory_search"]);
   const search = await mock.tools.get("pi_memory_search")!.execute("search", { queries: ["TypeScript"], match: "any" }, undefined, undefined, ctx as never);
@@ -113,35 +119,50 @@ test(`${memoryVersion === "v2" ? "T27 v2: " : ""}${memoryVersion} extraction pub
   assert.match(JSON.stringify(await read()), /TypeScript/);
   const usage = new DatabaseSync(join(agentDir, "memory", "state.sqlite"));
   assert.equal(usage.prepare("SELECT COUNT(*) AS n FROM memory_usage").get()!.n, 1, "detail use is deduplicated within one foreground run");
-  await mock.fire("before_agent_start", event, { ...ctx,
-    getContextUsage: () => ({ tokens: 32_000, contextWindow: 32_768, percent: 98 }) });
-  assert.equal(event.systemPromptOptions.sections.pi_memory, undefined, "resource-limited injection is omitted");
+  // Remaining capacity uses actual non-memory input and model output reserve,
+  // not previous request usage. Budget-only omission retains the same tool pin.
+  const limited = { ...ctx, model: { ...model, contextWindow: 32_768 },
+    getContextUsage: () => ({ tokens: 0, contextWindow: 32_768, percent: 0 }) };
+  const fullContext = await projectRequest(mock, limited, [
+    { role: "system", content: "Foreground policy", timestamp: 0 },
+    { role: "user", content: "x".repeat(25_000), timestamp: 1 },
+  ]);
+  assert.equal(fullContext.memory, undefined, "non-memory history plus output reserve exhausts capacity");
+  assert.equal((await projectRequest(mock, { ...ctx, model: { ...model, maxTokens: model.contextWindow } })).memory,
+    undefined, "output reservation alone can exhaust capacity");
+  assert.equal((await projectRequest(mock, { ...ctx, model: { contextWindow: model.contextWindow } })).memory,
+    undefined, "missing reliable output reserve never authorizes a carrier");
   assert.match(JSON.stringify(await read()), /TypeScript/, "budget omission does not invalidate the generation or detail tools");
-  await mock.fire("before_agent_start", event, ctx);
-  assert.match(event.systemPromptOptions.sections.pi_memory!, /TypeScript/, "injection recovers when context is available");
+  assert.match((await project()) ?? "", /TypeScript/, "same-run injection recovers when capacity is available");
+  // Hold the retention clock while preparing/reading so slow CI cannot expire
+  // the source between those operations. The original deadline is then passed.
+  let retentionNow = Date.now();
+  const retentionClock = t.mock.method(Date, "now", () => retentionNow);
   usage.exec("UPDATE source_stats SET last_used_at = NULL");
-  usage.prepare("UPDATE source_revisions SET source_time = ?").run(Date.now() - 30 * 86_400_000 + 150);
+  usage.prepare("UPDATE source_revisions SET source_time = ?").run(retentionNow - 30 * 86_400_000 + 150);
   await mock.fire("before_agent_start", event, ctx);
   assert.match(JSON.stringify(await read()), /TypeScript/, "detail use extends retention");
+  retentionNow += 200;
   await new Promise(resolve => setTimeout(resolve, 200));
   assert.match(JSON.stringify(await read()), /TypeScript/, "old retention timer must respect successful detail use");
+  retentionClock.mock.restore();
   usage.close();
   const configurationPath = join(agentDir, "memory", "config.json");
   const configuration = JSON.parse(readFileSync(configurationPath, "utf8"));
   writeFileSync(configurationPath, JSON.stringify({ ...configuration, generate: false }));
   await mock.fire("before_agent_start", event, ctx);
-  assert.match(event.systemPromptOptions.sections.pi_memory!, /TypeScript/, "read-only mode serves published memory");
+  assert.match((await project()) ?? "", /TypeScript/, "read-only mode serves published memory");
   const unbuiltVersion = memoryVersion === "v1" ? "v2" : "v1";
   writeFileSync(configurationPath, JSON.stringify({ ...configuration, generate: false, version: unbuiltVersion }));
   await mock.fire("before_agent_start", event, ctx);
-  assert.equal(event.systemPromptOptions.sections.pi_memory, undefined, "unbuilt selected version never falls back to the other");
+  assert.equal(await project(), undefined, "unbuilt selected version never falls back to the other");
   assert.match(JSON.stringify(await read()), /memory_unavailable/);
   writeFileSync(configurationPath, JSON.stringify({ ...configuration, generate: false }));
   const summaryPath = join(published.directory, "memory_summary.md");
   const originalSummary = readFileSync(summaryPath);
   writeFileSync(summaryPath, "tampered summary");
   await mock.fire("before_agent_start", event, ctx);
-  assert.equal(event.systemPromptOptions.sections.pi_memory, undefined, "file integrity is checked on every turn");
+  assert.equal(await project(), undefined, "file integrity is checked on every turn");
   writeFileSync(summaryPath, originalSummary);
   await mock.fire("before_agent_start", event, ctx);
   assert.match(JSON.stringify(await read()), /TypeScript/);
@@ -155,7 +176,7 @@ test(`${memoryVersion === "v2" ? "T27 v2: " : ""}${memoryVersion} extraction pub
   control.close();
   assert.match(JSON.stringify(await read()), /memory_unavailable/, "correction by another process revokes the existing run pin");
   await mock.fire("before_agent_start", event, ctx);
-  assert.equal(event.systemPromptOptions.sections.pi_memory, undefined, "changed control epoch revokes a cached view");
+  assert.equal(await project(), undefined, "changed control epoch revokes a cached view");
   assert.equal(extractionCalls + writerCalls, before);
 });
 }

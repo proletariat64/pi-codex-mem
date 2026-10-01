@@ -12,8 +12,8 @@ import { openStateDb, recordSnapshot } from "../src/store/db.ts";
 import { claimDueExtractions, commitExtraction, enqueueExtraction } from "../src/store/jobs.ts";
 import { claimConsolidation, commitGeneration, selectConsolidation } from "../src/store/consolidation.ts";
 import { MINIMAL_V1_SUMMARY } from "../src/pipeline/validate.ts";
-import { acquireReadView } from "../src/read/view.ts";
-import { MemoryRunReader, validateReadView } from "../src/read/run.ts";
+import { acquireEvidencePin } from "../src/read/evidence.ts";
+import { MemoryRunReader } from "../src/read/run.ts";
 import { createMemoryTools } from "../src/read/tools.ts";
 import { projectMemoryMessages, hasUnsafeMemoryResidue, removeProviderCarrier, requestCapacity } from "../src/read/projection.ts";
 
@@ -52,7 +52,7 @@ function fixture(t: test.TestContext) {
     const clock = empty ? now + 31 * 86_400_000 : now;
     assert.equal(commitGeneration(db, { lease, snapshot, generation: { memoryVersion: version, generationId: id,
       directory, manifestHash: digest(manifest), inputHash: id }, now: clock + 2 }), true);
-    const view = acquireReadView({ db, root, memoryVersion: version, now: clock + 3, extractionPromptHash: "extract" });
+    const view = acquireEvidencePin({ db, root, memoryVersion: version, now: clock + 3, extractionPromptHash: "extract" });
     assert.ok(view); return view;
   }
   return { root, db, publish };
@@ -61,22 +61,23 @@ function fixture(t: test.TestContext) {
 for (const version of ["v1", "v2"] as const) {
   test(`${version}: publication does not switch eligible run pin; integrity is rechecked against pinned artifacts`, t => {
     const f = fixture(t); const old = f.publish(version, "old"); f.publish(version, "new");
-    assert.equal(validateReadView(f.db, f.root, old, 30, NOW + 5).valid, true);
-    assert.equal(acquireReadView({ db: f.db, root: f.root, memoryVersion: version, generationId: "old", now: NOW + 5 })?.generationId, "old");
-    writeFileSync(join(old.directory, "memory_summary.md"), "v1\nchanged");
-    const checked = validateReadView(f.db, f.root, old, 30, NOW + 5);
+    assert.equal(old.validate({ db: f.db, root: f.root, maxUnusedDays: 30, now: NOW + 5 }).valid, true);
+    assert.equal(acquireEvidencePin({ db: f.db, root: f.root, memoryVersion: version, generationId: "old", now: NOW + 5 })?.generationId, "old");
+    const oldSummaryPath = join(f.root, "versions", version, "generations", "old", "memory_summary.md");
+    writeFileSync(oldSummaryPath, "v1\nchanged");
+    const checked = old.validate({ db: f.db, root: f.root, maxUnusedDays: 30, now: NOW + 5 });
     assert.equal(checked.reason, "artifact_integrity"); assert.equal(checked.error, true); assert.equal(checked.recoverable, undefined);
   });
   test(`${version}: proven ordinary expiry grants one clean same-version recovery, with old cursor rejected`, async t => {
     const f = fixture(t); const old = f.publish(version, "old"); const reader = new MemoryRunReader();
     reader.begin(version, f.root); reader.pin = old;
     let now = NOW + 4;
-    const tools = createMemoryTools({ root: f.root, db: () => f.db, view: () => reader.pin, consumer: () => null, now: () => now });
+    const tools = createMemoryTools({ root: f.root, db: () => f.db, pin: () => reader.pin, consumer: () => null, now: () => now });
     const search = tools.find(tool => tool.name === "pi_memory_search")!;
     const before = await search.execute("search", { queries: ["中文"], match: "any", maxResults: 1 }, undefined);
     assert.ok(before.details.cursor);
     now = NOW + 31 * 86_400_000;
-    const validity = validateReadView(f.db, f.root, old, 30, now);
+    const validity = old.validate({ db: f.db, root: f.root, maxUnusedDays: 30, now });
     assert.equal(validity.reason, "retention_expired"); assert.equal(validity.recoverable, true);
     reader.cache = { key: "old", text: "old secret", representation: "full", reason: "within_budget", counting: "utf8_upper_estimate" };
     reader.invalidate(validity.reason, validity.recoverable);
@@ -92,15 +93,15 @@ for (const version of ["v1", "v2"] as const) {
     const f = fixture(t); const pin = f.publish(version, "old");
     const external = new DatabaseSync(join(f.root, "state.sqlite"));
     try { external.exec("UPDATE store_state SET control_epoch = control_epoch + 1 WHERE singleton = 1"); } finally { external.close(); }
-    assert.equal(validateReadView(f.db, f.root, pin, 30, NOW + 5).reason, "control_epoch_changed");
-    const tools = createMemoryTools({ root: f.root, db: () => f.db, view: () => pin, consumer: () => null, now: () => NOW + 5 });
+    assert.equal(pin.validate({ db: f.db, root: f.root, maxUnusedDays: 30, now: NOW + 5 }).reason, "control_epoch_changed");
+    const tools = createMemoryTools({ root: f.root, db: () => f.db, pin: () => pin, consumer: () => null, now: () => NOW + 5 });
     assert.equal((await tools[0]!.execute("tool", { queries: ["中文"], match: "any" }, undefined)).details.error, "memory_unavailable");
     const reader = new MemoryRunReader(); reader.begin(version, f.root); reader.pin = pin;
     reader.invalidate("control_epoch_changed"); assert.equal(reader.recover(() => pin), false);
   });
   test(`${version}: revocation after reading but before tool return suppresses all output`, async t => {
     const f = fixture(t); const pin = f.publish(version, "old"); let checks = 0;
-    const tools = createMemoryTools({ root: f.root, db: () => f.db, view: () => pin, consumer: () => null,
+    const tools = createMemoryTools({ root: f.root, db: () => f.db, pin: () => pin, consumer: () => null,
       now: () => {
         if (++checks === 3) f.db.exec("UPDATE store_state SET control_epoch = control_epoch + 1");
         return NOW + 4;
@@ -114,7 +115,7 @@ for (const version of ["v1", "v2"] as const) {
     const descriptor = Object.getOwnPropertyDescriptor(performance, "now"); let ticks = 0;
     Object.defineProperty(performance, "now", { configurable: true, value: () => (ticks += 101) });
     try {
-      const validation = validateReadView(f.db, f.root, pin, 30, NOW + 4);
+      const validation = pin.validate({ db: f.db, root: f.root, maxUnusedDays: 30, now: NOW + 4 });
       assert.equal(validation.reason, "refresh_timeout"); assert.equal(validation.error, false);
       assert.equal(validation.recoverable, undefined);
     } finally {
@@ -125,15 +126,17 @@ for (const version of ["v1", "v2"] as const) {
   test(`${version}: unknown status invalidity is not classified as expiry`, t => {
     const f = fixture(t); const pin = f.publish(version, "old");
     f.db.prepare("UPDATE generations SET status = 'revoked' WHERE generation_id = ?").run(pin.generationId);
-    assert.equal(validateReadView(f.db, f.root, pin, 30, NOW + 31 * 86_400_000).recoverable, undefined);
+    assert.equal(pin.validate({ db: f.db, root: f.root, maxUnusedDays: 30, now: NOW + 31 * 86_400_000 }).recoverable, undefined);
   });
   test(`${version}: budget omission leaves retrieval grant usable without rewriting artifact`, async t => {
-    const f = fixture(t); const pin = f.publish(version, "old"); const bytes = readFileSync(join(pin.directory, "memory_summary.md"));
+    const f = fixture(t); const pin = f.publish(version, "old");
+    const summaryPath = join(f.root, "versions", version, "generations", "old", "memory_summary.md");
+    const bytes = readFileSync(summaryPath);
     const reader = new MemoryRunReader(); reader.begin(version, f.root); reader.pin = pin;
     reader.report("disabled", "context_budget", { representation: "omitted" });
-    const tools = createMemoryTools({ root: f.root, db: () => f.db, view: () => reader.pin, consumer: () => null, now: () => NOW + 4 });
+    const tools = createMemoryTools({ root: f.root, db: () => f.db, pin: () => reader.pin, consumer: () => null, now: () => NOW + 4 });
     assert.equal((await tools.find(tool => tool.name === "pi_memory_read")!.execute("read", { path: "rollout_summaries/source-decision.md" }, undefined)).details.error, undefined);
-    assert.deepEqual(readFileSync(join(pin.directory, "memory_summary.md")), bytes);
+    assert.deepEqual(readFileSync(summaryPath), bytes);
   });
 }
 

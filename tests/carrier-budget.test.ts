@@ -1,13 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { MEMORY_CARRIER_TYPE, renderMemoryCarrier, renderMemorySection } from "../src/read/inject.ts";
-import type { MemoryCarrier } from "../src/read/inject.ts";
-import type { MemoryReadView } from "../src/read/view.ts";
+import type { MemoryCarrier, MemoryCarrierView } from "../src/read/inject.ts";
 
 const cwd = "/repo";
-const makeView = (summary: string, memoryVersion: "v1" | "v2" = "v2"): MemoryReadView => ({
+const makeView = (summary: string, memoryVersion: "v1" | "v2" = "v2"): MemoryCarrierView => ({
   summary, memoryVersion, generationId: "generation-a", directory: `/memory/versions/${memoryVersion}/generations/generation-a`,
-  controlEpoch: 7, manifestHash: "manifest-hash", applicability: [cwd], retentionDeadline: null,
+  controlEpoch: 7, manifestHash: "manifest-hash", applicability: [cwd],
 });
 const evidence = (carrier: MemoryCarrier): string => {
   assert.ok(carrier.text);

@@ -1,21 +1,32 @@
 import { readFileSync } from "node:fs";
-import type { MemoryReadView } from "./view.ts";
+import type { MemoryVersion } from "../config.ts";
 import { renderTemplate } from "../template.ts";
 import type { CarrierRepresentation, CarrierCounting } from "./carrier.ts";
 export { MEMORY_CARRIER_TYPE } from "./carrier.ts";
+
+/** Plain formatting input, not a verified read pin or authorization to access evidence. */
+export interface MemoryCarrierView {
+  readonly memoryVersion: MemoryVersion;
+  readonly generationId: string;
+  readonly directory: string;
+  readonly controlEpoch: number;
+  readonly manifestHash: string;
+  readonly summary: string;
+  readonly applicability: readonly string[];
+}
 
 const guidance = {
   v1: readFileSync(new URL("../../prompts/pi/v1/read_path.md", import.meta.url), "utf8"),
   v2: readFileSync(new URL("../../prompts/pi/v2/read_path.md", import.meta.url), "utf8"),
 };
 
-function applicabilityGuidance(view: MemoryReadView, cwd: string): string {
+function applicabilityGuidance(view: MemoryCarrierView, cwd: string): string {
   return view.applicability.includes(cwd) ? "includes the current workspace" :
     view.memoryVersion === "v1" ? "check each task group's scope before applying" : "check each route's project scope before applying";
 }
 
 /** Legacy renderer for compatibility fixtures; foreground requests use renderMemoryCarrier. */
-export function renderMemorySection(view: MemoryReadView, cwd: string): string {
+export function renderMemorySection(view: MemoryCarrierView, cwd: string): string {
   const applicability = applicabilityGuidance(view, cwd);
   return renderTemplate(guidance[view.memoryVersion], {
     memory_version: view.memoryVersion, generation_id: JSON.stringify(view.generationId),
@@ -122,7 +133,7 @@ function joinUnits(units: SummaryUnit[]): string {
 }
 
 /** Build one bounded, request-local evidence carrier; does not mutate artifacts or reader pins. */
-export function renderMemoryCarrier(view: MemoryReadView, cwd: string, budget: MemoryCarrierBudget): MemoryCarrier {
+export function renderMemoryCarrier(view: MemoryCarrierView, cwd: string, budget: MemoryCarrierBudget): MemoryCarrier {
   const counting = budget.count ? "tokenizer" : "utf8_upper_estimate";
   const omitted = (reason: string): MemoryCarrier => ({ text: null, representation: "omitted", reason, counting, units: 0 });
   if (budget.capacity === null || !Number.isFinite(budget.capacity)) return omitted("capacity_unavailable");

@@ -4,8 +4,7 @@
 import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import { DatabaseSync } from "node:sqlite";
-import { acquireReadView } from "../src/read/view.ts";
-import { renderMemorySection } from "../src/read/inject.ts";
+import { acquireEvidencePin } from "../src/read/evidence.ts";
 import { createMemoryTools } from "../src/read/tools.ts";
 import { v1PromptHash } from "../src/extraction/v1.ts";
 import { v2PromptHash } from "../src/extraction/v2.ts";
@@ -36,25 +35,25 @@ try {
     const refresh = [];
     for (let i = 0; i < 200; i++) {
       const t0 = performance.now();
-      const view = acquireReadView({ db, root, memoryVersion: version, extractionPromptHash: promptHash });
+      const pin = acquireEvidencePin({ db, root, memoryVersion: version, extractionPromptHash: promptHash });
       const t1 = performance.now();
-      if (view) refresh.push(t1 - t0);
+      if (pin) refresh.push(t1 - t0);
     }
     if (refresh.length) results.push({ gate: "state/view refresh", version, ...stats(refresh), budget: 100 });
 
     // Gate: cached prompt-section preparation (p95 < 20 ms, no network by construction).
-    const view = acquireReadView({ db, root, memoryVersion: version, extractionPromptHash: promptHash });
-    if (view) {
+    const pin = acquireEvidencePin({ db, root, memoryVersion: version, extractionPromptHash: promptHash });
+    if (pin) {
       const prep = [];
       for (let i = 0; i < 200; i++) {
         const t0 = performance.now();
-        renderMemorySection(view, "/tmp/workspace");
+        pin.renderSection("/tmp/workspace");
         prep.push(performance.now() - t0);
       }
       results.push({ gate: "prompt-section prep", version, ...stats(prep), budget: 20 });
 
       // Gate: memory-tool search/read (p95 < 250 ms within the output budget).
-      const tools = createMemoryTools({ root, db: () => db, view: () => view,
+      const tools = createMemoryTools({ root, db: () => db, pin: () => pin,
         consumer: () => ({ consumerSession: `bench-${version}`, runId: "bench" }), now: () => Date.now() });
       const search = tools.find(tool => tool.name === "pi_memory_search");
       const read = tools.find(tool => tool.name === "pi_memory_read");

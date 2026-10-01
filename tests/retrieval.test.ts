@@ -9,10 +9,18 @@ import { claimDueExtractions, commitExtraction, enqueueExtraction } from "../src
 import { claimConsolidation, commitGeneration, selectConsolidation } from "../src/store/consolidation.ts";
 import { evidencePath, textHash } from "../src/pipeline/staging.ts";
 import { MINIMAL_V1_SUMMARY } from "../src/pipeline/validate.ts";
-import { acquireReadView } from "../src/read/view.ts";
+import { acquireEvidencePin, type MemoryReadPin } from "../src/read/evidence.ts";
 import { createMemoryTools } from "../src/read/tools.ts";
 
 const NOW = Date.UTC(2026, 8, 29);
+function renderedSummary(pin: MemoryReadPin, cwd: string): string {
+  const section = pin.renderSection(cwd);
+  const open = "<historical_memory_evidence>\n";
+  const close = "\n</historical_memory_evidence>";
+  const start = section.indexOf(open); const end = section.lastIndexOf(close);
+  assert.ok(start >= 0 && end >= start + open.length, "rendered section includes its evidence boundary");
+  return section.slice(start + open.length, end);
+}
 function fixture(t: test.TestContext) {
   const root = mkdtempSync(join(tmpdir(), "pi-retrieval-"));
   const db = openStateDb(root);
@@ -53,12 +61,12 @@ function fixture(t: test.TestContext) {
     writeFileSync(join(directory, "manifest.json"), manifest);
     assert.equal(commitGeneration(db, { lease, snapshot, generation: { memoryVersion: version, generationId: id,
       directory, inputHash: id, manifestHash: createHash("sha256").update(manifest).digest("hex") }, now: NOW + 3 }), true);
-    const view = acquireReadView({ db, root, memoryVersion: version, now: NOW + 4 }); assert.ok(view);
-    const tools = createMemoryTools({ root, db: () => db, view: () => view,
+    const pin = acquireEvidencePin({ db, root, memoryVersion: version, now: NOW + 4 }); assert.ok(pin);
+    const tools = createMemoryTools({ root, db: () => db, pin: () => pin,
       consumer: () => ({ consumerSession: "reader", runId: "run" }), now: () => NOW + 5 });
     const call = (name: string, args: Record<string, unknown>) => tools.find(tool => tool.name === `pi_memory_${name}`)!
       .execute("call", args, undefined);
-    return { view, path, call, directory };
+    return { pin, path, call, directory };
   }
   return { root, db, publish };
 }
@@ -67,10 +75,79 @@ test("reader accepts revision 3 format independently of lower writer targets", (
   const { root, db, publish } = fixture(t);
   const v1 = `v1\n${"x".repeat(12_000)}`;
   publish("v1", undefined, undefined, "", v1);
-  assert.equal(acquireReadView({ root, db, memoryVersion: "v1", now: NOW + 4, summaryBytes: 1024 })?.summary, v1);
+  const pinnedV1 = acquireEvidencePin({ root, db, memoryVersion: "v1", now: NOW + 4, summaryBytes: 1024 });
+  assert.ok(pinnedV1); assert.equal(renderedSummary(pinnedV1, root), v1);
   const v2 = `v1\n## What's in Memory\n### Prototype\n#### 2026-09-27\n- Choice\n  - desc: no repeated citation\n## General Tips\n${"x".repeat(1500)}\n## User preferences\n## User Profile\n`;
   publish("v2", undefined, undefined, undefined, v2);
-  assert.equal(acquireReadView({ root, db, memoryVersion: "v2", now: NOW + 4, summaryBytes: 1024 })?.summary, v2);
+  const pinnedV2 = acquireEvidencePin({ root, db, memoryVersion: "v2", now: NOW + 4, summaryBytes: 1024 });
+  assert.ok(pinnedV2); assert.equal(renderedSummary(pinnedV2, root), v2);
+});
+
+test("opaque read pins expose only lifecycle identity and scoped evidence access closes after completion", (t) => {
+  const { root, db, publish } = fixture(t); const { pin, path } = publish("v1");
+  for (const field of ["directory", "manifestHash", "summary", "applicability", "extractionPromptHash"])
+    assert.equal(field in pin, false, `${field} is not part of the public pin`);
+  assert.equal(Reflect.set(pin, "retentionDeadline", NOW + 1), false, "retention is read-only");
+
+  let borrowed: { read(path: string): string; paths(prefix?: unknown): string[] } | undefined;
+  const output = pin.withEvidence({ root, db: () => db, now: () => NOW + 5, maxUnusedDays: () => 30 }, access => {
+    borrowed = access;
+    assert.equal(access.isReadablePath(path), true);
+    assert.equal(access.isReadablePath("memory_summary.md"), false);
+    assert.ok(access.paths().includes(path));
+    assert.ok(access.paths("skills").includes("skills/types/SKILL.md"));
+    assert.throws(() => access.read("manifest.json"), /path_not_available_for_version/);
+    assert.throws(() => access.paths("versions"), /path_not_available_for_version/);
+    const text = access.read(path);
+    return { complete: () => {
+      assert.throws(() => access.read(path), /memory_unavailable/, "borrow closes before response completion");
+      return `complete:${text.split("\n")[0]}`;
+    } };
+  });
+  assert.equal(output, "complete:中文决策");
+  assert.throws(() => borrowed!.paths(), /memory_unavailable/);
+  assert.throws(() => borrowed!.read(path), /memory_unavailable/);
+});
+
+test("withEvidence suppresses completion and usage when the pin changes after evidence reads", (t) => {
+  const { root, db, publish } = fixture(t); const { pin, path } = publish("v1"); let completed = false;
+  assert.throws(() => pin.withEvidence({ root, db: () => db, now: () => NOW + 5, maxUnusedDays: () => 30 }, access => {
+    access.read(path);
+    db.exec("UPDATE store_state SET control_epoch = control_epoch + 1 WHERE singleton = 1");
+    return { detailUse: { path, startLine: 1, endLine: 1 }, complete: () => { completed = true; return "stale"; } };
+  }, () => ({ consumerSession: "reader", runId: "invalidated" })), /memory_unavailable/);
+  assert.equal(completed, false, "complete runs only after post-read validation");
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM memory_usage").get()!.n, 0);
+});
+
+test("detail use refreshes retention only after completion; empty and failed operations do not count", (t) => {
+  const { root, db, publish } = fixture(t); const { pin, path } = publish("v1");
+  let now = NOW + 29 * 86_400_000; let consumerCalls = 0;
+  const context = { root, db: () => db, now: () => now, maxUnusedDays: () => 30 };
+  const consumer = () => { consumerCalls++; now = NOW + 31 * 86_400_000;
+    return { consumerSession: "reader", runId: "detail" }; };
+  const formatted = pin.withEvidence(context, access => {
+    const evidence = access.attributedLines(path);
+    return { detailUse: { path, startLine: 2, endLine: 2 }, complete: () => `line:${evidence.lines[1]}` };
+  }, consumer);
+  assert.equal(formatted, "line:TypeScript chosen");
+  assert.equal(consumerCalls, 1);
+  const usage = db.prepare("SELECT used_at FROM memory_usage WHERE consumer_session = 'reader' AND run_id = 'detail'").get();
+  assert.equal(usage?.used_at, NOW + 29 * 86_400_000);
+  assert.equal(pin.validate({ db, root, maxUnusedDays: 30, now }).valid, true,
+    "recording complete detail-use refreshes retention before the post-use check");
+
+  const empty = pin.withEvidence(context, () => ({ complete: () => "empty" }), consumer);
+  assert.equal(empty, "empty");
+  assert.throws(() => pin.withEvidence(context, access => {
+    access.read(path); throw new Error("operation failed");
+  }, consumer), /operation failed/);
+  assert.throws(() => pin.withEvidence(context, access => {
+    access.attributedLines(path);
+    return { detailUse: { path, startLine: 2, endLine: 2 }, complete: () => { throw new Error("format failed"); } };
+  }, consumer), /format failed/);
+  assert.equal(consumerCalls, 1, "empty or failed operations never record use");
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM memory_usage").get()!.n, 1);
 });
 
 test("literal Chinese search returns pinned evidence with deterministic paging and no usage", async (t) => {
@@ -88,13 +165,13 @@ test("literal Chinese search returns pinned evidence with deterministic paging a
 test("missing original transcripts keep extracted memory readable with an unavailable-source marker", async (t) => {
   const { root, db, publish } = fixture(t);
   const original = join(root, "source.jsonl"); writeFileSync(original, '{"original":"evidence"}\n');
-  const { call, view, path } = publish("v1");
+  const { call, pin, path } = publish("v1");
   assert.equal((await call("read", { path })).details.items[0]!.sourceUnavailable, undefined);
   unlinkSync(original);
   const read = await call("read", { path });
   assert.equal(read.details.error, undefined); assert.equal(read.details.items[0]!.sourceUnavailable, true);
   assert.match(read.details.items[0]!.content!, /中文决策/);
-  assert.equal(acquireReadView({ root, db, memoryVersion: "v1", now: NOW + 6 })!.generationId, view.generationId);
+  assert.equal(acquireEvidencePin({ root, db, memoryVersion: "v1", now: NOW + 6 })!.generationId, pin.generationId);
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM suppression_tombstones").get()!.n, 0);
 });
 
@@ -143,8 +220,8 @@ test("T33 cross: version and generation mismatched cursors cannot serve content"
 test("a new extraction policy cannot read a published generation containing old-policy sources", (t) => {
   const { db, root, publish } = fixture(t);
   publish("v1");
-  assert.ok(acquireReadView({ db, root, memoryVersion: "v1", now: NOW + 5, extractionPromptHash: "extract" }));
-  assert.equal(acquireReadView({ db, root, memoryVersion: "v1", now: NOW + 5, extractionPromptHash: "new-policy" }), null);
+  assert.ok(acquireEvidencePin({ db, root, memoryVersion: "v1", now: NOW + 5, extractionPromptHash: "extract" }));
+  assert.equal(acquireEvidencePin({ db, root, memoryVersion: "v1", now: NOW + 5, extractionPromptHash: "new-policy" }), null);
 });
 
 test("literal case folding is opt-in and all matching requires every query on the line", async (t) => {
@@ -256,8 +333,17 @@ test("a 128-source task keeps metadata bounded and records complete validated de
   writeFileSync(join(directory, "manifest.json"), manifest);
   assert.equal(commitGeneration(db, { lease, snapshot, generation: { memoryVersion: "v1", generationId: "many",
     directory, inputHash: "many", manifestHash: textHash(manifest) }, now: NOW + 3 }), true);
-  const view = acquireReadView({ db, root, memoryVersion: "v1", now: NOW + 4 }); assert.ok(view);
-  const tools = createMemoryTools({ root, db: () => db, view: () => view,
+  const pin = acquireEvidencePin({ db, root, memoryVersion: "v1", now: NOW + 4 }); assert.ok(pin);
+  const attributed = pin.withEvidence({ root, db: () => db, now: () => NOW + 5, maxUnusedDays: () => 30 }, access => {
+    const evidence = access.attributedLines("MEMORY.md");
+    return { complete: () => evidence };
+  });
+  assert.deepEqual(attributed.attribution[3], ids, "full line attribution is not clipped to response source IDs");
+  assert.equal(Object.isFrozen(attributed.lines), true);
+  assert.equal(Object.isFrozen(attributed.attribution), true);
+  assert.equal(Object.isFrozen(attributed.attribution[3]), true);
+  assert.throws(() => (attributed.attribution[3] as string[]).push("mutated"), TypeError);
+  const tools = createMemoryTools({ root, db: () => db, pin: () => pin,
     consumer: () => ({ consumerSession: "reader", runId: "run" }), now: () => NOW + 5 });
   unlinkSync(join(root, `${ids[12]}.jsonl`));
   for (const name of ["read", "list", "search"]) {

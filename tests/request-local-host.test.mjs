@@ -55,7 +55,7 @@ for (const version of ['v1', 'v2']) for (const order of ['memory-first', 'overri
       return { memoryVersion: version, generationId: id, controlEpoch: snapshot.controlEpoch, manifestHash: hash(manifest),
         directory, summary, applicability: [], retentionDeadline: null };
     }
-    const firstPin = publish('first');
+    const firstFormatting = publish('first');
     const runtime = createExtensionRuntime(); const bus = createEventBus(); const errors = []; let fold = false;
     const names = order === 'memory-first' ? ['memory', 'override'] : ['override', 'memory'];
     const extensions = await Promise.all(names.map(name => loadExtensionFromFactory(pi => {
@@ -137,7 +137,8 @@ for (const version of ['v1', 'v2']) for (const order of ['memory-first', 'overri
     assert.equal(folded.some(message => message.customType === 'other'), true);
     assert.deepEqual(folded[0].toolsAdded, delta.toolsAdded); fold = false;
     const nonCarrierReserve = model.contextWindow - model.maxTokens - requestCapacity(canonical, model.contextWindow, model.maxTokens);
-    const minimum = renderMemoryCarrier({ ...firstPin, summary: 'v1\n' + 'x'.repeat(10_000) }, cwd, { capacity: 100_000 });
+    // Pure carrier rendering receives a formatting DTO, not a live pin.
+    const minimum = renderMemoryCarrier({ ...firstFormatting, summary: 'v1\n' + 'x'.repeat(10_000) }, cwd, { capacity: 100_000 });
     model.contextWindow = model.maxTokens + nonCarrierReserve + minimum.units + 200;
     await project(canonical, 'first');
     await diagnostic(/clipped carrier projected/);

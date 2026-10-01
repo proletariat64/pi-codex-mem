@@ -9,11 +9,18 @@ import { claimConsolidation, getPublishedGeneration, selectConsolidation } from 
 import { ConsolidationScheduler } from "../src/pipeline/scheduler.ts";
 import { buildStaging, textHash } from "../src/pipeline/staging.ts";
 import { MINIMAL_V1_SUMMARY } from "../src/pipeline/validate.ts";
-import { acquireReadView } from "../src/read/view.ts";
+import { acquireEvidencePin, type MemoryReadPin } from "../src/read/evidence.ts";
 import type { ConsolidationModelPort } from "../src/pipeline/model-port.ts";
 import { createAssistantMessageEventStream, type Api, type AssistantMessage, type Model } from "@earendil-works/pi-ai";
 
 const NOW = Date.UTC(2026, 8, 29);
+function renderedSummary(pin: MemoryReadPin, cwd: string): string {
+  const section = pin.renderSection(cwd);
+  const open = "<historical_memory_evidence>\n"; const close = "\n</historical_memory_evidence>";
+  const start = section.indexOf(open); const end = section.lastIndexOf(close);
+  assert.ok(start >= 0 && end >= start + open.length, "rendered section includes its evidence boundary");
+  return section.slice(start + open.length, end);
+}
 
 function fixture(t: test.TestContext, modelPort: () => ConsolidationModelPort | null = () => { throw new Error("empty selection must not resolve a model"); }) {
   const root = mkdtempSync(join(tmpdir(), "pi-memory-consolidation-scheduler-"));
@@ -50,7 +57,7 @@ test("an expired writer's leftover staging cannot block a reclaimed lease or ser
   advance(180_001);
   assert.deepEqual(await scheduler.runPass(), [{ status: "unchanged" }]);
   assert.equal(getPublishedGeneration(db, "v1", NOW + 180_001)?.generationId, before.generationId);
-  assert.equal(acquireReadView({ db, root, memoryVersion: "v1", now: NOW + 180_001 })?.summary, MINIMAL_V1_SUMMARY);
+  assert.equal(renderedSummary(acquireEvidencePin({ db, root, memoryVersion: "v1", now: NOW + 180_001 })!, root), MINIMAL_V1_SUMMARY);
   assert.equal((db.prepare("SELECT status FROM jobs WHERE job_id = ?").get(abandoned.job_id) as { status: string }).status, "succeeded");
   assert.ok(leftovers.every((directory) => !existsSync(directory)));
 });
@@ -95,7 +102,7 @@ test("v2 blocked by another version's live lease wakes after expiry without anot
   await wake.run();
   assert.ok(getPublishedGeneration(db, "v2", NOW + 180_001));
   assert.equal(getPublishedGeneration(db, "v1", NOW + 180_001), null);
-  assert.equal(acquireReadView({ db, root, memoryVersion: "v2", now: NOW + 180_001 })?.summary, MINIMAL_V1_SUMMARY);
+  assert.equal(renderedSummary(acquireEvidencePin({ db, root, memoryVersion: "v2", now: NOW + 180_001 })!, root), MINIMAL_V1_SUMMARY);
 });
 
 test("empty selection publishes deterministic v1 artifacts without a model and unchanged input preserves the generation", async (t) => {
@@ -103,11 +110,11 @@ test("empty selection publishes deterministic v1 artifacts without a model and u
   assert.deepEqual(await scheduler.runPass(), [{ status: "published" }]);
   const generation = getPublishedGeneration(db, "v1", NOW);
   assert.ok(generation);
-  assert.equal(acquireReadView({ db, root, memoryVersion: "v1", now: NOW })?.summary, MINIMAL_V1_SUMMARY);
+  assert.equal(renderedSummary(acquireEvidencePin({ db, root, memoryVersion: "v1", now: NOW })!, root), MINIMAL_V1_SUMMARY);
   assert.deepEqual(await scheduler.runPass(), [{ status: "unchanged" }]);
   assert.equal(getPublishedGeneration(db, "v1", NOW)?.generationId, generation.generationId);
   config.version = "v2";
-  assert.equal(acquireReadView({ db, root, memoryVersion: "v2", now: NOW }), null);
+  assert.equal(acquireEvidencePin({ db, root, memoryVersion: "v2", now: NOW }), null);
 });
 
 test("selected v2 publishes without a handbook and dual writing preserves independent current generations", async (t) => {
@@ -124,7 +131,7 @@ test("selected v2 publishes without a handbook and dual writing preserves indepe
   assert.deepEqual(await scheduler.runPass(), [{ status: "unchanged" }, { status: "published" }]);
   assert.equal(getPublishedGeneration(db, "v2", NOW)?.generationId, v2.generationId);
   assert.ok(getPublishedGeneration(db, "v1", NOW));
-  assert.equal(acquireReadView({ db, root, memoryVersion: "v2", now: NOW })?.memoryVersion, "v2");
+  assert.equal(acquireEvidencePin({ db, root, memoryVersion: "v2", now: NOW })?.memoryVersion, "v2");
 });
 
 test("a valid larger source-count configuration stays within the v1 policy and can publish", async (t) => {
@@ -133,7 +140,7 @@ test("a valid larger source-count configuration stays within the v1 policy and c
   assert.deepEqual(await scheduler.runPass(), [{ status: "published" }]);
   const generation = getPublishedGeneration(db, "v1", NOW)!;
   assert.equal(db.prepare("SELECT max_sources FROM generations WHERE generation_id = ?").get(generation.generationId)?.max_sources, 256);
-  assert.equal(acquireReadView({ db, root, memoryVersion: "v1", now: NOW })?.summary, MINIMAL_V1_SUMMARY);
+  assert.equal(renderedSummary(acquireEvidencePin({ db, root, memoryVersion: "v1", now: NOW })!, root), MINIMAL_V1_SUMMARY);
 });
 
 test("changed generated output rearms a content-based rebuild and never serves tampered summary", async (t) => {
@@ -142,7 +149,7 @@ test("changed generated output rearms a content-based rebuild and never serves t
   const before = getPublishedGeneration(db, "v1", NOW)!;
   assert.equal(scheduled.filter((item) => !item.cancelled).length, 0);
   writeFileSync(join(before.directory, "memory_summary.md"), MINIMAL_V1_SUMMARY + "Unsupported claim\n");
-  assert.equal(acquireReadView({ db, root, memoryVersion: "v1", now: NOW }), null);
+  assert.equal(acquireEvidencePin({ db, root, memoryVersion: "v1", now: NOW }), null);
   scheduler.trigger();
   const due = scheduled.filter((item) => !item.cancelled);
   assert.equal(due.length, 1);

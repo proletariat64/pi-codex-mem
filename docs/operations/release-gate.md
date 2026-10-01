@@ -1,6 +1,6 @@
 # Release gate record — v0.1.0 (spec §19.3)
 
-> Historical record for the earlier implementation. These measurements and sign-off do not certify revision 4 request-local projection, its recent-host capability checks, or the pre-send cancellation gate. See the current failure matrix and request-local verification record for new results and limitations.
+> Historical record for the earlier implementation. These measurements and sign-off do not certify revision 4 request-local projection, its recent-host capability checks, or the pre-send cancellation gate. See the current failure matrix and request-local verification record for new results and limitations. The subsequent [request-local override UAT](request-local-uat.md) separately records stable old-warning reproduction and the new implementation's fix in 24 actual TUI sessions.
 
 Recorded for the §18/§19.3 ready-to-release checklist. Environment note: measurements ran on the development host (4 vCPU, 7.6 GiB RAM, SSD, Node 24.15.0, pi 0.87.1), not the 2-vCPU/4-GB reference host; numbers are single-host samples, not cross-device claims.
 

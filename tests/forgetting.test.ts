@@ -9,7 +9,7 @@ import { captureSettledSession } from "../src/capture.ts";
 import { forgetEvidence } from "../src/control/forget.ts";
 import { defaultConfig } from "../src/config.ts";
 import { ConsolidationScheduler } from "../src/pipeline/scheduler.ts";
-import { acquireReadView } from "../src/read/view.ts";
+import { acquireEvidencePin } from "../src/read/evidence.ts";
 import { createMemoryTools } from "../src/read/tools.ts";
 import { planHistoricalImport, enrollHistoricalImport } from "../src/historical-import.ts";
 import { claimDueExtractions, commitExtraction, enqueueExtraction } from "../src/store/jobs.ts";
@@ -67,12 +67,12 @@ test("forget session blocks future branches and revokes both pinned views even w
   const scheduler = new ConsolidationScheduler({ root: f.root, db: f.db, config: () => config, modelPort: () => null,
     now: Date.now, isForegroundIdle: () => true });
   await scheduler.runPass(); await scheduler.stop();
-  const view = acquireReadView({ root: f.root, db: f.db, memoryVersion: "v1" }); assert.ok(view);
-  const tools = createMemoryTools({ root: f.root, db: () => f.db, view: () => view, consumer: () => null });
+  const view = acquireEvidencePin({ root: f.root, db: f.db, memoryVersion: "v1" }); assert.ok(view);
+  const tools = createMemoryTools({ root: f.root, db: () => f.db, pin: () => view, consumer: () => null });
   const captured = f.capture(); assert.equal(captured.status, "captured");
   const result = forgetEvidence({ root: f.root, db: f.db, kind: "session", id: captured.sessionKey });
   assert.equal(result.forgotten, true);
-  for (const memoryVersion of ["v1", "v2"] as const) assert.equal(acquireReadView({ root: f.root, db: f.db, memoryVersion }), null);
+  for (const memoryVersion of ["v1", "v2"] as const) assert.equal(acquireEvidencePin({ root: f.root, db: f.db, memoryVersion }), null);
   assert.equal((await tools.find(tool => tool.name === "pi_memory_list")!.execute("call", {}, undefined)).details.error, "memory_unavailable");
   f.entries.splice(0, f.entries.length, { ...f.entries[0]!, id: "another-root", parentId: null }); f.save();
   assert.equal(f.capture().status, "skipped", "session tombstone includes branches not yet captured");

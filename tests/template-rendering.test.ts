@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { renderV1Request, v1PromptHash } from "../src/extraction/v1.ts";
 import { renderV2Request, v2PromptHash } from "../src/extraction/v2.ts";
 import { renderMemorySection } from "../src/read/inject.ts";
-import type { MemoryReadView } from "../src/read/view.ts";
+import type { MemoryCarrierView } from "../src/read/inject.ts";
 
 const opaque = "JavaScript replacement $& $$ $` $' and literal {{ rollout_cwd }} / {{ memory_summary }}";
 for (const version of ["v1", "v2"] as const) test(`${version} template rendering preserves dollar tokens and literal placeholders in evidence and metadata`, () => {
@@ -16,9 +16,9 @@ for (const version of ["v1", "v2"] as const) test(`${version} template rendering
   assert.ok(rendered.userPrompt.includes(JSON.stringify(input.cwd)));
   if (version === "v2") assert.ok(rendered.userPrompt.includes(JSON.stringify(input.gitBranch)));
   assert.equal(rendered.promptHash, version === "v1" ? v1PromptHash() : v2PromptHash());
-  const view: MemoryReadView = { memoryVersion: version, generationId: "g-$&-{{ workspace }}",
+  const view: MemoryCarrierView = { memoryVersion: version, generationId: "g-$&-{{ workspace }}",
     directory: "/tmp/$&-{{ memory_summary }}", controlEpoch: 0, manifestHash: "hash",
-    summary: opaque, applicability: [], retentionDeadline: null };
+    summary: opaque, applicability: [] };
   const section = renderMemorySection(view, "/repo/$&-{{ memory_summary }}");
   assert.ok(section.includes(opaque), "injected summary must remain verbatim");
   assert.ok(section.includes(JSON.stringify(view.generationId)));

@@ -15,8 +15,7 @@ import { v1PromptHash } from "../src/extraction/v1.ts";
 import { withCodexExtractionFormat } from "../src/extraction/format.ts";
 import { v2PromptHash } from "../src/extraction/v2.ts";
 import { consolidationPromptHash } from "../src/pipeline/consolidate.ts";
-import { acquireReadView } from "../src/read/view.ts";
-import { renderMemorySection } from "../src/read/inject.ts";
+import { acquireEvidencePin } from "../src/read/evidence.ts";
 import { openStateDb } from "../src/store/db.ts";
 import { planHistoricalImport, enrollHistoricalImport } from "../src/historical-import.ts";
 import { forgetEvidence } from "../src/control/forget.ts";
@@ -216,13 +215,13 @@ async function answer({ item, mode, cwd, agentDir, runtime, model, approval }) {
   if (mode === "v1" || mode === "v2") {
     const db = new DatabaseSync(join(agentDir, "memory", "state.sqlite"), { readOnly: true });
     try {
-      const view = acquireReadView({ db, root: join(agentDir, "memory"), memoryVersion: mode,
+      const pin = acquireEvidencePin({ db, root: join(agentDir, "memory"), memoryVersion: mode,
         extractionPromptHash: mode === "v1" ? v1PromptHash() : v2PromptHash() });
       if (item.forgetBeforeAnswer?.length) {
-        if (view) throw new Error(`Forgotten source is still readable in ${mode} for ${item.id}`);
+        if (pin) throw new Error(`Forgotten source is still readable in ${mode} for ${item.id}`);
       } else {
-        if (!view) throw new Error(`No readable ${mode} generation for ${item.id}`);
-        section = renderMemorySection(view, cwd);
+        if (!pin) throw new Error(`No readable ${mode} generation for ${item.id}`);
+        section = pin.renderSection(cwd);
       }
     } finally { db.close(); }
   }

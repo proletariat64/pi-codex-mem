@@ -9,7 +9,7 @@ import { addNote, cleanupRevokedNotes, forgetNote } from "../src/control/notes.t
 import { buildStaging, textHash } from "../src/pipeline/staging.ts";
 import { MINIMAL_V1_SUMMARY, validateV1Artifacts, validateV2Artifacts, writeMinimalV1, writeMinimalV2 } from "../src/pipeline/validate.ts";
 import { publishGeneration } from "../src/pipeline/publish.ts";
-import { acquireReadView } from "../src/read/view.ts";
+import { acquireEvidencePin } from "../src/read/evidence.ts";
 import { defaultConfig } from "../src/config.ts";
 import { ConsolidationScheduler } from "../src/pipeline/scheduler.ts";
 import type { Api, Model } from "@earendil-works/pi-ai";
@@ -35,7 +35,7 @@ function publish(root: string, db: ReturnType<typeof openStateDb>, memoryVersion
   const manifest = JSON.stringify(stage.manifest); writeFileSync(join(stage.directory, "manifest.json"), manifest);
   assert.equal(publishGeneration({ root, db, stagingDir: stage.directory, lease, snapshot, inputHash: stage.inputHash,
     manifestHash: textHash(manifest), generationId, now }).published, true);
-  return acquireReadView({ root, db, memoryVersion, now });
+  return acquireEvidencePin({ root, db, memoryVersion, now });
 }
 test("explicit notes survive reopening with shared scope and host-provided provenance", (t) => {
   const { root, db } = fixture(t);
@@ -60,11 +60,12 @@ test("T35 cross: shared note revision applies independently to both publications
   assert.equal(getPublishedGeneration(db, "v1", 104), null); assert.equal(getPublishedGeneration(db, "v2", 104), null);
   assert.equal((db.prepare("SELECT status FROM jobs WHERE job_id = ?").get(old.jobId) as { status: string }).status, "superseded");
   cleanupRevokedNotes({ root, db, now: 104 });
-  assert.equal(existsSync(v1.directory), false); assert.equal(existsSync(v2.directory), false);
-  const next = publish(root, db, "v1", "new-v1", 105); assert.match(next!.summary, /Answer in Chinese/);
+  assert.equal(existsSync(join(root, "versions/v1/generations/old-v1")), false);
+  assert.equal(existsSync(join(root, "versions/v2/generations/old-v2")), false);
+  const next = publish(root, db, "v1", "new-v1", 105); assert.match(next!.renderSection("/"), /Answer in Chinese/);
   assert.equal(getPublishedGeneration(db, "v2", 106), null, "v1 success cannot unblock inactive v2");
   assert.deepEqual(db.prepare("SELECT memory_version FROM note_applications WHERE note_id = ?").all(correction.noteId).map(row => row.memory_version), ["v1"]);
-  const other = publish(root, db, "v2", "new-v2", 107); assert.match(other!.summary, /Answer in Chinese/);
+  const other = publish(root, db, "v2", "new-v2", 107); assert.match(other!.renderSection("/"), /Answer in Chinese/);
   assert.deepEqual(db.prepare("SELECT memory_version, note_hash FROM note_applications WHERE note_id = ? ORDER BY memory_version").all(correction.noteId)
     .map(row => [row.memory_version, row.note_hash]), [["v1", correction.textHash], ["v2", correction.textHash]]);
 });
@@ -79,7 +80,8 @@ test("forgetting one note removes its evidence, revokes both views and explains 
   assert.equal(existsSync(correction.textPath), false); assert.equal(existsSync(remembered.textPath), true);
   assert.equal(getPublishedGeneration(db, "v1", 104), null); assert.equal(getPublishedGeneration(db, "v2", 104), null);
   cleanupRevokedNotes({ root, db, now: 104 });
-  const rebuilt = publish(root, db, "v1", "remembered", 105); assert.match(rebuilt!.summary, /Use TypeScript/); assert.doesNotMatch(rebuilt!.summary, /Use Rust/);
+  const rebuilt = publish(root, db, "v1", "remembered", 105);
+  assert.match(rebuilt!.renderSection("/"), /Use TypeScript/); assert.doesNotMatch(rebuilt!.renderSection("/"), /Use Rust/);
   assert.equal(forgetNote({ root, db, noteId: correction.noteId, now: 106 }).removed, false);
 });
 
@@ -122,8 +124,8 @@ test("T32 cross: correction while v2 inactive and provider outage cannot revive 
     isForegroundIdle: () => true, modelPort: () => ({ resolve: () => model, stream: () => { throw new Error("provider unavailable"); } }) });
   try {
     const result = await scheduler.runPass(); assert.equal(result[0]!.status, "retry_wait");
-    assert.equal(acquireReadView({ root, db, memoryVersion: "v1", now: 104 }), null);
-    assert.equal(acquireReadView({ root, db, memoryVersion: "v2", now: 104 }), null);
+    assert.equal(acquireEvidencePin({ root, db, memoryVersion: "v1", now: 104 }), null);
+    assert.equal(acquireEvidencePin({ root, db, memoryVersion: "v2", now: 104 }), null);
     assert.equal(readFileSync(note.textPath, "utf8"), "Use TypeScript");
     assert.equal(db.prepare("SELECT COUNT(*) AS n FROM note_applications WHERE note_id = ?").get(note.noteId)!.n, 0);
   } finally { await scheduler.stop(); }
@@ -145,8 +147,8 @@ for (const version of ["v1", "v2"] as const) test(`T16 ${version}: correction re
       stream: () => { throw new Error("provider unavailable"); } }) });
   try {
     assert.equal((await scheduler.runPass())[0]?.status, "retry_wait");
-    assert.equal(acquireReadView({ root, db, memoryVersion: version, now: 104 }), null);
-    assert.equal(acquireReadView({ root, db, memoryVersion: version === "v1" ? "v2" : "v1", now: 104 }), null);
+    assert.equal(acquireEvidencePin({ root, db, memoryVersion: version, now: 104 }), null);
+    assert.equal(acquireEvidencePin({ root, db, memoryVersion: version === "v1" ? "v2" : "v1", now: 104 }), null);
     assert.equal(readFileSync(note.textPath, "utf8"), "Use TypeScript, not Rust");
   } finally { await scheduler.stop(); }
 });
@@ -157,7 +159,7 @@ test("committed correction priority survives a backward or repeated wall clock",
   const current = addNote({ root, db, action: "correct", text: "Use TypeScript", scope: "global", provenance, now: 99 });
   const notes = selectConsolidation(db, { memoryVersion: "v1", now: 100 }).notes.sort((a, b) => a.createdAt! - b.createdAt!);
   assert.deepEqual(notes.map(note => note.createdAt), [100, 101]); assert.equal(notes.at(-1)!.noteId, current.noteId);
-  assert.match(publish(root, db, "v1", "current", 102)!.summary, /Use TypeScript/);
+  assert.match(publish(root, db, "v1", "current", 102)!.renderSection("/"), /Use TypeScript/);
 });
 
 test("known credential and signed URL values are redacted before durable notes or writer staging", (t) => {

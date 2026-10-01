@@ -1,6 +1,4 @@
 import { createHash, randomUUID } from "node:crypto";
-import { rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import type { MemoryConfig, MemoryVersion } from "../config.ts";
 import type { SchedulerTimer } from "../extraction/scheduler.ts";
@@ -9,12 +7,11 @@ import { v1PromptHash } from "../extraction/v1.ts";
 import { v2PromptHash } from "../extraction/v2.ts";
 import { nextLocalDayTime } from "../store/jobs.ts";
 import { claimConsolidation, finishConsolidation, getPublishedGeneration, selectConsolidation } from "../store/consolidation.ts";
-import { consolidationPromptHash, runConsolidation } from "./consolidate.ts";
+import { consolidationPromptHash } from "./consolidate.ts";
 import type { ConsolidationModelPort } from "./model-port.ts";
-import { buildStaging } from "./staging.ts";
-import { cleanupGenerations, publishGeneration } from "./publish.ts";
+import { prepareGenerationCandidate, type GenerationCandidate } from "./candidate.ts";
+import { cleanupGenerations } from "./publish.ts";
 import { generatedOutput, readWorkspaceUtf8, workspaceInventory } from "./workspace-tools.ts";
-import { validateV1Artifacts, validateV2Artifacts, writeMinimalV1, writeMinimalV2 } from "./validate.ts";
 
 export interface ConsolidationSchedulerOptions {
   db: DatabaseSync;
@@ -194,32 +191,17 @@ export class ConsolidationScheduler {
       }
       return [];
     }
-    const validate = version === "v1" ? validateV1Artifacts : validateV2Artifacts;
     this.controller = new AbortController();
-    let directory: string | undefined;
+    let candidate: GenerationCandidate | undefined;
     try {
-      const prior = snapshot.baseGenerationId ? db.prepare(
-        "SELECT directory, manifest_hash FROM generations WHERE generation_id = ? AND memory_version = ? AND status = 'published'",
-      ).get(snapshot.baseGenerationId, version) as { directory: string; manifest_hash: string } | undefined : undefined;
-      let priorDir: string | undefined;
-      if (prior && getPublishedGeneration(db, version, clock(), { generationId: snapshot.baseGenerationId ?? undefined,
-        maxUnusedDays: config.schedule.maxUnusedDays, extractionPromptHash: snapshot.extractionPromptHash })) {
-        try {
-          const text = readWorkspaceUtf8(prior.directory, "manifest.json");
-          if (createHash("sha256").update(text).digest("hex") === prior.manifest_hash) priorDir = prior.directory;
-        } catch { /* A damaged previous artifact cannot become writer input. */ }
-      }
-      // Reclaimed leases must not reuse a dead writer's candidate or cleanup path.
-      const staged = buildStaging({ root: this.options.root, jobId: `${lease.jobId}-${lease.fence}`, snapshot, promptHash,
-        summaryBytes: config.limits.summaryBytes, priorDir });
-      directory = staged.directory;
-      if (staged.unchanged) {
-        validate({ directory, snapshot, summaryBytes: config.limits.summaryBytes });
+      candidate = prepareGenerationCandidate({ db, root: this.options.root, lease, snapshot, config,
+        signal: this.controller.signal, clock });
+      if (candidate.isUnchanged()) {
         finishConsolidation(db, lease, "succeeded", null, clock(), clock(), { refundAttempt: true });
         this.checkedKeys.set(version, this.key(config, version));
         return [{ status: "unchanged" }];
       }
-      if (!snapshot.sources.length && !snapshot.notes.length) (version === "v1" ? writeMinimalV1 : writeMinimalV2)(directory);
+      if (!snapshot.sources.length && !snapshot.notes.length) candidate.writeMinimal();
       else {
         const port = this.options.modelPort();
         if (!port || !config.models.consolidate) {
@@ -228,10 +210,8 @@ export class ConsolidationScheduler {
           return [{ status: "blocked", reason: "model_not_configured" }];
         }
         let requestsStarted = 0;
-        const result = await runConsolidation({ db, directory, lease, config, modelRef: config.models.consolidate,
-          port, signal: this.controller.signal, clock,
+        const result = await candidate.runWriter({ modelRef: config.models.consolidate, port,
           onRequestStarted: () => { requestsStarted++; },
-          validateOutputs: () => { validate({ directory: directory!, snapshot, summaryBytes: config.limits.summaryBytes }); },
           canStartRequest: () => {
             if (this.stopped || !this.options.isForegroundIdle()) return "foreground_active";
             const latest = this.config();
@@ -253,17 +233,10 @@ export class ConsolidationScheduler {
           return [result];
         }
       }
-      if (this.controller.signal.aborted) throw new Error("cancelled");
-      const validated = validate({ directory, snapshot, summaryBytes: config.limits.summaryBytes });
-      staged.manifest.fileHashes = validated.fileHashes;
-      const manifestText = JSON.stringify(staged.manifest, null, 2) + "\n";
-      writeFileSync(join(directory, "manifest.json"), manifestText, { mode: 0o600 });
-      const published = publishGeneration({ db, root: this.options.root, stagingDir: directory,
-        lease, snapshot, inputHash: staged.inputHash,
-        manifestHash: createHash("sha256").update(manifestText).digest("hex"), now: clock });
-      if (!published.published) finishConsolidation(db, lease, "superseded", "publication_cas", clock());
+      const published = candidate.publish();
+      if (!published) finishConsolidation(db, lease, "superseded", "publication_cas", clock());
       this.checkedKeys.set(version, this.key(config, version));
-      return [{ status: published.published ? "published" : "superseded" }];
+      return [{ status: published ? "published" : "superseded" }];
     } catch (error) {
       const reason = (error as Error).message;
       finishConsolidation(db, lease, this.controller.signal.aborted ? "cancelled" : "blocked", reason, clock());
@@ -271,7 +244,7 @@ export class ConsolidationScheduler {
       this.options.onError?.(error);
       return [{ status: this.controller.signal.aborted ? "cancelled" : "blocked", reason }];
     } finally {
-      if (directory) rmSync(directory, { recursive: true, force: true });
+      candidate?.dispose();
       this.controller = null;
       try { cleanupGenerations({ db, root: this.options.root, now: clock(),
         pinnedGenerationIds: this.options.pinnedGenerationIds?.() }); }

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { accessSync, constants as fsConstants, existsSync, lstatSync, realpathSync } from "node:fs";
+import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { join, resolve } from "node:path";
@@ -49,7 +50,7 @@ import {
   type MemoryMode, type WorkspaceFacts,
 } from "./runtime-policy.ts";
 
-const EXTENSION_VERSION = "0.1.0";
+const { version: EXTENSION_VERSION }: { version: string } = createRequire(import.meta.url)("../package.json");
 
 /** Sample workspace paths only after the operation's other configuration gates pass. */
 function recheckEligibilityWithWorkspace<T extends WorkspaceFacts>(config: MemoryConfig, cwd: string,

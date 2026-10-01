@@ -52,6 +52,9 @@ test("config edited mid-session takes effect at the next foreground run", async 
   await mock.commands.get("memory")!.handler("status", ctx);
   const status = notifyLog.find((m) => m.includes("mode:"));
   assert.ok(status, "status notify emitted");
+  const { version } = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+  assert.equal(status.split("\n")[0]?.split(" (pi ")[0], `pi-memory ${version}`,
+    "status reports the package version without a separately maintained version number");
   assert.match(status, /mode: read \(from config\)/);
   assert.match(status, /store: not initialized yet/, "control DB alone is not a captured store");
   await mock.commands.get("memory")!.handler("doctor", ctx);

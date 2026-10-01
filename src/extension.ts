@@ -480,8 +480,6 @@ export default function (pi: ExtensionAPI) {
     if (retentionTimer) clearTimeout(retentionTimer); retentionTimer = null;
     foregroundRun = null; foregroundPromptOptions = null;
     foregroundPrompt = null;
-    foregroundPromptOptions = null;
-    reader.release();
     if (heartbeat) clearInterval(heartbeat);
     heartbeat = null;
     foregroundIdle = true;
@@ -977,12 +975,7 @@ export default function (pi: ExtensionAPI) {
       legacyControlLock: legacyLockPath(root),
       models: { extract: resolveRef(cfg?.models.extract ?? null), consolidate: resolveRef(cfg?.models.consolidate ?? null) },
       promptSections: state.promptSections,
-      foreground: reader.diagnostic.status === "active" && reader.diagnostic.memoryVersion && reader.diagnostic.generationId
-        ? { status: "active", reason: reader.diagnostic.reason, memoryVersion: reader.diagnostic.memoryVersion,
-          generationId: reader.diagnostic.generationId, representation: reader.diagnostic.representation === "minimal" ? "minimal" : "full",
-          pinAvailable: Boolean(reader.pin), warningCounts: reader.diagnostic.warningCounts }
-        : { status: reader.diagnostic.status === "error" ? "error" : "disabled", reason: reader.diagnostic.reason,
-          pinAvailable: Boolean(reader.pin), warningCounts: reader.diagnostic.warningCounts },
+      foreground: { ...reader.diagnostic, pinAvailable: Boolean(reader.pin) },
     };
   }
 

@@ -93,6 +93,12 @@ for (const version of ['v1', 'v2']) for (const order of ['memory-first', 'overri
       if (forced) assert.equal(options.forceSystemPrompt, 'EXACT_FORCED_TEXT');
       await runner.emit({ type: 'agent_start' });
     }
+    async function diagnostic(expected) {
+      const context = runner.createCommandContext(); const notifications = [];
+      await runner.getCommand('memory').handler('doctor', { ...context, hasUI: true,
+        ui: { ...context.ui, notify: text => notifications.push(text) } });
+      assert.match(notifications.join('\n'), expected);
+    }
     async function project(messages, expectedGeneration = 'first', carrierExpected = true) {
       const snapshot = structuredClone(messages); const projection = await session.agent.transformContext(messages);
       assert.deepEqual(messages, snapshot);
@@ -116,6 +122,7 @@ for (const version of ['v1', 'v2']) for (const order of ['memory-first', 'overri
     await begin('first user');
     const projected = await project(canonical);
     assert.deepEqual(projected[0].toolsAdded, head.toolsAdded);
+    await diagnostic(/full carrier projected/);
     await project([...canonical, call('one'), result('one')]);
     await project([...canonical, call('one'), result('one'), call('two'), result('two')]);
     publish('second'); await project(canonical, 'first');
@@ -131,10 +138,15 @@ for (const version of ['v1', 'v2']) for (const order of ['memory-first', 'overri
     assert.deepEqual(folded[0].toolsAdded, delta.toolsAdded); fold = false;
     const nonCarrierReserve = model.contextWindow - model.maxTokens - requestCapacity(canonical, model.contextWindow, model.maxTokens);
     const minimum = renderMemoryCarrier({ ...firstPin, summary: 'v1\n' + 'x'.repeat(10_000) }, cwd, { capacity: 100_000 });
+    model.contextWindow = model.maxTokens + nonCarrierReserve + minimum.units + 200;
+    await project(canonical, 'first');
+    await diagnostic(/clipped carrier projected/);
     model.contextWindow = model.maxTokens + nonCarrierReserve + minimum.units + 2;
     const minimal = await project(canonical, 'first');
     assert(!minimal.find(message => message.customType === 'pi_memory').content.includes('Chinese discussion decisions matter'));
+    await diagnostic(/minimal carrier projected/);
     model.contextWindow = 1; await project(canonical, 'first', false);
+    await diagnostic(/disabled: capacity_exhausted; no active carrier; counting=utf8_upper_estimate; retrieval pin available/);
     const list = runner.getToolDefinition('pi_memory_list');
     const available = await list.execute('list', {}, undefined, undefined, runner.createContext());
     assert.equal(available.details.error, undefined);
@@ -144,6 +156,7 @@ for (const version of ['v1', 'v2']) for (const order of ['memory-first', 'overri
     await runner.emit({ type: 'agent_settled' }); await begin('second user'); await project(canonical, 'second');
     db.exec("UPDATE store_state SET control_epoch = control_epoch + 1; UPDATE pipeline_state SET read_blocked = 1, block_reason = 'user_correction'");
     await project(canonical, 'second', false);
+    await diagnostic(/disabled: control_epoch_changed; no active carrier; retrieval pin unavailable/);
     const denied = await list.execute('list', {}, undefined, undefined, runner.createContext());
     assert.equal(denied.details.error, 'memory_unavailable');
     publish('clean'); await project(canonical, 'clean', false); // no user/privacy mid-run recovery
@@ -170,6 +183,7 @@ for (const version of ['v1', 'v2']) for (const order of ['memory-first', 'overri
     db.exec('UPDATE store_state SET control_epoch = control_epoch + 1');
     await runner.emitBeforeProviderRequest({ opaque: unsafeText });
     assert.equal(aborted, true); // native binding exercised; transport enforcement is tested separately
+    await diagnostic(/error: unsafe_provider_residue/);
     aborted = false; publish('codex'); model.api = 'openai-codex-responses';
     await begin('accepted transport race');
     const codexProjection = await project(canonical, 'codex');

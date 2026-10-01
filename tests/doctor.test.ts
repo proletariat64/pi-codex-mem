@@ -136,9 +136,9 @@ test("missing config warns instead of failing or creating", () => {
   assert.equal(report.ok, true);
 });
 
-test("foreground active reports version, generation, and full/minimal representation", () => {
+test("foreground active reports version, generation, and full/clipped/minimal representation", () => {
   for (const memoryVersion of ["v1", "v2"] as const) {
-    for (const representation of ["full", "minimal"] as const) {
+    for (const representation of ["full", "clipped", "minimal"] as const) {
       const input = goodInput();
       input.foreground = {
         status: "active", reason: `carrier_${representation}`, memoryVersion,

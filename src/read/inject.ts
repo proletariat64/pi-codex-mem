@@ -1,16 +1,22 @@
 import { readFileSync } from "node:fs";
 import type { MemoryReadView } from "./view.ts";
 import { renderTemplate } from "../template.ts";
+import type { CarrierRepresentation, CarrierCounting } from "./carrier.ts";
+export { MEMORY_CARRIER_TYPE } from "./carrier.ts";
 
 const guidance = {
   v1: readFileSync(new URL("../../prompts/pi/v1/read_path.md", import.meta.url), "utf8"),
   v2: readFileSync(new URL("../../prompts/pi/v2/read_path.md", import.meta.url), "utf8"),
 };
 
+function applicabilityGuidance(view: MemoryReadView, cwd: string): string {
+  return view.applicability.includes(cwd) ? "includes the current workspace" :
+    view.memoryVersion === "v1" ? "check each task group's scope before applying" : "check each route's project scope before applying";
+}
+
 /** Legacy renderer for compatibility fixtures; foreground requests use renderMemoryCarrier. */
 export function renderMemorySection(view: MemoryReadView, cwd: string): string {
-  const applicability = view.applicability.includes(cwd) ? "includes the current workspace" :
-    view.memoryVersion === "v1" ? "check each task group's scope before applying" : "check each route's project scope before applying";
+  const applicability = applicabilityGuidance(view, cwd);
   return renderTemplate(guidance[view.memoryVersion], {
     memory_version: view.memoryVersion, generation_id: JSON.stringify(view.generationId),
     base_path: JSON.stringify(view.directory), workspace: JSON.stringify(cwd),
@@ -18,7 +24,6 @@ export function renderMemorySection(view: MemoryReadView, cwd: string): string {
   });
 }
 
-export const MEMORY_CARRIER_TYPE = "pi_memory";
 const SUMMARY_UNITS = 2_500;
 // Reserve the custom-message/user-role envelope as well as counting every rendered character.
 const MESSAGE_OVERHEAD_UNITS = 32;
@@ -30,9 +35,9 @@ export interface MemoryCarrierBudget {
 
 export interface MemoryCarrier {
   text: string | null;
-  representation: "full" | "clipped" | "minimal" | "omitted";
+  representation: CarrierRepresentation;
   reason: string;
-  counting: "tokenizer" | "utf8_upper_estimate";
+  counting: CarrierCounting;
   units: number;
 }
 
@@ -130,8 +135,7 @@ export function renderMemoryCarrier(view: MemoryReadView, cwd: string, budget: M
     return Math.ceil(result);
   };
   try {
-    const applicability = view.applicability.includes(cwd) ? "includes the current workspace" :
-      view.memoryVersion === "v1" ? "check each task group's scope before applying" : "check each route's project scope before applying";
+    const applicability = applicabilityGuidance(view, cwd);
     // Reuse all same-version read/safety guidance, not the legacy raw-evidence interpolation.
     const prefix = renderTemplate(guidance[view.memoryVersion].split("<historical_memory_evidence>")[0]!, {
       memory_version: view.memoryVersion, generation_id: quote(view.generationId),

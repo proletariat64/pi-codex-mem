@@ -26,7 +26,7 @@ export interface HostCapabilities {
   hasNodeSqlite: boolean;
   /** Verified events; registering an unknown name does not prove support. */
   events: readonly string[];
-  /** ctx.abort plus native signal enforcement before transport; not a caught throw. */
+  /** Native ctx.abort binding; transport enforcement requires separate host evidence. */
   hasNativeRunAbort: boolean;
   /** Request projection preserves the leading system and other extensions' policy. */
   hasLeadingSystemPreservation: boolean;
@@ -85,7 +85,7 @@ export function checkHostCompat(caps: HostCapabilities): CompatResult {
     }
   }
   if (!caps.hasNativeRunAbort) {
-    problems.push("host lacks native whole-run abort with a pre-transport signal fence (ctx.abort); caught handler exceptions cannot cancel dispatch");
+    problems.push("host lacks the native whole-run abort binding (ctx.abort); caught handler exceptions cannot substitute for cancellation");
   }
   if (!caps.hasLeadingSystemPreservation) {
     problems.push("host lacks leading system and extension-policy preservation during request projection");

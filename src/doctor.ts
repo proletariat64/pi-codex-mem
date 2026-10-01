@@ -3,7 +3,9 @@
 // calls — the adapter performs those checks before calling this.
 
 import type { CompatResult } from "./pi/compat.ts";
-import type { LoadConfigResult, MemoryVersion, ModelRef } from "./config.ts";
+import type { LoadConfigResult, ModelRef } from "./config.ts";
+import type { ForegroundDiagnostic } from "./read/carrier.ts";
+export type { ForegroundDiagnostic } from "./read/carrier.ts";
 
 export type ProbeStatus = "ok" | "warn" | "fail";
 
@@ -12,21 +14,6 @@ export interface DoctorProbe {
   label: string;
   status: ProbeStatus;
   detail: string;
-}
-
-/** Metadata only; active means a carrier was actually projected (spec §18). */
-export interface ForegroundDiagnostic {
-  status: "disabled" | "error" | "active";
-  reason: string;
-  memoryVersion?: MemoryVersion;
-  generationId?: string;
-  /** full, clipped (full with clipping), or minimal when active. */
-  representation?: string;
-  counting?: string;
-  /** Run-local reason counts, without memory bodies or unsolicited notifications. */
-  warningCounts?: Readonly<Record<string, number>>;
-  /** Budget omission can leave the independently bounded retrieval pin available. */
-  pinAvailable?: boolean;
 }
 
 export interface DoctorInput {
@@ -84,7 +71,7 @@ export function runDoctor(input: DoctorInput): DoctorReport {
 
   probes.push(
     input.compat.supported
-      ? { id: "host", label: "host API", status: "ok", detail: "pi host capabilities satisfied" }
+      ? { id: "host", label: "host API", status: "ok", detail: "required pi host API bindings available; transport behavior is verified separately" }
       : {
           id: "host",
           label: "host API",

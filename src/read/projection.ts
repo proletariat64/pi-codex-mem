@@ -2,14 +2,14 @@ import { createHash } from "node:crypto";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { getCurrentTools } from "@earendil-works/pi-ai";
 
-export const OWNED_MEMORY_TYPE = "pi_memory";
+import { MEMORY_CARRIER_TYPE } from "./carrier.ts";
 const legacyMemory = (text: string) => text.includes("historical_memory_evidence") &&
   (text.includes("## Pi Memory") || text.includes("Memory version:"));
 
 /** Old opaque system policy must not be destructively spliced. */
 export function hasUnsafeMemoryResidue(messages: AgentMessage[]): boolean {
   return messages.some(message => {
-    if (message.role === "custom" && message.customType === OWNED_MEMORY_TYPE) return false;
+    if (message.role === "custom" && message.customType === MEMORY_CARRIER_TYPE) return false;
     if (message.role !== "system" && message.role !== "custom") return false;
     const content = message.content;
     const text = typeof content === "string" ? content : JSON.stringify(content);
@@ -19,14 +19,14 @@ export function hasUnsafeMemoryResidue(messages: AgentMessage[]): boolean {
 
 /** Fresh request array; remove only attributed carriers/named sections, never opaque policy text. */
 export function projectMemoryMessages(messages: AgentMessage[], text: string | null): AgentMessage[] {
-  const fresh = messages.filter(message => !(message.role === "custom" && message.customType === OWNED_MEMORY_TYPE))
+  const fresh = messages.filter(message => !(message.role === "custom" && message.customType === MEMORY_CARRIER_TYPE))
     .map(message => {
-      if (message.role !== "system" || !message.sections || !("pi_memory" in message.sections)) return message;
-      const sections = { ...message.sections }; delete sections.pi_memory;
+      if (message.role !== "system" || !message.sections || !(MEMORY_CARRIER_TYPE in message.sections)) return message;
+      const sections = { ...message.sections }; delete sections[MEMORY_CARRIER_TYPE];
       return { ...message, sections };
     });
   if (text !== null) fresh.splice(fresh[0]?.role === "system" ? 1 : 0, 0, {
-    role: "custom", customType: OWNED_MEMORY_TYPE, content: text, display: false,
+    role: "custom", customType: MEMORY_CARRIER_TYPE, content: text, display: false,
     // Stable non-semantic host field; timestamps are not part of model-visible evidence.
     timestamp: 0,
   });

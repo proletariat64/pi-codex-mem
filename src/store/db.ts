@@ -2,6 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, realpathSync, unlinkSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 import type { WorkspaceIdentity } from "../identity.ts";
+import type { MemoryVersion } from "../config.ts";
 
 /**
  * State store (spec §12.2 — ticket #3 subset: schema_migrations, workspaces,
@@ -36,7 +37,7 @@ export interface SnapshotRecord {
   evidenceRemoved?: boolean;
 }
 
-const SCHEMA_VERSION = 12;
+const SCHEMA_VERSION = 13;
 
 const MIGRATION_1 = `
 CREATE TABLE schema_migrations (
@@ -290,6 +291,16 @@ WHEN NEW.active_generation_id IS NOT NULL AND NOT EXISTS (
 BEGIN SELECT RAISE(ABORT, 'active generation version mismatch'); END;
 `;
 
+const MIGRATION_13 = `
+CREATE TABLE IF NOT EXISTS generation_pins (
+  owner_id TEXT PRIMARY KEY,
+  generation_id TEXT NOT NULL,
+  memory_version TEXT NOT NULL CHECK (memory_version IN ('v1', 'v2')),
+  pinned_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+`;
+
 export function openStateDb(root: string, options?: { busyTimeoutMs?: number }): DatabaseSync {
   const busyTimeout = options?.busyTimeoutMs ?? 5_000;
   if (!Number.isSafeInteger(busyTimeout) || busyTimeout < 0 || busyTimeout > 5_000) {
@@ -391,6 +402,10 @@ export function openStateDb(root: string, options?: { busyTimeoutMs?: number }):
           status TEXT NOT NULL CHECK (status IN ('active', 'completed', 'cancelled')), created_at INTEGER NOT NULL)`);
         db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(12, Date.now());
       }
+      if (current < 13) {
+        db.exec(MIGRATION_13);
+        db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(13, Date.now());
+      }
       db.exec("COMMIT");
     } catch (err) {
       db.exec("ROLLBACK");
@@ -410,7 +425,7 @@ export function openStateDb(root: string, options?: { busyTimeoutMs?: number }):
 }
 
 /** A crashed note writer/forget may leave an unindexed private file; active notes are never pruned. */
-function sweepUnindexedNotes(db: DatabaseSync, root: string): void {
+export function sweepUnindexedNotes(db: DatabaseSync, root: string): void {
   const directory = join(root, "notes");
   if (!existsSync(directory)) return;
   if (lstatSync(directory).isSymbolicLink() || !lstatSync(directory).isDirectory()) throw new Error("notes symlink or special directory rejected");
@@ -535,6 +550,32 @@ function blockBothViews(db: DatabaseSync, reason: string): void {
   db.exec("UPDATE store_state SET control_epoch = control_epoch + 1 WHERE singleton = 1");
   db.prepare("UPDATE pipeline_state SET read_blocked = 1, block_reason = ?")
     .run(reason);
+}
+
+export const GENERATION_PIN_TTL_MS = 900_000;
+
+/**
+ * Cross-process read-pin registry. A cleanup in another process must not
+ * delete a generation that an active foreground run in this process still
+ * holds; process-local pin lists cannot see it. Upsert per acquisition; a
+ * lease that stops being refreshed expires so crashed owners cannot pin
+ * recovery copies forever.
+ */
+export function registerGenerationPin(db: DatabaseSync, input: {
+  ownerId: string; generationId: string; memoryVersion: MemoryVersion; now?: number; ttlMs?: number;
+}): void {
+  const now = input.now ?? Date.now();
+  db.prepare(`INSERT INTO generation_pins (owner_id, generation_id, memory_version, pinned_at, expires_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT (owner_id) DO UPDATE SET generation_id = excluded.generation_id,
+      memory_version = excluded.memory_version, pinned_at = excluded.pinned_at,
+      expires_at = excluded.expires_at`)
+    .run(input.ownerId, input.generationId, input.memoryVersion, now, now + (input.ttlMs ?? GENERATION_PIN_TTL_MS));
+}
+
+/** End of run/session: release the cross-process lease immediately. */
+export function clearGenerationPins(db: DatabaseSync, ownerId: string): void {
+  db.prepare("DELETE FROM generation_pins WHERE owner_id = ?").run(ownerId);
 }
 
 /** On resume, an active branch whose leaf advanced has not been recaptured. */

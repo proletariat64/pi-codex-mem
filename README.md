@@ -23,12 +23,13 @@ pi remove /path/to/pi-codex-mem   # data stays in <agent-dir>/memory
 
 ## Model configuration
 
-Memory generation uses two model roles — `extract` and `consolidate` — resolved through pi's registry. Configure them once in `memory/config.json`:
+Memory generation uses two model roles — `extract` and `consolidate` — resolved through pi's registry. On first run, memory generates a complete `memory/config.json` with defaults. Edit its `models` field to pin both roles (the JSON below is that field, not a complete config file — replacing the whole file with it fails validation and disables memory):
 
 ```json
-{ "models": {
-    "extract":      { "provider": "openai-codex", "modelId": "gpt-6-luna" },
-    "consolidate":  { "provider": "openai-codex", "modelId": "gpt-6-luna" } } }
+"models": {
+  "extract":     { "provider": "openai-codex", "modelId": "gpt-6-luna" },
+  "consolidate": { "provider": "openai-codex", "modelId": "gpt-6-luna" }
+}
 ```
 
 Host API credentials, model catalogs, and quotas are pi's; nothing is hardcoded. A missing role is filled with the foreground model at the next capture, but explicit roles make generation reproducible.

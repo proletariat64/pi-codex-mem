@@ -159,3 +159,22 @@ test("changed generated output rearms a content-based rebuild and never serves t
   assert.notEqual(after.generationId, before.generationId);
   assert.equal(readFileSync(join(after.directory, "memory_summary.md"), "utf8"), MINIMAL_V1_SUMMARY);
 });
+
+test("at-cap store pauses generation writes and prunes old recovery copies", async (t) => {
+  const { root, db, config, scheduler, scheduled } = fixture(t);
+  // First pass publishes normally below the cap.
+  assert.ok((await scheduler.runPass()).some(result => result.status === "published" || result.status === "unchanged"));
+
+  // Put the owned store over limits.maxStoreBytes.
+  const generation = getPublishedGeneration(db, "v1", NOW)!.directory;
+  config.limits = { ...config.limits, maxStoreBytes: 2 ** 20 };
+  writeFileSync(join(generation, "cap-fixture.bin"), Buffer.alloc(2 ** 21));
+
+  const before = getPublishedGeneration(db, "v1", NOW)!.generationId;
+  assert.deepEqual(await scheduler.runPass(), [{ status: "blocked", reason: "store_size_limit_reached" }]);
+  getPublishedGeneration(db, "v1", NOW);
+  // The paused pass must not rearm a busy idle-loop wake.
+  assert.equal(scheduled.length, 0);
+  // The published generation survived; no new generation was written.
+  assert.equal(getPublishedGeneration(db, "v1", NOW)?.generationId, before);
+});

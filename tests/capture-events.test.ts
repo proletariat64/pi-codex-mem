@@ -539,3 +539,42 @@ test("enabled=false captures nothing", async (t) => {
   assert.deepEqual(snapshotFiles(memoryRoot), []);
   assert.ok(!existsSync(join(memoryRoot, "state.sqlite")), "no state store when disabled");
 });
+
+test("capture pauses when the store is at limits.maxStoreBytes and reports it in status", async (t) => {
+  const { cwd, memoryRoot } = makeSandbox(t);
+  const base = defaultConfig("UTC");
+  mkdirSync(memoryRoot, { recursive: true });
+  writeFileSync(join(memoryRoot, "config.json"), JSON.stringify(base));
+
+  const mock = makeMockPi();
+  memoryExtension(mock.pi);
+  const entries: unknown[] = [userEntry("u1", "decided: TypeScript over Rust")];
+  const ctx = {
+    cwd, hasUI: false, mode: "tui",
+    sessionManager: fakeSessionManager(cwd, entries),
+    modelRegistry: { find: () => ({}), streamSimple: () => ({}) },
+    ui: { notify: () => {} },
+  };
+  await mock.fire("session_start", { type: "session_start" }, ctx);
+  await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
+  assert.equal(snapshotFiles(memoryRoot).length, 1, "first settlement captures below the cap");
+
+  // Owned store at/over the configured cap: new evidence writes must pause
+  // rather than growing until filesystem writes fail.
+  mkdirSync(join(memoryRoot, "versions"), { recursive: true });
+  writeFileSync(join(memoryRoot, "versions", "cap-fixture.bin"), Buffer.alloc(2 ** 21));
+  writeFileSync(join(memoryRoot, "config.json"),
+    JSON.stringify({ ...base, limits: { ...base.limits, maxStoreBytes: 2 ** 20 } }));
+
+  entries.push({ ...userEntry("u2", "a further decision after the cap"), parentId: "u1" });
+  await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
+  assert.equal(snapshotFiles(memoryRoot).length, 1, "at-cap store pauses new snapshots");
+
+  const status: string[] = [];
+  await mock.commands.get("memory")!.handler("status",
+    { ...ctx, hasUI: true, ui: { notify: (text: string) => status.push(text) } });
+  const text = status.join("\n");
+  assert.ok(text.includes("capture: skipped (store_size_limit_reached)"), text);
+  assert.ok(text.includes("store size:"), text);
+  assert.ok(text.includes("paused (store_size_limit_reached)"), text);
+});

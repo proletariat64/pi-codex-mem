@@ -3,6 +3,7 @@
 // calls — the adapter performs those checks before calling this.
 
 import type { CompatResult } from "./pi/compat.ts";
+import { RUN_CRITICAL_EVENTS, RUN_EVIDENCE_EVENTS } from "./pi/compat.ts";
 import type { LoadConfigResult, ModelRef } from "./config.ts";
 import type { ForegroundDiagnostic } from "./read/carrier.ts";
 export type { ForegroundDiagnostic } from "./read/carrier.ts";
@@ -38,6 +39,8 @@ export interface DoctorInput {
   };
   /** Latest request-local carrier observation; absent until adapter reports one. */
   foreground?: ForegroundDiagnostic;
+  /** Extension events the host actually dispatched this session (registration alone cannot prove support). */
+  observedEvents?: readonly string[];
   /** @deprecated Ignored: full prompt overrides do not disable the revision 4 carrier. */
   promptSections?: "confirmed" | "unobserved" | "unavailable" | "conflict";
 }
@@ -192,6 +195,21 @@ export function runDoctor(input: DoctorInput): DoctorReport {
     };
   }
   probes.push(foregroundProbe);
+
+  if (input.observedEvents) {
+    const observed = new Set(input.observedEvents);
+    const missing = RUN_CRITICAL_EVENTS.filter(name => !observed.has(name));
+    const runObserved = RUN_EVIDENCE_EVENTS.some(name => observed.has(name));
+    const probe = !missing.length
+      ? { id: "host-events", label: "host events", status: "ok" as ProbeStatus,
+          detail: "all run-critical extension events have been dispatched this session" }
+      : !runObserved
+        ? { id: "host-events", label: "host events", status: "warn" as ProbeStatus,
+            detail: `no agent-run events dispatched yet (${missing.join(", ")} unobserved); after your first prompt these must appear — a host that accepted pi.on registrations but never dispatches them breaks capture, reading and fencing` }
+        : { id: "host-events", label: "host events", status: "fail" as ProbeStatus,
+            detail: `host accepted pi.on registrations but never dispatched: ${missing.join(", ")} — capture, request-local reading or dispatch fencing cannot work on this host` };
+    probes.push(probe);
+  }
 
   const ok = probes.every((probe) => probe.status !== "fail");
   return {

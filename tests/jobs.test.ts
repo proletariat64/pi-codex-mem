@@ -260,7 +260,7 @@ test("schema 5 jobs upgrade to configuration epochs without losing durable work"
   t.after(() => upgraded.close());
   assert.deepEqual({ ...upgraded.prepare("SELECT status, config_epoch FROM jobs").get() },
     { status: "queued", config_epoch: "" });
-  assert.equal((upgraded.prepare("SELECT MAX(version) AS v FROM schema_migrations").get() as { v: number }).v, 12);
+  assert.equal((upgraded.prepare("SELECT MAX(version) AS v FROM schema_migrations").get() as { v: number }).v, 13);
 });
 
 test("schema 7 migration preserves existing v1 output while adding v2 truncation metadata", (t) => {
@@ -281,7 +281,7 @@ test("schema 7 migration preserves existing v1 output while adding v2 truncation
   const row = migrated.prepare("SELECT raw_memory, truncated, original_bytes, accepted_bytes FROM extractions")
     .get() as { raw_memory: string; truncated: number; original_bytes: number; accepted_bytes: number };
   assert.deepEqual({ ...row }, { raw_memory: "decision", truncated: 0, original_bytes: 0, accepted_bytes: 0 });
-  assert.equal((migrated.prepare("SELECT MAX(version) AS v FROM schema_migrations").get() as { v: number }).v, 12);
+  assert.equal((migrated.prepare("SELECT MAX(version) AS v FROM schema_migrations").get() as { v: number }).v, 13);
 });
 
 test("a conflicting extraction is never reported as a successful commit", (t) => {

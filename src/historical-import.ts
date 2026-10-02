@@ -188,7 +188,7 @@ export function planHistoricalImport(path: string, options: {
 /** Enroll only explicitly planned, supported branches through live capture's policy. */
 export function enrollHistoricalImport(
   report: ImportReport,
-  options: { root: string; agentDir: string; db: DatabaseSync; limits: NormalizeLimits },
+  options: { root: string; agentDir: string; db: DatabaseSync; limits: NormalizeLimits; maxStoreBytes?: number },
 ): { imported: number; skipped: { path: string; reason: string }[] } {
   let imported = 0;
   const skipped: { path: string; reason: string }[] = [];
@@ -202,6 +202,7 @@ export function enrollHistoricalImport(
       const result = captureSettledSession({
         root: options.root, agentDir: options.agentDir, db: options.db,
         cwd: candidate.header.cwd, mode: "import", limits: options.limits,
+        maxStoreBytes: options.maxStoreBytes,
         reader: {
           getBranch: () => candidate.branch,
           getHeader: () => candidate.header,

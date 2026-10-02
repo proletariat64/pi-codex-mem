@@ -6,7 +6,8 @@ import { DatabaseSync } from "node:sqlite";
 import { join, resolve } from "node:path";
 import { getAgentDir, VERSION as PI_VERSION, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type SessionHeader } from "@earendil-works/pi-coding-agent";
 import { captureSettledSession, type CaptureResult } from "./capture.ts";
-import { blockUncapturedLeaf, openStateDb, prunePrivacyRevoked, retireOtherHeads } from "./store/db.ts";
+import { blockUncapturedLeaf, clearGenerationPins, openStateDb, prunePrivacyRevoked, registerGenerationPin, retireOtherHeads, sweepUnindexedNotes } from "./store/db.ts";
+import { storeSizeBytes } from "./store/size.ts";
 import { computeSessionKey } from "./identity.ts";
 import { isExcludedWorkspace } from "./workspace-policy.ts";
 import { enrollHistoricalImport, planHistoricalImport } from "./historical-import.ts";
@@ -22,6 +23,8 @@ import {
 import {
   checkHostCompat,
   REQUIRED_EVENTS,
+  RUN_CRITICAL_EVENTS,
+  RUN_EVIDENCE_EVENTS,
   type CompatResult,
   type HostCapabilities,
 } from "./pi/compat.ts";
@@ -108,7 +111,7 @@ function rootPointsIntoForeignMemory(root: string): boolean {
     join(home, ".codex", "sessions"),
     join(home, ".claude-mem"),
   ];
-  return forbidden.some((f) => real === f || real.startsWith(f + "/"));
+  return forbidden.some((f) => real === f || real.startsWith(`${f}/`));
 }
 
 /** Mode derived from configuration alone (spec §14 distinctions). */
@@ -127,6 +130,8 @@ interface RuntimeState {
   compat: CompatResult | null;
   config: LoadConfigResult | null;
   promptSections: DoctorInput["promptSections"];
+  /** Events the host actually dispatched this session; registration alone cannot prove support. */
+  observedEvents: Set<string>;
   modelRegistry: { find?: unknown } | null;
   db: DatabaseSync | null;
   capture: CaptureResult | null;
@@ -145,6 +150,7 @@ export default function (pi: ExtensionAPI) {
     compat: null,
     config: null,
     promptSections: "unobserved",
+    observedEvents: new Set(),
     modelRegistry: null,
     db: null,
     capture: null,
@@ -388,6 +394,10 @@ export default function (pi: ExtensionAPI) {
       try {
         if (state.db) prunePrivacyRevoked(state.db, root);
         else state.db = openStateDb(root);
+        // A forget whose note-file unlink failed leaves the revoked file on
+        // disk; the sweep retries it (active notes are never pruned).
+        try { sweepUnindexedNotes(state.db, root); }
+        catch (error) { throw new Error("privacy WAL cleanup deferred: note file cleanup unavailable", { cause: error }); }
         cleanupGenerations({ db: state.db, root, now: Date.now(),
           pinnedGenerationIds: foreground.pinnedGenerationIds });
         ensureScheduler();
@@ -418,6 +428,22 @@ export default function (pi: ExtensionAPI) {
     privacyRetryCount = 0;
   }
 
+  /** Best-effort cross-process pin lease: this process's foreground run must survive another process's cleanup. */
+  function refreshGenerationPinLease(): void {
+    const pin = foreground.pin;
+    if (!pin || !state.db) return;
+    try {
+      registerGenerationPin(state.db, { ownerId: activityOwner, generationId: pin.generationId, memoryVersion: pin.memoryVersion });
+    } catch { /* A failed lease write never breaks the run it protects. */ }
+  }
+
+  /** Registration alone is not proof: track what the host really dispatches so
+   * a host that accepts pi.on but never emits can be diagnosed. */
+  function runEventGaps(): { runObserved: boolean; missing: string[] } {
+    const missing = RUN_CRITICAL_EVENTS.filter(name => !state.observedEvents.has(name));
+    return { runObserved: RUN_EVIDENCE_EVENTS.some(name => state.observedEvents.has(name)), missing };
+  }
+
   function markForegroundActive(ctx: ExtensionContext): void {
     foregroundIdle = false;
     scheduler?.foregroundStarted();
@@ -434,6 +460,7 @@ export default function (pi: ExtensionAPI) {
         try {
           if (state.db) recordProcessActivity(state.db, { owner: activityOwner, sessionKey,
             state: "active", now: Date.now() });
+          refreshGenerationPinLease();
         } catch (err) {
           state.captureError = `activity heartbeat failed: ${(err as Error).message}`;
         }
@@ -452,7 +479,7 @@ export default function (pi: ExtensionAPI) {
     heartbeat = null;
     foregroundIdle = true;
     try {
-      if (state.db) clearProcessActivity(state.db, activityOwner);
+      if (state.db) { clearProcessActivity(state.db, activityOwner); clearGenerationPins(state.db, activityOwner); }
       scheduler?.foregroundSettled();
       consolidator?.foregroundSettled();
       explicitRun?.extraction.foregroundSettled();
@@ -481,6 +508,9 @@ export default function (pi: ExtensionAPI) {
       hasNativeRunAbort: typeof ctx.abort === "function",
       hasLeadingSystemPreservation: typeof ctx.getSystemPrompt === "function",
       hasToolPreservation: typeof pi.getActiveTools === "function" && typeof pi.getAllTools === "function",
+      // Registration presence alone gates startup; actual dispatch is verified
+      // at runtime via observedEvents (see /memory status, /memory doctor). A
+      // host that accepts pi.on but never emits is diagnosed there.
       events: typeof pi.on === "function" ? REQUIRED_EVENTS : [],
       hasBranchAccess: typeof sm?.getBranch === "function",
       hasModelRegistryAccess: typeof mr?.find === "function" && typeof mr?.streamSimple === "function",
@@ -488,6 +518,8 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.on("session_start", async (_event, ctx) => {
+    state.observedEvents.clear();
+    state.observedEvents.add("session_start");
     foreground.resetSession();
     cancelPrivacyCleanup();
     if (heartbeat) clearInterval(heartbeat);
@@ -499,7 +531,7 @@ export default function (pi: ExtensionAPI) {
     consolidationPort = null;
     foreground.resetSession();
     try {
-      if (state.db) { state.db.exec("PRAGMA busy_timeout = 100"); clearProcessActivity(state.db, activityOwner); }
+      if (state.db) { state.db.exec("PRAGMA busy_timeout = 100"); clearProcessActivity(state.db, activityOwner); clearGenerationPins(state.db, activityOwner); }
     } catch (error) {
       if (ctx.hasUI) ctx.ui.notify(`pi-memory: previous session cleanup skipped: ${(error as Error).message}`, "warning");
     } finally { state.db?.close(); state.db = null; }
@@ -627,6 +659,7 @@ export default function (pi: ExtensionAPI) {
           toolResultBytes: config.config.limits.toolResultBytes,
           totalBytes: config.config.limits.inputBytes,
         },
+        maxStoreBytes: config.config.limits.maxStoreBytes,
       });
       cleanupGenerations({ db: state.db, root, now: Date.now(),
         pinnedGenerationIds: foreground.pinnedGenerationIds });
@@ -646,8 +679,9 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  pi.on("agent_start", (_event, ctx) => { markForegroundActive(ctx); });
+  pi.on("agent_start", (_event, ctx) => { state.observedEvents.add("agent_start"); markForegroundActive(ctx); });
   pi.on("agent_settled", (_event, ctx) => {
+    state.observedEvents.add("agent_settled");
     captureNow(ctx);
     // A brand-new memory root only creates its store on first capture.
     // Construct the scheduler now, before the settled transition arms its timer.
@@ -655,9 +689,10 @@ export default function (pi: ExtensionAPI) {
     catch (err) { state.captureError = `scheduler startup failed: ${(err as Error).message}`; }
     markForegroundSettled();
   });
-  pi.on("session_before_compact", (_event, ctx) => captureNow(ctx));
+  pi.on("session_before_compact", (_event, ctx) => { state.observedEvents.add("session_before_compact"); captureNow(ctx); });
 
   pi.on("session_tree", (_event, ctx) => {
+    state.observedEvents.add("session_tree");
     foreground.sessionReplaced();
     const root = resolveMemoryRoot();
     if (!canAccessMemoryStore(root)) return;
@@ -684,6 +719,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
+    state.observedEvents.add("session_shutdown");
     foreground.resetSession();
     cancelPrivacyCleanup();
     if (heartbeat) clearInterval(heartbeat);
@@ -696,6 +732,7 @@ export default function (pi: ExtensionAPI) {
       if (state.db) {
         state.db.exec("PRAGMA busy_timeout = 100");
         clearProcessActivity(state.db, activityOwner);
+        clearGenerationPins(state.db, activityOwner);
       }
       captureNow(ctx, { busyTimeoutMs: 100 });
     } catch (error) {
@@ -711,6 +748,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", (event, ctx) => {
+    state.observedEvents.add("before_agent_start");
     markForegroundActive(ctx);
     let consumerSession: string = activityOwner;
     try {
@@ -783,14 +821,26 @@ export default function (pi: ExtensionAPI) {
         if (lstatSync(path).isSymbolicLink()) return { pin: null, failure: { error: true, reason: "preparation_integrity" } };
         // Existing read stores also support ephemeral foreground retrieval. Never
         // create a database here or run migrations/capture while acquiring a pin.
-        state.db = new DatabaseSync(path); state.db.exec("PRAGMA busy_timeout = 50");
+        // secure_delete must be set before /memory forget can reuse this writable
+        // connection — otherwise deleted extraction cells keep recoverable
+        // plaintext in free pages that WAL truncation never scrubs.
+        state.db = new DatabaseSync(path);
+        state.db.exec("PRAGMA busy_timeout = 50");
+        state.db.exec("PRAGMA secure_delete = ON");
       } catch { return { pin: null, failure: { error: true, reason: "preparation_unavailable" } }; }
     }
-    return withReaderDb((db): PinAcquisition => {
+    const acquisition = withReaderDb((db): PinAcquisition => {
       const options = { maxUnusedDays: config.schedule.maxUnusedDays,
         extractionPromptHash: version === "v1" ? v1PromptHash() : v2PromptHash() };
       return prepareEvidencePin({ db, root: resolveMemoryRoot(), memoryVersion: version, ...options });
     }, { pin: null });
+    if (acquisition.pin && state.db) {
+      try {
+        registerGenerationPin(state.db, { ownerId: activityOwner, generationId: acquisition.pin.generationId,
+          memoryVersion: acquisition.pin.memoryVersion });
+      } catch { /* Lease registration is best-effort cleanup protection. */ }
+    }
+    return acquisition;
   }
   /** Host adapter: re-sample configuration, store access and read policy at a checkpoint. */
   function sampleReadEligibility(cwd: string): boolean {
@@ -807,16 +857,24 @@ export default function (pi: ExtensionAPI) {
       maxUnusedDays: state.config?.status === "ok" ? state.config.config.schedule.maxUnusedDays : 30 }),
       { valid: false, reason: "validation_unavailable", error: true });
   }
-  pi.on("context_with_system", (event, ctx) => foreground.prepareRequest({
-    messages: event.messages, cwd: ctx.cwd,
-    contextWindow: ctx.model?.contextWindow, maxTokens: ctx.model?.maxTokens,
-    abort: () => ctx.abort(),
-  }));
-  pi.on("before_provider_request", (event, ctx) => foreground.admitDispatch({
-    payload: event.payload, cwd: ctx.cwd,
-    contextWindow: ctx.model?.contextWindow, maxTokens: ctx.model?.maxTokens,
-    abort: () => ctx.abort(),
-  }));
+  pi.on("context_with_system", (event, ctx) => {
+    state.observedEvents.add("context_with_system");
+    const prepared = foreground.prepareRequest({
+      messages: event.messages, cwd: ctx.cwd,
+      contextWindow: ctx.model?.contextWindow, maxTokens: ctx.model?.maxTokens,
+      abort: () => ctx.abort(),
+    });
+    refreshGenerationPinLease();
+    return prepared;
+  });
+  pi.on("before_provider_request", (event, ctx) => {
+    state.observedEvents.add("before_provider_request");
+    return foreground.admitDispatch({
+      payload: event.payload, cwd: ctx.cwd,
+      contextWindow: ctx.model?.contextWindow, maxTokens: ctx.model?.maxTokens,
+      abort: () => ctx.abort(),
+    });
+  });
 
   function storeSchemaState(root: string): "absent" | "current" | "unavailable" {
     const path = join(root, "state.sqlite");
@@ -861,10 +919,10 @@ export default function (pi: ExtensionAPI) {
     const resolveRef = (ref: { provider: string; modelId: string } | null) => {
       if (!ref) return { status: "unset" } as const;
       const find = state.modelRegistry?.find;
-      const resolved =
-        typeof find === "function"
-          ? Boolean((find as (p: string, m: string) => unknown).call(state.modelRegistry, ref.provider, ref.modelId))
-          : false;
+      let resolved = false;
+      if (typeof find === "function") {
+        resolved = Boolean((find as (p: string, m: string) => unknown).call(state.modelRegistry, ref.provider, ref.modelId));
+      }
       return { status: "configured", ref, resolved } as const;
     };
     return {
@@ -880,6 +938,7 @@ export default function (pi: ExtensionAPI) {
       legacyControlLock: legacyLockPath(root),
       models: { extract: resolveRef(cfg?.models.extract ?? null), consolidate: resolveRef(cfg?.models.consolidate ?? null) },
       promptSections: state.promptSections,
+      observedEvents: [...state.observedEvents],
       foreground: { ...foreground.diagnostic, pinAvailable: Boolean(foreground.pin) },
     };
   }
@@ -905,11 +964,17 @@ export default function (pi: ExtensionAPI) {
       ).get(Date.now(), version) as { status: string; error_code: string | null; due_at: number;
         last_activity_at: number; busy_until: number | null; skip_idle: number } | undefined;
       if (!row) return `${version} extraction: not queued`;
-      const outcome = row.status === "leased" ? "extracting" : row.status === "succeeded" ? "extracted" : row.status;
+      let outcome = row.status;
+      if (row.status === "leased") outcome = "extracting";
+      else if (row.status === "succeeded") outcome = "extracted";
       const reason = row.error_code ? ` — ${row.error_code}` : "";
-      const idleUntil = row.last_activity_at + (row.skip_idle ? 0 : state.config?.status === "ok" ? state.config.config.schedule.minIdleMinutes : 360) * 60_000;
+      let idleMinutes = 360;
+      if (row.skip_idle) idleMinutes = 0;
+      else if (state.config?.status === "ok") idleMinutes = state.config.config.schedule.minIdleMinutes;
+      const idleUntil = row.last_activity_at + idleMinutes * 60_000;
       const nextDue = Math.max(row.due_at, idleUntil, row.busy_until ?? 0);
-      const pending = row.status === "queued" && idleUntil > Date.now() ? "pending idle window; " : "";
+      let pending = "";
+      if (row.status === "queued" && idleUntil > Date.now()) pending = "pending idle window; ";
       const due = ["queued", "retry_wait"].includes(row.status) ? ` (${pending}next due ${new Date(nextDue).toISOString()})` : "";
       return `${version} extraction: ${outcome}${reason}${due}`;
     } catch {
@@ -929,6 +994,10 @@ export default function (pi: ExtensionAPI) {
       lines.push(`state: DISABLED — unsupported host`, ...state.compat.problems.map((p) => `  - ${p}`));
       return lines;
     }
+    const { runObserved, missing } = runEventGaps();
+    if (runObserved && missing.length) {
+      lines.push(`host events: MISSING — ${missing.join(", ")} accepted but never dispatched this session;`, "  capture, request-local reading or dispatch fencing may be nonfunctional (host bug, see /memory doctor)");
+    }
     const cfg = state.config;
     const { mode, source } = effectiveMode();
     if (!cfg || cfg.status === "missing") {
@@ -939,25 +1008,32 @@ export default function (pi: ExtensionAPI) {
     } else {
       const c = cfg.config;
       const readiness = (["v1", "v2"] as const).map(version => pipelineReadiness(root, version));
+      const storeState = storeSchemaState(root);
+      let storeLine = "store: not initialized yet";
+      if (storeState === "current") storeLine = "store: present";
+      else if (storeState === "unavailable") storeLine = "store: unavailable or corrupt (preserved)";
+      let captureLine = "capture: pending settlement";
+      if (state.capture?.status === "captured") captureLine = `capture: captured (${state.capture.sourceId})`;
+      else if (state.capture?.status === "ephemeral") captureLine = "capture: ephemeral (no persistent session)";
+      else if (state.capture?.status === "skipped") captureLine = `capture: skipped (${state.capture.reason})`;
+      const usedBytes = storeSizeBytes(root);
+      const capBytes = c.limits.maxStoreBytes;
+      const storeSizeLine = `store size: ${(usedBytes / 2 ** 20).toFixed(1)} MiB of ${(capBytes / 2 ** 20).toFixed(1)} MiB cap` +
+        (usedBytes >= capBytes ? " — new evidence paused (store_size_limit_reached)" : "");
+      const dualWriteLines: string[] = [];
+      if (c.dualWrite) dualWriteLines.push(`dual-write: ${readiness.every(line => line.endsWith(": published")) ? "published both" : "partial"}`);
       lines.push(
         `mode: ${describeMode(mode, source)}`,
         `selected version: ${c.version}${c.dualWrite ? " + dual-write v1&v2" : ""}`,
         `models: extract=${formatModelRef(c.models.extract)}, consolidate=${formatModelRef(c.models.consolidate)}`,
-        storeSchemaState(root) === "current"
-          ? "store: present"
-          : storeSchemaState(root) === "unavailable"
-            ? "store: unavailable or corrupt (preserved)"
-            : "store: not initialized yet",
-        state.capture?.status === "captured"
-          ? `capture: captured (${state.capture.sourceId})`
-          : state.capture?.status === "ephemeral"
-            ? "capture: ephemeral (no persistent session)"
-            : "capture: pending settlement",
+        storeLine,
+        storeSizeLine,
+        captureLine,
         extractionStatusLine(root, "v1"),
         extractionStatusLine(root, "v2"),
         ...readiness,
         `generation targets: ${targetVersions(c).join(", ")}`,
-        ...(c.dualWrite ? [`dual-write: ${readiness.every(line => line.endsWith(": published")) ? "published both" : "partial"}`] : []),
+        ...dualWriteLines,
         ...(state.captureError ? [`capture error: ${state.captureError}`] : []),
         `foreground: ${foreground.diagnostic.status} (${foreground.diagnostic.reason}); ${foreground.diagnostic.memoryVersion ?? ""} ${foreground.diagnostic.generationId ?? ""} ${foreground.diagnostic.representation ?? ""}`,
         `foreground warnings: ${JSON.stringify(foreground.diagnostic.warningCounts)}`,
@@ -982,9 +1058,12 @@ export default function (pi: ExtensionAPI) {
       const writer = db.prepare("SELECT status, error_code FROM jobs WHERE kind = 'consolidate' AND memory_version = ? ORDER BY updated_at DESC LIMIT 1").get(version);
       const extraction = db.prepare("SELECT status, error_code FROM jobs WHERE kind = 'extract' AND memory_version = ? ORDER BY updated_at DESC LIMIT 1").get(version);
       const captured = db.prepare("SELECT 1 FROM source_revisions WHERE status = 'captured' LIMIT 1").get();
-      const progress = writer?.status === "leased" ? "; consolidating" : writer?.status === "blocked" ? `; blocked (${writer.error_code})`
-        : extraction?.status === "leased" ? "; extracting" : extraction?.status === "blocked" ? `; blocked (${extraction.error_code})`
-        : captured ? "; captured" : "";
+      let progress = "";
+      if (writer?.status === "leased") progress = "; consolidating";
+      else if (writer?.status === "blocked") progress = `; blocked (${writer.error_code})`;
+      else if (extraction?.status === "leased") progress = "; extracting";
+      else if (extraction?.status === "blocked") progress = `; blocked (${extraction.error_code})`;
+      else if (captured) progress = "; captured";
       return `${version} readiness: warming_up${progress}`;
     } catch { return `${version} readiness: store unavailable`; }
     finally { if (db && db !== state.db) db.close(); }
@@ -1127,7 +1206,10 @@ export default function (pi: ExtensionAPI) {
           if (match[1] === "note") {
             const result = forgetNote({ ...store, noteId: match[2]! });
             if (result.removed) afterNoteChange(store.root, true);
-            if (ctx.hasUI) ctx.ui.notify(`pi-memory: ${result.removed ? "removed" : "no active note found for"} ${result.noteId}. ${result.explanation} ${DELETION_LIMITS}`, "info");
+            // A failed unlink leaves the revoked note file on disk; keep retrying
+            // the sweep instead of reporting the note as fully removed.
+            if (result.cleanupPending) schedulePrivacyCleanup(store.root);
+            if (ctx.hasUI) ctx.ui.notify(`pi-memory: ${result.removed ? "removed" : "no active note found for"} ${result.noteId}.${result.cleanupPending ? " Note-file deletion is pending; revoked views remain unavailable. " : " "}${result.explanation} ${DELETION_LIMITS}`, result.cleanupPending ? "warning" : "info");
           } else {
             const result = forgetEvidence({ ...store, kind: match[1] as "source" | "session", id: match[2]! });
             if (result.forgotten) afterNoteChange(store.root, true);
@@ -1225,6 +1307,7 @@ export default function (pi: ExtensionAPI) {
                 root, agentDir: getAgentDir(), db: state.db,
                 limits: { itemBytes: 64 * 1024, toolResultBytes: cfg.config.limits.toolResultBytes,
                   totalBytes: cfg.config.limits.inputBytes },
+                maxStoreBytes: cfg.config.limits.maxStoreBytes,
               });
               lines.push(`imported: ${result.imported}`);
               for (const item of result.skipped) lines.push(`${item.path}: skipped — ${item.reason}`);

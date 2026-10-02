@@ -212,6 +212,7 @@ async function generateMemory({ item, version, agentDir, root, paths, runtime, e
 
 async function answer({ item, mode, cwd, agentDir, runtime, model, approval }) {
   let section = "";
+  let expectedGenerationId = null;
   if (mode === "v1" || mode === "v2") {
     const db = new DatabaseSync(join(agentDir, "memory", "state.sqlite"), { readOnly: true });
     try {
@@ -222,12 +223,20 @@ async function answer({ item, mode, cwd, agentDir, runtime, model, approval }) {
       } else {
         if (!pin) throw new Error(`No readable ${mode} generation for ${item.id}`);
         section = pin.renderSection(cwd);
+        expectedGenerationId = pin.generationId;
       }
     } finally { db.close(); }
   }
-  let observedSection = "";
-  const observeInjection = pi => pi.on("before_agent_start", event => {
-    observedSection = event.systemPromptOptions?.sections?.pi_memory ?? "";
+  // Request-local reading injects a `pi_memory` custom carrier during request
+  // projection, not a `systemPromptOptions.sections.pi_memory` section.
+  // Observe the effective provider request instead of the removed section.
+  const observed = { dispatched: false, generationIds: new Set() };
+  const observeInjection = pi => pi.on("before_provider_request", event => {
+    let serialized = "";
+    try { serialized = JSON.stringify(event.payload ?? {}); } catch { return; }
+    if (!serialized.includes("historical_memory_evidence")) return;
+    observed.dispatched = true;
+    for (const match of serialized.matchAll(/Generation ID: \\"([^"\\]+)\\"/g)) observed.generationIds.add(match[1]);
   });
   const loader = new DefaultResourceLoader({ cwd, agentDir, noContextFiles: true, noSkills: true,
     noPromptTemplates: true,
@@ -276,8 +285,14 @@ async function answer({ item, mode, cwd, agentDir, runtime, model, approval }) {
     const started = performance.now();
     await session.prompt(item.query);
     const elapsedMs = Math.round(performance.now() - started);
-    if (section !== observedSection)
-      throw new Error(`Published ${mode} section was not injected for ${item.id}`);
+    if (mode === "v1" || mode === "v2") {
+      if (section && !observed.dispatched)
+        throw new Error(`Published ${mode} carrier was not dispatched for ${item.id}`);
+      if (!section && observed.dispatched)
+        throw new Error(`Memory carrier unexpectedly dispatched for ${item.id}`);
+      if (section && expectedGenerationId && !observed.generationIds.has(expectedGenerationId))
+        throw new Error(`Dispatched carrier did not contain the pinned generation for ${item.id}`);
+    }
     const final = session.messages.findLast(message => message.role === "assistant");
     if (exceededTurns) throw new Error("Answer exceeded four model turns");
     if (!final || final.stopReason === "error" || final.stopReason === "aborted")

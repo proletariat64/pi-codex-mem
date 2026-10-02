@@ -11,6 +11,7 @@ import {
 import { applyContextEdits, normalizeEvidence, NORMALIZATION_POLICY_VERSION, type NormalizeLimits } from "./snapshot.ts";
 import { prunePrivacyRevoked, recordSnapshot, sourceSuppressed } from "./store/db.ts";
 import { writeSnapshotFile } from "./store/snapshot-files.ts";
+import { storeSizeBytes } from "./store/size.ts";
 
 /** Capture plain branch values immediately; never retain a pi context for queued work (§6.1). */
 export interface BranchReader {
@@ -28,6 +29,8 @@ export interface CaptureInput {
   reader: BranchReader;
   db: DatabaseSync;
   limits?: NormalizeLimits;
+  /** Optional store cap (limits.maxStoreBytes): capture pauses at or above it. */
+  maxStoreBytes?: number;
 }
 
 export type CaptureResult =
@@ -47,6 +50,12 @@ export function captureSettledSession(input: CaptureInput): CaptureResult {
   const leaf = input.reader.getLeafId();
   if (!file || !header || !leaf) {
     return { status: "ephemeral", reason: "persistent session header/path/leaf unavailable" };
+  }
+  // limits.maxStoreBytes pauses new evidence writes while the store is at cap:
+  // the configured limit is an owned-store ceiling, not a per-snapshot budget.
+  if (input.maxStoreBytes !== undefined && Number.isSafeInteger(input.maxStoreBytes) && input.maxStoreBytes > 0 &&
+      storeSizeBytes(input.root) >= input.maxStoreBytes) {
+    return { status: "skipped", reason: "store_size_limit_reached" };
   }
   // getBranch() is authoritative. Copy immediately, before any I/O can
   // interleave another extension event with the current branch snapshot.

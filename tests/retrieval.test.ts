@@ -297,6 +297,23 @@ test("a handbook lesson read counts its task-local sources even when references 
   assert.deepEqual(noteOnly.details.items[0]!.sourceIds, [], "an unrelated task's sources must not be refreshed");
 });
 
+test("reusable-knowledge sections and group preambles attribute only their own sources", async (t) => {
+  const { db, publish } = fixture(t);
+  const evidence = evidencePath("source", "decision");
+  const handbook = `# Task Group: Types\nscope: project\napplies_to: repo\n## Task 1: Choice\n### rollout_summary_files\n- ${evidence}\n### learnings\n- 中文决策\n## Reusable Knowledge\n- Prefer explicit interfaces\n`;
+  const { call } = publish("v1", "group-over-attribution", "中文决策", handbook);
+  const taskLine = await call("read", { path: "MEMORY.md", startLine: 6, maxLines: 1 });
+  assert.deepEqual(taskLine.details.items[0]!.sourceIds, ["source"]);
+  const preamble = await call("read", { path: "MEMORY.md", startLine: 3, maxLines: 1 });
+  assert.deepEqual(preamble.details.items[0]!.sourceIds, [],
+    "the task-group preamble must not inherit the group's task sources");
+  const reusable = await call("read", { path: "MEMORY.md", startLine: 10, maxLines: 1 });
+  assert.deepEqual(reusable.details.items[0]!.sourceIds, [],
+    "a reusable-knowledge section must not inherit the group's task sources");
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM memory_usage").get()!.n, 1,
+    "reading unrelated reusable knowledge must not refresh task sources");
+});
+
 test("a 128-source task keeps metadata bounded and records complete validated detail support", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "pi-many-sources-")); const db = openStateDb(root);
   t.after(() => { db.close(); rmSync(root, { recursive: true, force: true }); });
@@ -348,7 +365,7 @@ test("a 128-source task keeps metadata bounded and records complete validated de
   unlinkSync(join(root, `${ids[12]}.jsonl`));
   for (const name of ["read", "list", "search"]) {
     const output = await tools.find(tool => tool.name === `pi_memory_${name}`)!.execute("call",
-      { path: "MEMORY.md", startLine: 4, maxLines: 1, queries: ["Task Group"], match: "any" }, undefined);
+      { path: "MEMORY.md", startLine: 4, maxLines: 1, queries: ["TypeScript"], match: "any" }, undefined);
     assert.equal(output.details.error, undefined); assert.equal(output.details.truncated, true);
     assert.equal(output.details.items[0]!.omittedSourceIds, 116);
     assert.deepEqual(output.details.items[0]!.sourceIds, ids.slice(0, 12));

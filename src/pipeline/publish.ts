@@ -60,7 +60,9 @@ export function publishGeneration(opts: {
   if (createHash("sha256").update(readFileSync(manifestPath)).digest("hex") !== opts.manifestHash) throw new Error("publication manifest changed");
   if (opts.lease.memoryVersion === "v2") {
     const validated = validateV2Artifacts({ directory: stagingDir, snapshot: opts.snapshot });
-    const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as StagingManifest;
+    let manifest: StagingManifest;
+    try { manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as StagingManifest; }
+    catch (err) { throw new Error("malformed v2 publication manifest", { cause: err }); }
     const entries = (hashes: Record<string, string>) => Object.entries(hashes).sort(([a], [b]) => a.localeCompare(b));
     const sources = [...opts.snapshot.sources].sort((a, b) => a.sourceId < b.sourceId ? -1 : a.sourceId > b.sourceId ? 1 : 0).map(source => [source.sourceId, source.extractionId,
       evidencePath(source.sourceId, source.rolloutSlug), source.outputHash, source.cwd, source.workspaceKey]);
@@ -101,8 +103,12 @@ export function publishGeneration(opts: {
 /** Bounded recovery plus pins. The write lock prevents new writers racing orphan cleanup. */
 export function cleanupGenerations(opts: {
   db: DatabaseSync; root: string; now: number; pinnedGenerationIds?: readonly string[];
+  /** Recovery copies kept per version beyond the active/pinned ones; defaults to 2. */
+  retainRecoveryCount?: number;
 }): void {
   const { db, now } = opts;
+  const retainRecovery = opts.retainRecoveryCount ?? 2;
+  if (!Number.isSafeInteger(retainRecovery) || retainRecovery < 0) throw new Error("invalid generation recovery retention");
   const root = realpathSync(opts.root);
   db.exec("BEGIN IMMEDIATE");
   try {
@@ -112,6 +118,12 @@ export function cleanupGenerations(opts: {
       db.exec("COMMIT"); return;
     }
     const pins = new Set(opts.pinnedGenerationIds ?? []);
+    // Cross-process pins: another process's active foreground run registered its
+    // pin in the store; cleanup here must retain that generation even though it
+    // cannot see the other process's memory. Expired leases are pruned first.
+    db.prepare("DELETE FROM generation_pins WHERE expires_at <= ?").run(now);
+    const leased = new Set((db.prepare("SELECT generation_id FROM generation_pins")
+      .all() as { generation_id: string }[]).map(row => row.generation_id));
     for (const version of ["v1", "v2"] as const) {
       const active = (db.prepare("SELECT active_generation_id AS id FROM pipeline_state WHERE memory_version = ?")
         .get(version) as { id: string | null }).id;
@@ -124,10 +136,11 @@ export function cleanupGenerations(opts: {
       const keep = new Set<string>();
       for (const row of rows) {
         const revoked = row.status === "revoked" || row.privateRevoked !== 0;
-        const retain = !revoked && (row.id === active || pins.has(row.id) || oldCount < 2);
+        const retainedPin = pins.has(row.id) || leased.has(row.id);
+        const retain = !revoked && (row.id === active || retainedPin || oldCount < retainRecovery);
         if (retain) {
           keep.add(row.id);
-          if (row.id !== active && !pins.has(row.id)) oldCount++;
+          if (row.id !== active && !retainedPin) oldCount++;
           continue;
         }
         const expected = join(root, "versions", version, "generations", row.id);

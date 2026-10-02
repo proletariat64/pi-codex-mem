@@ -18,6 +18,22 @@ export const REQUIRED_EVENTS = [
 
 export type RequiredEvent = (typeof REQUIRED_EVENTS)[number];
 
+/**
+ * Events that must be dispatched during any complete agent run. Registration
+ * cannot prove these (a host can accept pi.on and never emit); runtime
+ * observation of a partial set with others missing proves a broken host.
+ */
+export const RUN_CRITICAL_EVENTS = [
+  "before_agent_start",
+  "context_with_system",
+  "before_provider_request",
+  "agent_start",
+  "agent_settled",
+] as const;
+
+/** A dispatched agent-start/settle event proves a run happened this session. */
+export const RUN_EVIDENCE_EVENTS = ["before_agent_start", "agent_start", "agent_settled"] as const;
+
 export interface HostCapabilities {
   /** e.g. process.versions.node */
   nodeVersion: string;

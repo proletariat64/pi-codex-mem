@@ -9,8 +9,9 @@ import {
   computeWorkspaceIdentity,
 } from "./identity.ts";
 import { applyContextEdits, normalizeEvidence, NORMALIZATION_POLICY_VERSION, type NormalizeLimits } from "./snapshot.ts";
-import { prunePrivacyRevoked, recordSnapshot, sourceSuppressed } from "./store/db.ts";
+import { prunePrivacyRevoked, recordCapturePrivacy, recordSnapshot, sourceSuppressed } from "./store/db.ts";
 import { writeSnapshotFile } from "./store/snapshot-files.ts";
+import { storeSizeBytes } from "./store/size.ts";
 
 /** Capture plain branch values immediately; never retain a pi context for queued work (§6.1). */
 export interface BranchReader {
@@ -28,6 +29,8 @@ export interface CaptureInput {
   reader: BranchReader;
   db: DatabaseSync;
   limits?: NormalizeLimits;
+  /** Optional store cap (limits.maxStoreBytes): capture pauses at or above it. */
+  maxStoreBytes?: number;
 }
 
 export type CaptureResult =
@@ -51,13 +54,18 @@ export function captureSettledSession(input: CaptureInput): CaptureResult {
   // getBranch() is authoritative. Copy immediately, before any I/O can
   // interleave another extension event with the current branch snapshot.
   const branch = structuredClone(input.reader.getBranch());
+  const edits = branch.filter((e) => e.type === "context_edit");
+  // Size pressure pauses new evidence, but privacy edits must still revoke
+  // earlier snapshots and derived views before returning the paused result.
+  const capturePaused = input.maxStoreBytes !== undefined && Number.isSafeInteger(input.maxStoreBytes) &&
+    input.maxStoreBytes > 0 && storeSizeBytes(input.root) >= input.maxStoreBytes;
+  if (capturePaused && !edits.length) return { status: "skipped", reason: "store_size_limit_reached" };
   // Potentially slow normalization and Git probes happen before taking the
   // SQLite writer lock; the branch values are already copied and immutable.
-  const edits = branch.filter((e) => e.type === "context_edit");
   const normalized = normalizeEvidence(applyContextEdits(branch), { limits: input.limits });
   const workspace = computeWorkspaceIdentity(input.cwd);
   for (let attempt = 0; attempt < 3; attempt++) {
-    const outcome = captureBranch(input, file, header, leaf, branch, edits, normalized, workspace);
+    const outcome = captureBranch(input, file, header, leaf, branch, edits, normalized, workspace, capturePaused);
     if (!outcome) continue; // another connection committed during preparation
     if (outcome.revokedSourceIds.length) prunePrivacyRevoked(input.db, input.root);
     return outcome.result;
@@ -68,7 +76,7 @@ export function captureSettledSession(input: CaptureInput): CaptureResult {
 function captureBranch(
   input: CaptureInput, file: string, header: SessionHeader, leaf: string, branch: SessionEntry[],
   edits: SessionEntry[], baseNormalized: ReturnType<typeof normalizeEvidence>,
-  workspace: ReturnType<typeof computeWorkspaceIdentity>,
+  workspace: ReturnType<typeof computeWorkspaceIdentity>, capturePaused: boolean,
 ): { result: CaptureResult; revokedSourceIds: string[] } | null {
   // PRAGMA data_version detects commits by other connections, including new
   // branches, revocations, and policy updates. Retry the whole DB read if it
@@ -271,6 +279,12 @@ function captureBranch(
     if (sourceSuppressed(input.db, sessionKey, lineageKey)) {
       input.db.exec("ROLLBACK");
       return { result: { status: "skipped", reason: "source_suppressed" }, revokedSourceIds: [] };
+    }
+    if (capturePaused) {
+      recordCapturePrivacy(input.db, { capturedAt: Date.now(), revokedSourceIds, privacyTargets,
+        privacyPolicyChanged, evidenceRemoved });
+      input.db.exec("COMMIT");
+      return { result: { status: "skipped", reason: "store_size_limit_reached" }, revokedSourceIds };
     }
     saved = writeSnapshotFile(input.root, lineageKey, revisionHash, snapshot);
     recordSnapshot(input.db, {

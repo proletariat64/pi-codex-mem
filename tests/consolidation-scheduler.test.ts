@@ -159,3 +159,46 @@ test("changed generated output rearms a content-based rebuild and never serves t
   assert.notEqual(after.generationId, before.generationId);
   assert.equal(readFileSync(join(after.directory, "memory_summary.md"), "utf8"), MINIMAL_V1_SUMMARY);
 });
+
+test("at-cap store pauses generation writes and prunes old recovery copies", async (t) => {
+  const { root, db, config, scheduler, scheduled } = fixture(t);
+  // First pass publishes normally below the cap.
+  assert.ok((await scheduler.runPass()).some(result => result.status === "published" || result.status === "unchanged"));
+
+  // Put the owned store over limits.maxStoreBytes.
+  const generation = getPublishedGeneration(db, "v1", NOW)!.directory;
+  config.limits = { ...config.limits, maxStoreBytes: 2 ** 20 };
+  writeFileSync(join(generation, "cap-fixture.bin"), Buffer.alloc(2 ** 21));
+
+  const before = getPublishedGeneration(db, "v1", NOW)!.generationId;
+  assert.deepEqual(await scheduler.runPass(), [{ status: "blocked", reason: "store_size_limit_reached" }]);
+  getPublishedGeneration(db, "v1", NOW);
+  // The paused pass must not rearm a busy idle-loop wake.
+  assert.equal(scheduled.length, 0);
+  scheduler.trigger();
+  assert.equal(scheduled.length, 0, "an unchanged store still above the cap stays paused");
+  // The published generation survived; no new generation was written.
+  assert.equal(getPublishedGeneration(db, "v1", NOW)?.generationId, before);
+});
+
+test("pruning recovery copies below the store cap continues pending consolidation", async (t) => {
+  const { root, db, config, scheduler, scheduled } = fixture(t);
+  assert.deepEqual(await scheduler.runPass(), [{ status: "published" }]);
+  const recovery = getPublishedGeneration(db, "v1", NOW)!;
+  writeFileSync(join(recovery.directory, "memory_summary.md"), MINIMAL_V1_SUMMARY + "Unsupported claim\n");
+  assert.deepEqual(await scheduler.runPass(), [{ status: "published" }]);
+  const before = getPublishedGeneration(db, "v1", NOW)!;
+  assert.ok(existsSync(recovery.directory), "the old generation is retained for recovery");
+
+  config.limits = { ...config.limits, maxStoreBytes: 2 ** 20 };
+  writeFileSync(join(recovery.directory, "cap-fixture.bin"), Buffer.alloc(2 ** 21));
+  writeFileSync(join(before.directory, "memory_summary.md"), MINIMAL_V1_SUMMARY + "Another unsupported claim\n");
+
+  assert.deepEqual(await scheduler.runPass(), [{ status: "published" }],
+    "reclaimed capacity permits the pending rebuild without another input event");
+  assert.equal(existsSync(recovery.directory), false);
+  const after = getPublishedGeneration(db, "v1", NOW)!;
+  assert.notEqual(after.generationId, before.generationId);
+  assert.equal(readFileSync(join(after.directory, "memory_summary.md"), "utf8"), MINIMAL_V1_SUMMARY);
+  assert.equal(scheduled.filter(item => !item.cancelled).length, 0);
+});

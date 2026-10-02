@@ -198,14 +198,14 @@ const sources = (manifest: StagingManifest, path: string, text: string): string[
       const groups = [0, ...lines.flatMap((line, index) => index > 0 && /^# Task Group: /.test(line) ? [index] : []), lines.length];
       for (let g = 0; g < groups.length - 1; g++) {
         const start = groups[g]!; const end = groups[g + 1]!;
-        const groupSources = sources(manifest, path, lines.slice(start, end).join("\n"));
-        for (let index = start; index < end; index++) attribution[index] = groupSources;
-        const sections = [...lines.slice(start, end).flatMap((line, index) => /^## /.test(line) ? [start + index] : []), end];
+        // Attribute every section (and the group preamble) by its own text, not
+        // by the whole task group: a reusable-knowledge line supported by one
+        // task must not extend retention of unrelated tasks' sources.
+        const sections = [start, ...lines.slice(start, end).flatMap((line, index) => /^## /.test(line) ? [start + index] : []), end];
         for (let s = 0; s < sections.length - 1; s++) {
           const first = sections[s]!; const last = sections[s + 1]!;
-          if (!/^## Task \d+(?::|\b)/.test(lines[first]!)) continue;
-          const taskSources = sources(manifest, path, lines.slice(first, last).join("\n"));
-          for (let index = first; index < last; index++) attribution[index] = taskSources;
+          const sectionSources = sources(manifest, path, lines.slice(first, last).join("\n"));
+          for (let index = first; index < last; index++) attribution[index] = sectionSources;
         }
       }
     }

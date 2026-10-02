@@ -6,7 +6,7 @@ import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { openStateDb } from "../src/store/db.ts";
+import { openStateDb, registerGenerationPin } from "../src/store/db.ts";
 import { claimConsolidation, finishConsolidation, getPublishedGeneration, selectConsolidation } from "../src/store/consolidation.ts";
 import { cleanupGenerations, publishGeneration } from "../src/pipeline/publish.ts";
 import { buildStaging } from "../src/pipeline/staging.ts";
@@ -54,6 +54,24 @@ test("publication serves only immutable DB-selected complete directories and ret
   cleanupGenerations({ db, root, now: NOW + 6, pinnedGenerationIds: ["generation-0"] });
   assert.deepEqual((db.prepare("SELECT generation_id FROM generations ORDER BY generation_id").all() as { generation_id: string }[])
     .map(g => g.generation_id), ["generation-0", "generation-2", "generation-3", "generation-4"]);
+});
+
+test("cleanup retains another process's registered generation pin until its lease expires", (t) => {
+  const { root, db, candidate } = fixture(t);
+  for (let n = 0; n < 5; n++) assert.equal(publishGeneration(candidate(`generation-${n}`, NOW + n)).published, true);
+  // Another foreground run in a different process pinned generation-0 and
+  // registered the lease in the shared store; this process has no local pins.
+  registerGenerationPin(db, { ownerId: "other-process", generationId: "generation-0",
+    memoryVersion: "v1", now: NOW + 6 });
+  cleanupGenerations({ db, root, now: NOW + 6 });
+  assert.deepEqual((db.prepare("SELECT generation_id FROM generations ORDER BY generation_id").all() as { generation_id: string }[])
+    .map(g => g.generation_id), ["generation-0", "generation-2", "generation-3", "generation-4"]);
+  assert.equal(existsSync(join(root, "versions", "v1", "generations", "generation-0")), true);
+  // Once the lease lapses, the same recovery-copy bound applies again.
+  cleanupGenerations({ db, root, now: NOW + 901_000 });
+  assert.deepEqual((db.prepare("SELECT generation_id FROM generations ORDER BY generation_id").all() as { generation_id: string }[])
+    .map(g => g.generation_id), ["generation-2", "generation-3", "generation-4"]);
+  assert.equal(existsSync(join(root, "versions", "v1", "generations", "generation-0")), false);
 });
 
 test("v2 publication rejects forbidden files and directories even without caller validation", (t) => {

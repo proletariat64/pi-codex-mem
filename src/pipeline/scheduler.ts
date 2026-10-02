@@ -11,6 +11,7 @@ import { consolidationPromptHash } from "./consolidate.ts";
 import type { ConsolidationModelPort } from "./model-port.ts";
 import { prepareGenerationCandidate, type GenerationCandidate } from "./candidate.ts";
 import { cleanupGenerations } from "./publish.ts";
+import { storeSizeBytes } from "../store/size.ts";
 import { generatedOutput, readWorkspaceUtf8, workspaceInventory } from "./workspace-tools.ts";
 
 export interface ConsolidationSchedulerOptions {
@@ -179,6 +180,22 @@ export class ConsolidationScheduler {
     const db = this.options.db;
     const busy = db.prepare("SELECT 1 FROM process_activity WHERE activity_state = 'active' AND expires_at > ? LIMIT 1").get(clock());
     if (busy) return [];
+    // limits.maxStoreBytes pauses generation writes at the configured cap and
+    // instead prunes old recovery copies; without a gate the store grows until
+    // filesystem writes fail. Recheck capacity after pruning so a successful
+    // cleanup can continue this pass; checkedKeys records only a remaining
+    // pause so the idle timer does not spin.
+    const storeCap = config.limits.maxStoreBytes;
+    if (Number.isSafeInteger(storeCap) && storeCap > 0 && storeSizeBytes(this.options.root) >= storeCap) {
+      try {
+        cleanupGenerations({ db, root: this.options.root, now: clock(),
+          pinnedGenerationIds: this.options.pinnedGenerationIds?.(), retainRecoveryCount: 0 });
+      } catch (error) { this.options.onError?.(error); }
+      if (storeSizeBytes(this.options.root) >= storeCap) {
+        this.checkedKeys.set(version, this.key(config, version));
+        return [{ status: "blocked", reason: "store_size_limit_reached" }];
+      }
+    }
     const snapshot = this.snapshot(config, version);
     const promptHash = consolidationPromptHash(config, version);
     const lease = claimConsolidation(db, { memoryVersion: version, owner: randomUUID(), now: clock(), promptHash,

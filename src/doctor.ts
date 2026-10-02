@@ -196,16 +196,16 @@ export function runDoctor(input: DoctorInput): DoctorReport {
   }
   probes.push(foregroundProbe);
 
-  if (input.observedEvents) {
-    const observed = new Set(input.observedEvents);
+  {
+    const observed = new Set(input.observedEvents ?? []);
     const missing = RUN_CRITICAL_EVENTS.filter(name => !observed.has(name));
     const runObserved = RUN_EVIDENCE_EVENTS.some(name => observed.has(name));
     const probe = !missing.length
       ? { id: "host-events", label: "host events", status: "ok" as ProbeStatus,
           detail: "all run-critical extension events have been dispatched this session" }
       : !runObserved
-        ? { id: "host-events", label: "host events", status: "warn" as ProbeStatus,
-            detail: `no agent-run events dispatched yet (${missing.join(", ")} unobserved); after your first prompt these must appear — a host that accepted pi.on registrations but never dispatches them breaks capture, reading and fencing` }
+        ? { id: "host-events", label: "host events", status: "fail" as ProbeStatus,
+            detail: `host event dispatch unverified (${missing.join(", ")} unobserved); send your first prompt, let the agent run complete, then run /memory doctor again — registration alone cannot verify capture, reading or fencing` }
         : { id: "host-events", label: "host events", status: "fail" as ProbeStatus,
             detail: `host accepted pi.on registrations but never dispatched: ${missing.join(", ")} — capture, request-local reading or dispatch fencing cannot work on this host` };
     probes.push(probe);

@@ -451,26 +451,28 @@ export default function (pi: ExtensionAPI) {
     explicitRun?.extraction.foregroundStarted();
     if (heartbeat) clearInterval(heartbeat);
     heartbeat = null;
+    let sessionKey: string | null = null;
     try {
       const header = ctx.sessionManager.getHeader();
       const file = ctx.sessionManager.getSessionFile();
-      if (!state.db || !header || !file) return;
-      const sessionKey = computeSessionKey(getAgentDir(), file, header.id);
-      const beat = () => {
-        try {
-          if (state.db) recordProcessActivity(state.db, { owner: activityOwner, sessionKey,
-            state: "active", now: Date.now() });
-          refreshGenerationPinLease();
-        } catch (err) {
-          state.captureError = `activity heartbeat failed: ${(err as Error).message}`;
-        }
-      };
-      beat();
-      heartbeat = setInterval(beat, 30_000);
-      heartbeat.unref();
+      if (header && file) sessionKey = computeSessionKey(getAgentDir(), file, header.id);
     } catch {
       // Ephemeral/unavailable session metadata must not break the foreground run.
     }
+    const beat = () => {
+      try {
+        if (state.db && sessionKey) recordProcessActivity(state.db, { owner: activityOwner, sessionKey,
+          state: "active", now: Date.now() });
+      } catch (err) {
+        state.captureError = `activity heartbeat failed: ${(err as Error).message}`;
+      }
+      refreshGenerationPinLease();
+    };
+    // Pin acquisition can open the store after this transition, including for
+    // ephemeral readers. Keep its lease alive even without capture metadata.
+    beat();
+    heartbeat = setInterval(beat, 30_000);
+    heartbeat.unref();
   }
 
   function markForegroundSettled(): void {

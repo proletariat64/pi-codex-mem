@@ -182,17 +182,19 @@ export class ConsolidationScheduler {
     if (busy) return [];
     // limits.maxStoreBytes pauses generation writes at the configured cap and
     // instead prunes old recovery copies; without a gate the store grows until
-    // filesystem writes fail. checkedKeys records the pause so the idle timer
-    // does not spin; any config change rotates the input revision and re-arms,
-    // and capture resumes once the store is below the cap again.
+    // filesystem writes fail. Recheck capacity after pruning so a successful
+    // cleanup can continue this pass; checkedKeys records only a remaining
+    // pause so the idle timer does not spin.
     const storeCap = config.limits.maxStoreBytes;
     if (Number.isSafeInteger(storeCap) && storeCap > 0 && storeSizeBytes(this.options.root) >= storeCap) {
-      this.checkedKeys.set(version, this.key(config, version));
       try {
         cleanupGenerations({ db, root: this.options.root, now: clock(),
           pinnedGenerationIds: this.options.pinnedGenerationIds?.(), retainRecoveryCount: 0 });
       } catch (error) { this.options.onError?.(error); }
-      return [{ status: "blocked", reason: "store_size_limit_reached" }];
+      if (storeSizeBytes(this.options.root) >= storeCap) {
+        this.checkedKeys.set(version, this.key(config, version));
+        return [{ status: "blocked", reason: "store_size_limit_reached" }];
+      }
     }
     const snapshot = this.snapshot(config, version);
     const promptHash = consolidationPromptHash(config, version);

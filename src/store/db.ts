@@ -599,6 +599,29 @@ export function blockUncapturedLeaf(db: DatabaseSync, sessionKey: string, leafId
   }
 }
 
+/** Apply privacy policy inside the caller's transaction, even when new evidence is paused. */
+export function recordCapturePrivacy(db: DatabaseSync, input: Pick<SnapshotRecord,
+  "capturedAt" | "privacyTargets" | "revokedSourceIds" | "privacyPolicyChanged" | "evidenceRemoved"> & { sourceId?: string }): void {
+  for (const target of input.privacyTargets ?? []) {
+    db.prepare(
+      `INSERT INTO privacy_edit_targets (entry_id, allowed_hashes, applied_at, edit_id, edit_time)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT (entry_id) DO UPDATE SET
+         allowed_hashes = excluded.allowed_hashes, applied_at = excluded.applied_at,
+         edit_id = excluded.edit_id, edit_time = excluded.edit_time`,
+    ).run(target.entryId, target.allowedHashes, input.capturedAt, target.editId, target.editTime);
+  }
+  for (const sourceId of input.revokedSourceIds ?? []) {
+    db.prepare("UPDATE source_revisions SET status = 'privacy_revoked' WHERE source_id = ? AND (? IS NULL OR source_id != ?)")
+      .run(sourceId, input.sourceId ?? null, input.sourceId ?? null);
+    db.prepare("DELETE FROM extractions WHERE source_id = ? AND (? IS NULL OR source_id != ?)")
+      .run(sourceId, input.sourceId ?? null, input.sourceId ?? null);
+  }
+  if (input.revokedSourceIds?.length || input.evidenceRemoved || input.privacyPolicyChanged) {
+    blockBothViews(db, input.revokedSourceIds?.length || input.privacyPolicyChanged ? "context_edit" : "evidence_removed");
+  }
+}
+
 /** Transactionally record a captured snapshot (R01). Idempotent per revision. */
 export function recordSnapshot(db: DatabaseSync, rec: SnapshotRecord, root?: string, transactionOwned = false): void {
   if (rec.revokedSourceIds?.length && !root) throw new Error("privacy revocation requires the owned memory root");
@@ -682,24 +705,7 @@ export function recordSnapshot(db: DatabaseSync, rec: SnapshotRecord, root?: str
     // brought back by branch reactivation).
     db.prepare("UPDATE source_revisions SET status = 'captured' WHERE source_id = ? AND status != 'privacy_revoked'")
       .run(rec.revision.sourceId);
-    for (const target of rec.privacyTargets ?? []) {
-      db.prepare(
-        `INSERT INTO privacy_edit_targets (entry_id, allowed_hashes, applied_at, edit_id, edit_time)
-         VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT (entry_id) DO UPDATE SET
-           allowed_hashes = excluded.allowed_hashes, applied_at = excluded.applied_at,
-           edit_id = excluded.edit_id, edit_time = excluded.edit_time`,
-      ).run(target.entryId, target.allowedHashes, rec.capturedAt, target.editId, target.editTime);
-    }
-    for (const sourceId of rec.revokedSourceIds ?? []) {
-      db.prepare("UPDATE source_revisions SET status = 'privacy_revoked' WHERE source_id = ? AND source_id != ?")
-        .run(sourceId, rec.revision.sourceId);
-      db.prepare("DELETE FROM extractions WHERE source_id = ? AND source_id != ?")
-        .run(sourceId, rec.revision.sourceId);
-    }
-    if (rec.revokedSourceIds?.length || rec.evidenceRemoved || rec.privacyPolicyChanged) {
-      blockBothViews(db, rec.revokedSourceIds?.length || rec.privacyPolicyChanged ? "context_edit" : "evidence_removed");
-    }
+    recordCapturePrivacy(db, { ...rec, sourceId: rec.revision.sourceId });
 
     if (!transactionOwned) db.exec("COMMIT");
   } catch (err) {

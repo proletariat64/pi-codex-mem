@@ -578,3 +578,56 @@ test("capture pauses when the store is at limits.maxStoreBytes and reports it in
   assert.ok(text.includes("store size:"), text);
   assert.ok(text.includes("paused (store_size_limit_reached)"), text);
 });
+
+for (const replacement of [null, "sanitized decision"] as const) test(`at-cap capture applies privacy ${replacement === null ? "removal" : "replacement"} without writing new evidence`, async (t) => {
+  const { cwd, memoryRoot } = makeSandbox(t);
+  const base = defaultConfig("UTC");
+  mkdirSync(memoryRoot, { recursive: true });
+  writeFileSync(join(memoryRoot, "config.json"), JSON.stringify(base));
+  const mock = makeMockPi(); memoryExtension(mock.pi);
+  const original = userEntry("u1", "private decision to remove");
+  const entries: unknown[] = [original];
+  const ctx = { cwd, hasUI: false, mode: "tui", sessionManager: fakeSessionManager(cwd, entries),
+    modelRegistry: { find: () => ({}), streamSimple: () => ({}) }, ui: { notify: () => {} } };
+  await mock.fire("session_start", { type: "session_start" }, ctx);
+  await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
+  const priorFile = snapshotFiles(memoryRoot)[0]!;
+  const writer = openStateDb(memoryRoot);
+  t.after(() => { if (writer.isOpen) writer.close(); });
+  const sourceId = String(writer.prepare("SELECT source_id FROM source_revisions").get()!.source_id);
+  const now = Date.now();
+  enqueueExtraction(writer, { sourceId, memoryVersion: "v1", promptHash: "a".repeat(64), now });
+  const [job] = claimDueExtractions(writer, { owner: "cap-privacy", now: now + 1, limit: 1 });
+  assert.ok(job);
+  assert.equal(commitExtraction(writer, job, { memoryVersion: "v1", promptHash: job.promptHash,
+    model: { provider: "mock", modelId: "extract" }, rawMemory: "private derived memory",
+    rolloutSummary: "private summary", rolloutSlug: "private", outputHash: "b".repeat(64),
+    usage: { input: 1, output: 1 }, outcome: "succeeded" }, now + 2), true);
+  mkdirSync(join(memoryRoot, "versions"), { recursive: true });
+  writeFileSync(join(memoryRoot, "versions", "cap-fixture.bin"), Buffer.alloc(2 ** 21));
+  writeFileSync(join(memoryRoot, "config.json"), JSON.stringify({ ...base,
+    limits: { ...base.limits, maxStoreBytes: 2 ** 20 } }));
+  entries.push({ type: "context_edit", id: "e1", parentId: "u1", targetId: "u1",
+    replacement: replacement === null ? null : { content: [{ type: "text", text: replacement }] },
+    timestamp: "2024-01-02T00:00:00.000Z" });
+  entries.push({ ...userEntry("u2", "new evidence must stay paused"), parentId: "e1" });
+  await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
+  assert.equal(existsSync(priorFile), false, "old private snapshot is pruned even at the cap");
+  assert.deepEqual(snapshotFiles(memoryRoot), [], "no replacement or unrelated evidence is written at cap");
+  assert.equal(writer.prepare("SELECT status FROM source_revisions WHERE source_id = ?").get(sourceId)!.status, "privacy_revoked");
+  assert.equal(writer.prepare("SELECT COUNT(*) AS n FROM extractions").get()!.n, 0);
+  assert.deepEqual(writer.prepare("SELECT read_blocked FROM pipeline_state").all().map(row => row.read_blocked), [1, 1]);
+  const policy = String(writer.prepare("SELECT allowed_hashes FROM privacy_edit_targets WHERE entry_id = 'u1'").get()!.allowed_hashes);
+  assert.equal(JSON.parse(policy).length, replacement === null ? 0 : 1);
+  const epoch = writer.prepare("SELECT control_epoch FROM store_state").get()!.control_epoch;
+  await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
+  assert.equal(writer.prepare("SELECT control_epoch FROM store_state").get()!.control_epoch, epoch, "repeat paused edit is idempotent");
+  // An unedited sibling must still obey the edit accepted while capture was paused.
+  rmSync(join(memoryRoot, "versions", "cap-fixture.bin"));
+  const siblingCtx = { ...ctx, sessionManager: fakeSessionManager(cwd,
+    [original, { ...userEntry("sibling", "safe sibling evidence"), parentId: "u1" }]) };
+  await mock.fire("agent_settled", { type: "agent_settled" }, siblingCtx);
+  assert.equal(snapshotFiles(memoryRoot).length, 1);
+  assert.doesNotMatch(readFileSync(snapshotFiles(memoryRoot)[0]!, "utf8"), /private decision to remove/);
+  await mock.fire("session_shutdown", { type: "session_shutdown" }, siblingCtx);
+});

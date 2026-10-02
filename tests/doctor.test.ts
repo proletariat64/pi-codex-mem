@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { defaultConfig } from "../src/config.ts";
 import { runDoctor, type DoctorInput } from "../src/doctor.ts";
+import { RUN_CRITICAL_EVENTS } from "../src/pi/compat.ts";
 
 function goodInput(): DoctorInput {
   return {
@@ -22,6 +23,7 @@ function goodInput(): DoctorInput {
       status: "active", reason: "carrier_full", memoryVersion: "v1",
       generationId: "gen-1", representation: "full", pinAvailable: true,
     },
+    observedEvents: [...RUN_CRITICAL_EVENTS],
   };
 }
 
@@ -43,6 +45,36 @@ test("unsupported host fails the report and names the compat problems", () => {
   const host = report.probes.find((p) => p.id === "host");
   assert.equal(host?.status, "fail");
   assert.ok(host?.detail?.includes("agent_settled"));
+});
+
+test("unobserved host events cannot pass doctor before the first prompt", () => {
+  for (const observedEvents of [undefined, [], ["session_start"]]) {
+    const report = runDoctor({ ...goodInput(), observedEvents });
+    const probe = report.probes.find((p) => p.id === "host-events");
+    assert.equal(report.ok, false);
+    assert.equal(probe?.status, "fail");
+    assert.match(probe?.detail ?? "", /unverified/);
+    assert.match(probe?.detail ?? "", /first prompt/);
+    assert.match(probe?.detail ?? "", /doctor again/);
+    for (const event of RUN_CRITICAL_EVENTS) assert.ok(probe?.detail.includes(event));
+    assert.doesNotMatch(report.format()[0]!, /no blocking problems/);
+  }
+});
+
+test("partial host event dispatch fails while full observation passes", () => {
+  for (const missingEvent of RUN_CRITICAL_EVENTS) {
+    const report = runDoctor({
+      ...goodInput(),
+      observedEvents: RUN_CRITICAL_EVENTS.filter((event) => event !== missingEvent),
+    });
+    assert.equal(report.ok, false);
+    const probe = report.probes.find((p) => p.id === "host-events");
+    assert.equal(probe?.status, "fail");
+    assert.ok(probe?.detail.includes(missingEvent));
+  }
+  const report = runDoctor(goodInput());
+  assert.equal(report.ok, true);
+  assert.equal(report.probes.find((p) => p.id === "host-events")?.status, "ok");
 });
 
 test("invalid config fails the report; file is reported as preserved", () => {

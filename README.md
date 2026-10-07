@@ -46,10 +46,10 @@ Generation runs when pi is idle; schedules, byte budgets, and daily token/reques
 
 | Command | Effect |
 |---|---|
-| `/memory status` | Selected version, per-version pipeline state, model roles, capture state |
-| `/memory doctor` | Host compatibility, store integrity, injection diagnostics |
+| `/memory status` | Selected memory readability, separate extraction/consolidation state, publication, notes, local budget waits |
+| `/memory doctor` | Environment health separately from persistent memory availability and recovery blockers |
 | `/memory import <file> --dry-run` or `--run` `[--leaf ID]` | Import a historical session JSONL read-only (branching files need an explicit leaf) |
-| `/memory run [--version v1]`, `v2`, or `both`, plus `[--now]` | Trigger extraction/consolidation outside the idle window |
+| `/memory run [--version v1]`, `v2`, or `both`, plus `[--now]` | Queue extraction/consolidation; `--now` skips idle waiting, not budget admission |
 | `/memory remember <text>` | Save a workspace-scoped note for the next consolidation |
 | `/memory correct <text>` | Same, marked as a correction; revokes the current run's read pin until republished |
 | `/memory forget note|source|session <id>` | Revoke one item immediately; readers stop seeing it |

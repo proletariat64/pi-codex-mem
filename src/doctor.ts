@@ -6,6 +6,7 @@ import type { CompatResult } from "./pi/compat.ts";
 import { RUN_CRITICAL_EVENTS, RUN_EVIDENCE_EVENTS } from "./pi/compat.ts";
 import type { LoadConfigResult, ModelRef } from "./config.ts";
 import type { ForegroundDiagnostic } from "./read/carrier.ts";
+import type { MemoryDiagnostics } from "./diagnostics.ts";
 export type { ForegroundDiagnostic } from "./read/carrier.ts";
 
 export type ProbeStatus = "ok" | "warn" | "fail";
@@ -28,6 +29,7 @@ export interface DoctorInput {
     rootIsCodex: boolean;
   };
   store: { state: "absent" | "current" | "legacy_layout" | "unavailable" };
+  memory?: MemoryDiagnostics;
   legacyControlLock?: string | null;
   models: {
     extract:
@@ -69,6 +71,7 @@ function modelProbe(
     : { id, label: "model", status: "fail", detail: `${name} does not resolve in pi's model registry` };
 }
 
+/** Build a pure report that separates environment health from selected persistent-memory availability. */
 export function runDoctor(input: DoctorInput): DoctorReport {
   const probes: DoctorProbe[] = [];
 
@@ -84,20 +87,18 @@ export function runDoctor(input: DoctorInput): DoctorReport {
   );
 
   const p = input.paths;
-  probes.push(
-    p.rootIsCodex
-      ? {
-          id: "paths",
-          label: "paths",
-          status: "fail",
-          detail: `memory root ${p.memoryRoot} points into Codex/Claude-mem data — rejected (spec §5.1)`,
-        }
-      : !p.rootExists
-        ? { id: "paths", label: "paths", status: "warn", detail: `memory root ${p.memoryRoot} does not exist yet` }
-        : !p.rootWritable
-          ? { id: "paths", label: "paths", status: "fail", detail: `memory root ${p.memoryRoot} is not writable` }
-          : { id: "paths", label: "paths", status: "ok", detail: p.memoryRoot },
-  );
+  if (p.rootIsCodex) {
+    probes.push({
+      id: "paths", label: "paths", status: "fail",
+      detail: `memory root ${p.memoryRoot} points into Codex/Claude-mem data — rejected (spec §5.1)`,
+    });
+  } else if (p.rootExists) {
+    probes.push(p.rootWritable
+      ? { id: "paths", label: "paths", status: "ok", detail: p.memoryRoot }
+      : { id: "paths", label: "paths", status: "fail", detail: `memory root ${p.memoryRoot} is not writable` });
+  } else {
+    probes.push({ id: "paths", label: "paths", status: "warn", detail: `memory root ${p.memoryRoot} does not exist yet` });
+  }
 
   const c = input.config;
   if (c.status === "invalid") {
@@ -161,12 +162,7 @@ export function runDoctor(input: DoctorInput): DoctorReport {
 
   const fg = input.foreground;
   let foregroundProbe: DoctorProbe;
-  if (!fg) {
-    foregroundProbe = {
-      id: "foreground", label: "memory carrier", status: "warn",
-      detail: "request-local carrier not yet observed; enabled configuration alone does not prove projection",
-    };
-  } else {
+  if (fg) {
     let stateDetail: string;
     let status: ProbeStatus;
     if (fg.status === "active") {
@@ -179,7 +175,10 @@ export function runDoctor(input: DoctorInput): DoctorReport {
       }
     } else {
       status = fg.status === "error" ? "fail" : "warn";
-      stateDetail = `${fg.status}: ${fg.reason}; no active carrier`;
+      if (fg.reason === "no_foreground_run") status = "ok";
+      stateDetail = fg.reason === "no_foreground_run"
+        ? "idle: no_foreground_run; no active carrier (normal between runs; persistent availability reported separately)"
+        : `${fg.status}: ${fg.reason}; no active carrier`;
     }
     if (fg.counting) stateDetail += `; counting=${fg.counting}`;
     const pinDetail = fg.pinAvailable === undefined ? ""
@@ -193,6 +192,11 @@ export function runDoctor(input: DoctorInput): DoctorReport {
       status,
       detail: `${stateDetail}${pinDetail}${counts.length ? `; warnings: ${counts.join(", ")}` : ""}`,
     };
+  } else {
+    foregroundProbe = {
+      id: "foreground", label: "memory carrier", status: "warn",
+      detail: "request-local carrier not yet observed; enabled configuration alone does not prove projection",
+    };
   }
   probes.push(foregroundProbe);
 
@@ -200,25 +204,39 @@ export function runDoctor(input: DoctorInput): DoctorReport {
     const observed = new Set(input.observedEvents ?? []);
     const missing = RUN_CRITICAL_EVENTS.filter(name => !observed.has(name));
     const runObserved = RUN_EVIDENCE_EVENTS.some(name => observed.has(name));
-    const probe = !missing.length
-      ? { id: "host-events", label: "host events", status: "ok" as ProbeStatus,
-          detail: "all run-critical extension events have been dispatched this session" }
-      : !runObserved
-        ? { id: "host-events", label: "host events", status: "fail" as ProbeStatus,
-            detail: `host event dispatch unverified (${missing.join(", ")} unobserved); send your first prompt, let the agent run complete, then run /memory doctor again — registration alone cannot verify capture, reading or fencing` }
-        : { id: "host-events", label: "host events", status: "fail" as ProbeStatus,
-            detail: `host accepted pi.on registrations but never dispatched: ${missing.join(", ")} — capture, request-local reading or dispatch fencing cannot work on this host` };
-    probes.push(probe);
+    if (missing.length === 0) {
+      probes.push({ id: "host-events", label: "host events", status: "ok",
+        detail: "all run-critical extension events have been dispatched this session" });
+    } else if (runObserved) {
+      probes.push({ id: "host-events", label: "host events", status: "fail",
+        detail: `host accepted pi.on registrations but never dispatched: ${missing.join(", ")} — capture, request-local reading or dispatch fencing cannot work on this host` });
+    } else {
+      probes.push({ id: "host-events", label: "host events", status: "fail",
+        detail: `host event dispatch unverified (${missing.join(", ")} unobserved); send your first prompt, let the agent run complete, then run /memory doctor again — registration alone cannot verify capture, reading or fencing` });
+    }
   }
 
+  const environmentOk = probes.every((probe) => probe.status !== "fail");
+  let memoryState = "not assessed";
+  if (input.memory) {
+    memoryState = input.memory.selectedReadable ? "READABLE" : "UNAVAILABLE";
+    let status: ProbeStatus = "warn";
+    if (input.memory.selectedReadable) status = "ok";
+    else if (input.memory.selectedInvalidated) status = "fail";
+    probes.push({
+      id: "memory", label: "persistent memory", status,
+      detail: input.memory.lines.join("\n  "),
+    });
+  }
   const ok = probes.every((probe) => probe.status !== "fail");
   return {
     ok,
     probes,
+    /** Render the health summary and probes as UI lines without changing their diagnostic state. */
     format(): string[] {
       const icon = { ok: "✓", warn: "!", fail: "✗" } as const;
       return [
-        `pi-memory doctor — ${ok ? "no blocking problems" : "BLOCKED (see failures)"}`,
+        `pi-memory doctor — environment ${environmentOk ? "OK" : "BLOCKED (see failures)"}; selected memory ${memoryState}`,
         ...probes.map((probe) => `${icon[probe.status]} ${probe.id}: ${probe.detail}`),
       ];
     },

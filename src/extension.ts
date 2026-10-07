@@ -41,7 +41,7 @@ import { prepareEvidencePin, type MemoryReadPin } from "./read/evidence.ts";
 import { ForegroundMemory, type PinAcquisition } from "./read/foreground.ts";
 import { cleanupGenerations } from "./pipeline/publish.ts";
 import { createMemoryTools } from "./read/tools.ts";
-import { getPublishedGeneration } from "./store/consolidation.ts";
+import { persistentDiagnostics, type MemoryDiagnostics } from "./diagnostics.ts";
 import { Type } from "typebox";
 import { addNote, cleanupRevokedNotes, forgetNote, type NoteProvenance } from "./control/notes.ts";
 import { clearMemoryStore, DELETION_LIMITS, forgetEvidence, resumeClear } from "./control/forget.ts";
@@ -895,6 +895,7 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  /** Gather fresh read-only environment, model and persistent-memory probes for doctor. */
   function gatherDoctorInput(): DoctorInput {
     const root = resolveMemoryRoot();
     let rootWritable = false;
@@ -918,6 +919,7 @@ export default function (pi: ExtensionAPI) {
     }
     const cfg: MemoryConfig | null =
       config.status === "ok" || config.status === "created" ? config.config : null;
+    /** Check a configured model in the host registry without initiating a model request. */
     const resolveRef = (ref: { provider: string; modelId: string } | null) => {
       if (!ref) return { status: "unset" } as const;
       const find = state.modelRegistry?.find;
@@ -937,6 +939,7 @@ export default function (pi: ExtensionAPI) {
         rootIsCodex: rootPointsIntoForeignMemory(root),
       },
       store: { state: storeState },
+      memory: cfg ? memoryDiagnostics(cfg) : undefined,
       legacyControlLock: legacyLockPath(root),
       models: { extract: resolveRef(cfg?.models.extract ?? null), consolidate: resolveRef(cfg?.models.consolidate ?? null) },
       promptSections: state.promptSections,
@@ -945,47 +948,28 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
-  function extractionStatusLine(root: string, version: MemoryVersion): string {
-    const storePath = join(root, "state.sqlite");
-    if (!state.db && (storeSchemaState(root) !== "current" || lstatSync(storePath).isSymbolicLink())) {
-      return `${version} extraction: not queued`;
-    }
-    const db = state.db ?? new DatabaseSync(storePath, { readOnly: true });
-    try {
-      const row = db.prepare(
-        `SELECT j.status, j.error_code, j.due_at, s.last_activity_at,
-         COALESCE((SELECT skip_idle FROM version_run_grants g WHERE g.request_id = j.request_id AND g.status = 'active'), 0) AS skip_idle,
-         (SELECT MAX(expires_at) FROM process_activity p WHERE p.session_key = r.session_key
-           AND p.activity_state = 'active' AND p.expires_at > ?) AS busy_until FROM jobs j
-         JOIN source_revisions r ON r.source_id = j.source_id
-         JOIN sessions s ON s.session_key = r.session_key
-         JOIN branch_heads h ON h.session_key = r.session_key AND h.branch_id = r.branch_id
-         WHERE j.kind = 'extract' AND j.memory_version = ?
-           AND h.state = 'active' AND h.latest_revision = r.source_id
-         ORDER BY j.updated_at DESC LIMIT 1`,
-      ).get(Date.now(), version) as { status: string; error_code: string | null; due_at: number;
-        last_activity_at: number; busy_until: number | null; skip_idle: number } | undefined;
-      if (!row) return `${version} extraction: not queued`;
-      let outcome = row.status;
-      if (row.status === "leased") outcome = "extracting";
-      else if (row.status === "succeeded") outcome = "extracted";
-      const reason = row.error_code ? ` — ${row.error_code}` : "";
-      let idleMinutes = 360;
-      if (row.skip_idle) idleMinutes = 0;
-      else if (state.config?.status === "ok") idleMinutes = state.config.config.schedule.minIdleMinutes;
-      const idleUntil = row.last_activity_at + idleMinutes * 60_000;
-      const nextDue = Math.max(row.due_at, idleUntil, row.busy_until ?? 0);
-      let pending = "";
-      if (row.status === "queued" && idleUntil > Date.now()) pending = "pending idle window; ";
-      const due = ["queued", "retry_wait"].includes(row.status) ? ` (${pending}next due ${new Date(nextDue).toISOString()})` : "";
-      return `${version} extraction: ${outcome}${reason}${due}`;
-    } catch {
-      return `${version} extraction: store unavailable`;
-    } finally {
-      if (!state.db) db.close();
-    }
+  /** Read shared diagnostics, distinguishing an uninitialized store from unavailable diagnostics. */
+  function memoryDiagnostics(config: MemoryConfig): MemoryDiagnostics {
+    const diagnostics = withReaderDb<MemoryDiagnostics | null>(db => persistentDiagnostics(db, config), null);
+    if (diagnostics) return diagnostics;
+    const absent = storeSchemaState(resolveMemoryRoot()) === "absent";
+    const readiness = (["v1", "v2"] as const).map(version =>
+      `${version} readiness: ${absent ? "warming_up (store not initialized)" : "store unavailable"}`);
+    return {
+      selectedReadable: false, selectedInvalidated: false, readiness,
+      lines: [
+        `selected memory (${config.version}): UNAVAILABLE (${absent ? "initialization pending" : "persistent diagnostics unavailable"})`,
+        ...(["v1", "v2"] as const).flatMap(version => [
+          `${version} extraction: ${absent ? "not queued" : "unknown (store unavailable)"}`,
+          `${version} consolidation: ${absent ? "not queued" : "unknown (store unavailable)"}`,
+          `${version} readable generation: ${absent ? "none" : "unknown (store unavailable)"}`,
+        ]),
+        ...readiness,
+      ],
+    };
   }
 
+  /** Render fresh configuration, capture, persistent pipeline and foreground state for the UI. */
   function statusLines(): string[] {
     const root = resolveMemoryRoot();
     state.config = loadConfig(root, { create: false });
@@ -1009,7 +993,8 @@ export default function (pi: ExtensionAPI) {
       lines.push("state: DISABLED generation — config invalid (file preserved)", ...cfg.problems.map((p) => `  - ${p}`));
     } else {
       const c = cfg.config;
-      const readiness = (["v1", "v2"] as const).map(version => pipelineReadiness(root, version));
+      const diagnostics = memoryDiagnostics(c);
+      const readiness = diagnostics.readiness;
       const storeState = storeSchemaState(root);
       let storeLine = "store: not initialized yet";
       if (storeState === "current") storeLine = "store: present";
@@ -1031,13 +1016,11 @@ export default function (pi: ExtensionAPI) {
         storeLine,
         storeSizeLine,
         captureLine,
-        extractionStatusLine(root, "v1"),
-        extractionStatusLine(root, "v2"),
-        ...readiness,
+        ...diagnostics.lines,
         `generation targets: ${targetVersions(c).join(", ")}`,
         ...dualWriteLines,
         ...(state.captureError ? [`capture error: ${state.captureError}`] : []),
-        `foreground: ${foreground.diagnostic.status} (${foreground.diagnostic.reason}); ${foreground.diagnostic.memoryVersion ?? ""} ${foreground.diagnostic.generationId ?? ""} ${foreground.diagnostic.representation ?? ""}`,
+        `foreground: ${foreground.diagnostic.reason === "no_foreground_run" ? "idle" : foreground.diagnostic.status} (${foreground.diagnostic.reason}); ${foreground.diagnostic.memoryVersion ?? ""} ${foreground.diagnostic.generationId ?? ""} ${foreground.diagnostic.representation ?? ""}`,
         `foreground warnings: ${JSON.stringify(foreground.diagnostic.warningCounts)}`,
         ...(foreground.readDiagnostic ? [foreground.readDiagnostic] : []),
       );
@@ -1045,30 +1028,11 @@ export default function (pi: ExtensionAPI) {
     return lines;
   }
 
-  function pipelineReadiness(root: string, version: MemoryVersion): string {
-    if (storeSchemaState(root) !== "current") return `${version} readiness: warming_up`;
-    let db: DatabaseSync | undefined;
-    try {
-      db = state.db ?? new DatabaseSync(join(root, "state.sqlite"), { readOnly: true });
-      const pipeline = db.prepare("SELECT read_blocked, block_reason FROM pipeline_state WHERE memory_version = ?").get(version);
-      if (pipeline?.read_blocked) return `${version} readiness: read invalidated (${pipeline.block_reason})`;
-      const config = state.config;
-      if (getPublishedGeneration(db, version, Date.now(), { maxUnusedDays: config?.status === "ok" ? config.config.schedule.maxUnusedDays : 30,
-        extractionPromptHash: version === "v1" ? v1PromptHash() : v2PromptHash() })) {
-        return `${version} readiness: published`;
-      }
-      const writer = db.prepare("SELECT status, error_code FROM jobs WHERE kind = 'consolidate' AND memory_version = ? ORDER BY updated_at DESC LIMIT 1").get(version);
-      const extraction = db.prepare("SELECT status, error_code FROM jobs WHERE kind = 'extract' AND memory_version = ? ORDER BY updated_at DESC LIMIT 1").get(version);
-      const captured = db.prepare("SELECT 1 FROM source_revisions WHERE status = 'captured' LIMIT 1").get();
-      let progress = "";
-      if (writer?.status === "leased") progress = "; consolidating";
-      else if (writer?.status === "blocked") progress = `; blocked (${writer.error_code})`;
-      else if (extraction?.status === "leased") progress = "; extracting";
-      else if (extraction?.status === "blocked") progress = `; blocked (${extraction.error_code})`;
-      else if (captured) progress = "; captured";
-      return `${version} readiness: warming_up${progress}`;
-    } catch { return `${version} readiness: store unavailable`; }
-    finally { if (db && db !== state.db) db.close(); }
+  /** Select one version's shared readiness line for version-switch feedback. */
+  function pipelineReadiness(_root: string, version: MemoryVersion): string {
+    const config = state.config;
+    if (config?.status !== "ok" && config?.status !== "created") return `${version} readiness: warming_up`;
+    return memoryDiagnostics(config.config).readiness.find(line => line.startsWith(version)) ?? `${version} readiness: warming_up`;
   }
 
   function selectedImportLeaf(file: string, header: SessionHeader): string | undefined {

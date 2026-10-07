@@ -19,12 +19,14 @@ import { makeMockPi } from "./mock-pi.ts";
 const NOW = Date.UTC(2026, 8, 1, 12);
 const RETRY = NOW + 60_000;
 
+/** Create an isolated initialized store with fixed-time builders and automatic cleanup. */
 function fixture(t: test.TestContext) {
   const agentDir = mkdtempSync(join(tmpdir(), "pi-memory-diagnostics-"));
   const root = join(agentDir, "memory");
   const db = openStateDb(root);
   const config = defaultConfig("UTC");
   t.after(() => { if (db.isOpen) db.close(); rmSync(agentDir, { recursive: true, force: true }); });
+  /** Capture an independent active source and enqueue its v1 extraction at the supplied time. */
   function source(id: string, capturedAt = NOW) {
     recordSnapshot(db, {
       workspace: { workspaceKey: "workspace", repoKey: null, checkoutKey: null, cwdReal: root,
@@ -37,6 +39,7 @@ function fixture(t: test.TestContext) {
     });
     enqueueExtraction(db, { sourceId: id, memoryVersion: "v1", promptHash: v1PromptHash(), now: capturedAt });
   }
+  /** Commit eligible v1 extraction/publication metadata without making any model calls. */
   function publish() {
     source("published-source", NOW - 86_400_000);
     const [job] = claimDueExtractions(db, { owner: "extractor", now: NOW - 1000, limit: 1 });
@@ -54,6 +57,7 @@ function fixture(t: test.TestContext) {
     assert.equal(getPublishedGeneration(db, "v1", NOW, { maxUnusedDays: config.schedule.maxUnusedDays,
       extractionPromptHash: v1PromptHash() })?.generationId, "readable-v1");
   }
+  /** Persist an input-budget-denied consolidator and usage ledger with a chosen retry time. */
   function budgetWait(dueAt = RETRY) {
     const lease = claimConsolidation(db, { memoryVersion: "v1", owner: "writer", promptHash: "writer",
       inputRevisionHash: "recovery", now: NOW });
@@ -66,6 +70,7 @@ function fixture(t: test.TestContext) {
   return { agentDir, root, db, config, source, publish, budgetWait };
 }
 
+/** Run doctor against healthy environment probes and the fixture's persistent diagnostics. */
 function doctor(f: ReturnType<typeof fixture>, now = NOW) {
   return runDoctor({
     compat: { supported: true, problems: [] },
@@ -77,6 +82,7 @@ function doctor(f: ReturnType<typeof fixture>, now = NOW) {
   });
 }
 
+/** Serialize relevant durable rows so tests detect diagnostic writes and budget consumption. */
 function snapshot(db: DatabaseSync) {
   const queries = [
     "SELECT * FROM store_state ORDER BY rowid", "SELECT * FROM pipeline_state ORDER BY rowid",
@@ -92,6 +98,7 @@ function snapshot(db: DatabaseSync) {
   return JSON.stringify(queries.map(query => db.prepare(query).all()));
 }
 
+/** Combine invalidation, idle extraction, an unpublished note and a budget-denied consolidator. */
 function recovery(f: ReturnType<typeof fixture>) {
   f.publish();
   f.db.prepare("UPDATE pipeline_state SET read_blocked = 1, block_reason = 'evidence_removed' WHERE memory_version = 'v1'").run();
@@ -101,6 +108,7 @@ function recovery(f: ReturnType<typeof fixture>) {
   f.budgetWait();
 }
 
+/** Require recovery output to preserve both invalidation and actionable local-budget details. */
 function assertRecovery(text: string) {
   assert.match(text, /selected memory \(v1\): UNAVAILABLE/);
   assert.match(text, /v1.*evidence_removed/);

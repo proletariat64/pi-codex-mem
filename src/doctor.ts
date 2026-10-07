@@ -71,6 +71,7 @@ function modelProbe(
     : { id, label: "model", status: "fail", detail: `${name} does not resolve in pi's model registry` };
 }
 
+/** Build a pure report that separates environment health from selected persistent-memory availability. */
 export function runDoctor(input: DoctorInput): DoctorReport {
   const probes: DoctorProbe[] = [];
 
@@ -231,6 +232,7 @@ export function runDoctor(input: DoctorInput): DoctorReport {
   return {
     ok,
     probes,
+    /** Render the health summary and probes as UI lines without changing their diagnostic state. */
     format(): string[] {
       const icon = { ok: "✓", warn: "!", fail: "✗" } as const;
       return [

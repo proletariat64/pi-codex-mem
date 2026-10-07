@@ -13,6 +13,7 @@ export interface MemoryDiagnostics {
   readiness: string[];
 }
 
+/** Collect SELECT-only pipeline and budget diagnostics without claiming jobs or pinning memory. */
 export function persistentDiagnostics(db: DatabaseSync, config: MemoryConfig, now = Date.now()): MemoryDiagnostics {
   const lines: string[] = [];
   const readiness: string[] = [];
@@ -103,6 +104,7 @@ export function persistentDiagnostics(db: DatabaseSync, config: MemoryConfig, no
   return { selectedReadable, selectedInvalidated, lines, readiness };
 }
 
+/** Describe the latest active source's extraction, including idle/busy-adjusted due time and prior denial. */
 function extractionLine(db: DatabaseSync, config: MemoryConfig, version: MemoryVersion, now: number): { line: string; budgetWait: boolean } {
   const row = db.prepare(`SELECT j.status, j.error_code, j.due_at, s.last_activity_at,
     COALESCE((SELECT skip_idle FROM version_run_grants g WHERE g.request_id = j.request_id AND g.status = 'active'), 0) AS skip_idle,

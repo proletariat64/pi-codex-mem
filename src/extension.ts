@@ -895,6 +895,7 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  /** Gather fresh read-only environment, model and persistent-memory probes for doctor. */
   function gatherDoctorInput(): DoctorInput {
     const root = resolveMemoryRoot();
     let rootWritable = false;
@@ -918,6 +919,7 @@ export default function (pi: ExtensionAPI) {
     }
     const cfg: MemoryConfig | null =
       config.status === "ok" || config.status === "created" ? config.config : null;
+    /** Check a configured model in the host registry without initiating a model request. */
     const resolveRef = (ref: { provider: string; modelId: string } | null) => {
       if (!ref) return { status: "unset" } as const;
       const find = state.modelRegistry?.find;
@@ -946,6 +948,7 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
+  /** Read shared diagnostics, distinguishing an uninitialized store from unavailable diagnostics. */
   function memoryDiagnostics(config: MemoryConfig): MemoryDiagnostics {
     const diagnostics = withReaderDb<MemoryDiagnostics | null>(db => persistentDiagnostics(db, config), null);
     if (diagnostics) return diagnostics;
@@ -966,6 +969,7 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
+  /** Render fresh configuration, capture, persistent pipeline and foreground state for the UI. */
   function statusLines(): string[] {
     const root = resolveMemoryRoot();
     state.config = loadConfig(root, { create: false });
@@ -1024,6 +1028,7 @@ export default function (pi: ExtensionAPI) {
     return lines;
   }
 
+  /** Select one version's shared readiness line for version-switch feedback. */
   function pipelineReadiness(_root: string, version: MemoryVersion): string {
     const config = state.config;
     if (config?.status !== "ok" && config?.status !== "created") return `${version} readiness: warming_up`;

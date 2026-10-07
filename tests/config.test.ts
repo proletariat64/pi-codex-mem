@@ -34,7 +34,9 @@ test("first load creates config.json with spec defaults", (t) => {
   assert.equal(c.schedule.maxUnusedDays, 30);
   assert.equal(c.limits.summaryBytes, 9999);
   assert.equal(c.limits.v2RolloutSummaryBytes, 9000);
-  assert.equal(c.limits.dailyRequests, 20);
+  assert.equal(c.limits.dailyInputTokens, 1000000);
+  assert.equal(c.limits.dailyOutputTokens, 200000);
+  assert.equal(c.limits.dailyRequests, 200);
   assert.equal(c.timezone, "Asia/Shanghai");
   // The file was actually written
   const onDisk = JSON.parse(readFileSync(join(root, "config.json"), "utf8"));

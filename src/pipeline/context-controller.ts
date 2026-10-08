@@ -131,6 +131,9 @@ export interface RequestContextController {
   /** Calibrate with the usage of one completed, trustworthy request (spec §3.2).
    * Returns undefined when usage is missing, zero or invalid; the reservation stays intact. */
   observeResult(observation: { usage: Usage | undefined; request: { method: CountingMethod; baseEstimate: number } }): CalibratedObservation | undefined;
+  /** §7.2 bounded provider-overflow recovery: raise the fallback safety multiplier
+   * for estimated modes to at least `minimum`; never lowered within a lease. */
+  raiseSafetyMultiplierTo(minimum: number): number;
   snapshot(): ContextDiagnostics;
 }
 
@@ -277,6 +280,13 @@ export function createContextController(init: {
       }
       latestObservation = observation;
       return observation;
+    },
+    raiseSafetyMultiplierTo: (minimum) => {
+      if (Number.isFinite(minimum) && minimum > safetyMultiplier) {
+        safetyMultiplier = minimum;
+        calibration.set(identity, { multiplier: safetyMultiplier, latest: latestObservation });
+      }
+      return safetyMultiplier;
     },
     snapshot: () => ({
       identity,

@@ -24,11 +24,13 @@ export interface WriterObservation {
   lastCompaction?: { before?: number; after?: number; units?: TokenUnits; result: string };
 }
 const observations = new Map<string, Partial<Record<MemoryVersion, WriterObservation>>>();
+/** Identify a file-backed store across connections; return undefined for an in-memory database. */
 function storeKey(db: DatabaseSync): string | undefined {
   // SELECT-only PRAGMA, works on separate read-only connections used by doctor.
   const row = db.prepare("PRAGMA database_list").get() as { file: string } | undefined;
   return row?.file || undefined;
 }
+/** Save a defensive copy of the latest process-local run observation for this store and memory version. */
 export function recordWriterObservation(db: DatabaseSync, version: MemoryVersion, observation: WriterObservation): void {
   const key = storeKey(db);
   if (!key) return;
@@ -36,6 +38,7 @@ export function recordWriterObservation(db: DatabaseSync, version: MemoryVersion
   latest[version] = structuredClone(observation);
   observations.set(key, latest);
 }
+/** Return a defensive copy only when the latest local observation matches the requested job. */
 export function writerObservation(db: DatabaseSync, version: MemoryVersion, jobId: string): WriterObservation | undefined {
   const key = storeKey(db);
   const latest = key ? observations.get(key)?.[version] : undefined;

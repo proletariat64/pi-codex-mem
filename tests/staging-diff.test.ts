@@ -49,6 +49,7 @@ interface HunkRange {
   lines: { kind: " " | "-" | "+"; text: string; marker: boolean }[];
 }
 
+/** Parse one unified diff section, asserting valid headers, body prefixes and newline-marker placement. */
 function parseSection(path: string, body: string): { path: string; hunks: HunkRange[] } {
   const hunks: HunkRange[] = [];
   let current: HunkRange | null = null;

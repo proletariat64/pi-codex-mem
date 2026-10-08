@@ -71,6 +71,7 @@ function priorFiles(directory: string | undefined, snapshot: ConsolidationSnapsh
   } catch { return { files: new Map(), paths, manifest: null, valid: false }; }
 }
 
+/** List every changed path using stored hashes without including prior plaintext. */
 function changedPathIndex(priorPaths: string[], priorHashes: Record<string, string>, next: Map<string, string>): string {
   const paths = [...new Set([...priorPaths, ...next.keys()])].sort();
   const changes: { path: string; kind: "added" | "deleted" | "modified" }[] = [];
@@ -83,6 +84,7 @@ function changedPathIndex(priorPaths: string[], priorHashes: Record<string, stri
   return `# Workspace changes\n\nPrior plaintext omitted because support, retention, invalidation epoch, or integrity changed. Read added/modified staged files separately and remove claims supported only by deleted inputs. Complete changed-path index:\n\n${indexLines(changes)}\n`;
 }
 
+/** Render the ordered change list as Markdown entries shared by unified and fallback diffs. */
 const indexLines = (changes: { path: string; kind: "added" | "deleted" | "modified" }[]): string =>
   changes.map(({ path, kind }) => `- ${kind}: ${path}`).join("\n");
 
@@ -126,6 +128,7 @@ export function workspaceDiff(prior: Map<string, string>, next: Map<string, stri
   return { text: `# Workspace changes\n\n${notice}Complete changed-path index:\n\n${indexLines(changes)}\n`, fallback: true, reason };
 }
 
+/** Create a confined workspace with selected evidence, verified reusable outputs, a diff and a manifest. */
 export function buildStaging(options: { root: string; jobId: string; snapshot: ConsolidationSnapshot; promptHash: string; summaryBytes?: number; priorDir?: string }): StagedWorkspace {
   const { root, snapshot, promptHash } = options;
   const memoryVersion = snapshot.memoryVersion;

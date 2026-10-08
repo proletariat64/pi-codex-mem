@@ -37,6 +37,7 @@ const SEG_TARGET = Math.floor((44_000 - 4_000 - 1_024) * 0.5);
  *  short summary, so a valid but long summary fails the target honestly. */
 const noProgressWindow: Model<Api> = { ...model, contextWindow: 45_000 };
 
+/** Create a leased writer workspace with optional large diff input and automatic store and file cleanup. */
 function fixture(t: test.TestContext, memoryVersion: MemoryVersion = "v1", options?: { bigDiff?: boolean }) {
   const root = mkdtempSync(join(tmpdir(), "pi-context-compaction-"));
   const repo = join(root, "repo"); mkdirSync(repo); execFileSync("git", ["init", "-q"], { cwd: repo });
@@ -57,12 +58,14 @@ function fixture(t: test.TestContext, memoryVersion: MemoryVersion = "v1", optio
   return { db, directory, lease, config, root };
 }
 
+/** Build a deterministic assistant response with configurable stop reason and synthetic token usage. */
 function reply(content: AssistantMessage["content"], stopReason: AssistantMessage["stopReason"] = "stop",
   input = 10, output = 5): AssistantMessage {
   return { role: "assistant", content, stopReason, api: model.api, model: model.id, provider: model.provider,
     timestamp: NOW, usage: { input, output, cacheRead: 0, cacheWrite: 0, totalTokens: input + output,
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
 }
+/** Build a tool-call block with optional arguments and a stable default call identifier. */
 function tool(name: string, args: JsonObject = {}, id = name) {
   return { type: "toolCall" as const, name, arguments: args, id };
 }
@@ -70,6 +73,7 @@ function tool(name: string, args: JsonObject = {}, id = name) {
 type Step = (call: { context: TranscriptContext; options?: unknown }) =>
   AssistantMessage | Promise<AssistantMessage>;
 
+/** Capture requests and stream scripted messages or asynchronous responses under the supplied model capacity. */
 function scriptedPort(steps: Array<Step | AssistantMessage>, portModel: Model<Api> = smallWindow) {
   const calls: { context: TranscriptContext; options?: unknown }[] = [];
   const port: ConsolidationModelPort = { resolve: () => portModel, stream: (_model, context, options) => {
@@ -94,10 +98,12 @@ function scriptedPort(steps: Array<Step | AssistantMessage>, portModel: Model<Ap
 const isCompactionCall = (call: { context: TranscriptContext }) =>
   !(call.context.messages[0] as SystemMessage).toolsAdded?.length && call.context.messages[0]?.role === "system";
 
+/** Run the fixture writer with a fixed clock and fresh calibration state, allowing per-test overrides. */
 const run = (setup: ReturnType<typeof fixture>, port: ConsolidationModelPort,
   extra: Partial<Parameters<typeof runConsolidation>[0]> = {}) => runConsolidation({ ...setup, port,
   modelRef: { provider: "mock", modelId: "writer" }, signal: new AbortController().signal,
   clock: () => NOW + 1, contextCalibration: createContextCalibrationStore(), ...extra });
+/** Read reservation accounting in request order to check writer and compaction charges. */
 const reservations = (db: import("node:sqlite").DatabaseSync) =>
   db.prepare("SELECT estimate_input, estimate_output, actual_input, status FROM budget_reservations ORDER BY rowid").all();
 

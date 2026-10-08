@@ -196,6 +196,7 @@ export function createContextCalibrationStore(): ContextCalibrationStore {
   };
 }
 
+/** Reject unsupported content and classify a valid counter result as exact only when all identity assertions match. */
 function countIdentity(model: ControllerModel, policy: ContextCountingPolicy, counter: MatchingTokenCounter | undefined,
   request: NormalizedRequest): { ok: true; count: CountOk } | { ok: false; reason: "unsupported_content"; kind: "image" } {
   const fallback = countModelVisibleRequest(request, policy);
@@ -212,6 +213,7 @@ function countIdentity(model: ControllerModel, policy: ContextCountingPolicy, co
   return { ok: true, count: fallback };
 }
 
+/** Create request counting, admission and calibration state for one model, transport and policy identity. */
 export function createContextController(init: {
   model: ControllerModel;
   counter?: MatchingTokenCounter;
@@ -317,8 +319,10 @@ export interface NormalizedRequest {
   messages: readonly Message[];
 }
 
+/** Estimate token units by rounding UTF-8 byte length up to the next group of four. */
 const div4 = (text: string): number => Math.ceil(Buffer.byteLength(text, "utf8") / 4);
 
+/** Collect model-visible system text and named sections, excluding host metadata and tool declarations. */
 function systemText(message: SystemMessage): string {
   const parts: string[] = [];
   if (typeof message.content === "string") parts.push(message.content);
@@ -341,6 +345,7 @@ function effectiveTools(messages: readonly Message[]): Tool[] {
   return [...effective.values()];
 }
 
+/** Sum fallback estimates for text blocks, rejecting images whose token cost is unsupported. */
 function countTextBlocks(blocks: readonly { type: "text" | "image"; text?: string }[]):
   { ok: true; units: number } | { ok: false } {
   let units = 0;

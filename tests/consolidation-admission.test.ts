@@ -25,6 +25,7 @@ const handbook = "# Task Group: TypeScript\nscope: project\napplies_to: cwd=/rep
 const englishHeavy = "The quick brown fox jumps over the lazy dog while reviewing consolidation evidence summaries. ".repeat(
   Math.ceil(404_000 / "The quick brown fox jumps over the lazy dog while reviewing consolidation evidence summaries. ".length));
 
+/** Stage version-specific evidence and claim a writer lease in an isolated store cleaned up after the test. */
 function fixture(t: test.TestContext, memoryVersion: MemoryVersion = "v1") {
   const root = mkdtempSync(join(tmpdir(), "pi-context-admission-"));
   const repo = join(root, "repo"); mkdirSync(repo); execFileSync("git", ["init", "-q"], { cwd: repo });
@@ -41,15 +42,18 @@ function fixture(t: test.TestContext, memoryVersion: MemoryVersion = "v1") {
   return { db, directory, lease, config };
 }
 
+/** Build a deterministic assistant response with configurable stop reason and synthetic token usage. */
 function reply(content: AssistantMessage["content"], stopReason: AssistantMessage["stopReason"] = "stop",
   input = 10, output = 5): AssistantMessage {
   return { role: "assistant", content, stopReason, api: model.api, model: model.id, provider: model.provider,
     timestamp: NOW, usage: { input, output, cacheRead: 0, cacheWrite: 0, totalTokens: input + output,
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
 }
+/** Build a tool-call block with explicit arguments and a stable default call identifier. */
 function tool(name: string, args: JsonObject, id = name) {
   return { type: "toolCall" as const, name, arguments: args, id };
 }
+/** Capture requests and consume scripted responses, optionally supplying a matching-token-counter seam. */
 function fakePort(responses: AssistantMessage[], resolved: Model<Api> = model,
   counter?: (request: NormalizedRequest) => ConsolidationTokenCount | undefined) {
   const calls: { context: TranscriptContext; maxTokens?: number; maxRetries?: number }[] = [];
@@ -68,8 +72,10 @@ function fakePort(responses: AssistantMessage[], resolved: Model<Api> = model,
   if (counter) port.countTokens = (_model, request) => counter(request);
   return { port, calls };
 }
+/** Read reservation estimates and settled usage in request order for admission assertions. */
 const reservations = (db: import("node:sqlite").DatabaseSync) =>
   db.prepare("SELECT estimate_input, estimate_output, actual_input, actual_output, status FROM budget_reservations ORDER BY rowid").all();
+/** Run the fixture writer with a fixed clock and fresh calibration state, allowing per-test overrides. */
 const run = (setup: ReturnType<typeof fixture>, port: ConsolidationModelPort,
   extra: Partial<Parameters<typeof runConsolidation>[0]> = {}) => runConsolidation({ ...setup, port,
   modelRef: { provider: "mock", modelId: "writer" }, signal: new AbortController().signal,

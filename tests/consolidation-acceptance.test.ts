@@ -26,13 +26,16 @@ const model: Model<Api> = { id: "acceptance", name: "Deterministic mock", api: "
   baseUrl: "https://unused.invalid", reasoning: false, input: ["text"],
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 60_000, maxTokens: 8_000 };
 const provenance = { consumerSession: "test", runId: "test", userMessageId: "u1", origin: "command" as const };
+/** Build a synthetic tool-call block with an explicit call identifier. */
 const tool = (id: string, name: string, args: JsonObject) => ({ type: "toolCall" as const, id, name, arguments: args });
+/** Build a deterministic assistant response with synthetic usage for scheduler acceptance tests. */
 const reply = (content: AssistantMessage["content"], stopReason: AssistantMessage["stopReason"] = "stop"): AssistantMessage => ({
   role: "assistant", content, stopReason, api: model.api, model: model.id, provider: model.provider, timestamp: NOW,
   // Synthetic usage is deliberately not a token-accuracy measurement.
   usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
 });
+/** Create an isolated store and scripted scheduler for either memory version, with automatic cleanup. */
 function fixture(t: test.TestContext, version: MemoryVersion) {
   const root = mkdtempSync(join(tmpdir(), "pi-context-acceptance-"));
   const db = openStateDb(root);
@@ -64,6 +67,7 @@ function fixture(t: test.TestContext, version: MemoryVersion) {
     now: () => NOW, isForegroundIdle: () => true,
     timer: { schedule: () => ({ cancel() {} }) } });
   t.after(async () => { await scheduler.stop(); db.close(); rmSync(root, { recursive: true, force: true }); });
+  /** Seed and commit synthetic extracted evidence with optional padding to exercise context limits. */
   function source(id: string, padding = 0) {
     recordSnapshot(db, {
       workspace: { workspaceKey: "synthetic", repoKey: null, checkoutKey: null, cwdReal: root,

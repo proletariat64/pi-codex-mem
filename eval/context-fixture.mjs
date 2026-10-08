@@ -2,6 +2,7 @@
 import { writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
+/** Build deterministic synthetic evidence and evaluation questions without making model requests. */
 export function contextSemanticFixture() {
   const sources = Array.from({ length: 256 }, (_, i) => {
     const sourceId = `source-${String(i).padStart(3, "0")}`;

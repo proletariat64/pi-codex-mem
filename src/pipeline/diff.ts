@@ -41,6 +41,7 @@ interface FileLine {
 /** Line identity includes the final-newline status so `x` differs from `x\n`. */
 const keyOf = (line: FileLine): string => line.newline ? `${line.text}\n` : line.text;
 
+/** Split file text into lines while preserving whether the final line has a newline terminator. */
 function splitLines(text: string): FileLine[] {
   if (text === "") return [];
   const ended = text.endsWith("\n");
@@ -185,6 +186,7 @@ interface Group {
   anchorNew: number;
 }
 
+/** Group adjacent edits and merge groups whose surrounding context would overlap or touch. */
 function splitGroups(ops: readonly Op[]): Group[] {
   const raw: Group[] = [];
   let x = 0;
@@ -230,6 +232,7 @@ function splitGroups(ops: readonly Op[]): Group[] {
   return groups;
 }
 
+/** Render edit groups with bounded context, unified line ranges and missing-final-newline markers. */
 function renderHunks(ops: readonly Op[], oldLines: readonly FileLine[], newLines: readonly FileLine[]): string[] {
   const hunks: string[] = [];
   const oldLen = oldLines.length;

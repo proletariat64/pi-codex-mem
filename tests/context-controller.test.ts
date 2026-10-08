@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { normalizeContext, type Message } from "@earendil-works/pi-ai";
+import { normalizeContext, type Message, type Model } from "@earendil-works/pi-ai";
+import { stream as openAIStream } from "@earendil-works/pi-ai/api/openai-completions";
 import {
   DEFAULT_CONTEXT_COUNTING_POLICY,
   countModelVisibleRequest,
@@ -220,7 +221,7 @@ test("countModelVisibleRequest ignores host-only metadata, IDs and serialization
     Buffer.byteLength(JSON.stringify({ messages: visibleLedger(true).messages }), "utf8"));
 });
 
-test("CT02: normalized 16 KiB tool content is counted once regardless of host display details", () => {
+test("CT02: normalized 16 KiB tool content is counted once regardless of host display details", async () => {
   const text = "x".repeat(16_384);
   const messages: Message[] = [
     { role: "assistant", api: "openai-completions", provider: "fake", model: "writer", usage: hostUsage,
@@ -235,6 +236,19 @@ test("CT02: normalized 16 KiB tool content is counted once regardless of host di
   const decorated = normalizeContext({ messages: messages.map(message => message.role === "toolResult"
     ? { ...message, details: { text, bytes: 16_384 } } : message) });
   assert.deepEqual(decorated.messages[1]!.content, plain.messages[1]!.content);
+  const model: Model<"openai-completions"> = { ...writer, api: "openai-completions", name: "Writer",
+    baseUrl: "https://example.invalid", reasoning: true, input: ["text"], cost: hostUsage.cost };
+  const payloads: unknown[] = [];
+  for (const context of [plain, decorated]) {
+    // Capture adapter conversion only: stop before any HTTP or external model call.
+    await openAIStream(model, context, { apiKey: "fixture-only", onPayload: payload => {
+      payloads.push(payload);
+      throw new Error("Conversion captured; dispatch forbidden");
+    }, fetch: async () => { throw new Error("Network forbidden"); } }).result();
+  }
+  assert.equal(payloads.length, 2);
+  assert.deepEqual(payloads[1], payloads[0], "the installed adapter does not transmit tool details");
+  assert.match(JSON.stringify(payloads[0]), /Replay reasoning/, "replayed reasoning stays model-visible");
   assert.deepEqual(countModelVisibleRequest(decorated), countModelVisibleRequest(plain));
   const withoutReasoning = countModelVisibleRequest({ messages: [messages[1]!] });
   const withReasoning = countModelVisibleRequest(plain);

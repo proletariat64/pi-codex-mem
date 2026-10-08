@@ -188,6 +188,19 @@ test("CT04: underestimation is calibrated into the next estimate and cannot gran
     "the second request is denied at daily admission, not dispatched");
 });
 
+test("CT04: output-only writer usage retains the input reservation and denies further daily input", async (t) => {
+  const setup = fixture(t);
+  setup.config.limits.dailyInputTokens = 30_000;
+  const { port, calls } = fakePort([
+    reply([tool("workspace_list", {})], "toolUse", 0, 5),
+    reply([{ type: "text", text: "Must not dispatch" }]),
+  ]);
+  assert.deepEqual(await run(setup, port), { status: "budget_deferred", reason: "input_budget" });
+  assert.equal(calls.length, 1);
+  const rows = reservations(setup.db) as { estimate_input: number; actual_input: number }[];
+  assert.equal(rows[0]!.actual_input, rows[0]!.estimate_input);
+});
+
 test("CT02: unicode-heavy accumulated history that fits the window is admitted where bytes previously blocked it", async (t) => {
   const setup = fixture(t);
   const medium: Model<Api> = { ...model, contextWindow: 120_000 };

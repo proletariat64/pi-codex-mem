@@ -208,7 +208,9 @@ function providerFailure(message: string | undefined): ConsolidationRunResult {
 
 function usableUsage(message: AssistantMessage): { input: number; output: number } | undefined {
   const usage = normalizeModelUsage(message.usage);
-  return usage && (usage.input > 0 || usage.output > 0) ? usage : undefined;
+  // Output alone cannot establish the input cost of a nonempty request (§3.2).
+  // Keep the safety-adjusted reservation when input usage is absent or zero.
+  return usage && usage.input > 0 ? usage : undefined;
 }
 
 function failureMessage(model: Model<Api>, clock: () => number, aborted: boolean, reason: string): AssistantMessage {

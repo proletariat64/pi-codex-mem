@@ -186,6 +186,24 @@ test("CT05: accumulated pages crossing the soft limit compact at the settled sea
 });
 
 
+test("CT04: output-only compactor usage retains its input charge and denies the resumed writer", async (t) => {
+  const setup = fixture(t);
+  setup.config.limits.dailyInputTokens = 50_000;
+  const { port, calls } = scriptedPort([
+    reply([{ type: "text", text: "界".repeat(12_000) }, tool("workspace_list")], "toolUse"),
+    reply([{ type: "text", text: "界".repeat(30_000) }, tool("workspace_list")], "toolUse"),
+    call => {
+      assert.ok(isCompactionCall(call));
+      return reply([{ type: "text", text: "Short derived summary" }], "stop", 0, 5);
+    },
+    reply([{ type: "text", text: "Must not dispatch" }]),
+  ]);
+  assert.deepEqual(await run(setup, port), { status: "budget_deferred", reason: "input_budget" });
+  assert.equal(calls.length, 3);
+  const rows = reservations(setup.db) as { estimate_input: number; actual_input: number }[];
+  assert.equal(rows[2]!.actual_input, rows[2]!.estimate_input);
+});
+
 // --- §5.2 segmented fallback: shared burst script on the segmentWindow fixture ---
 // Turn 1 (small): ~6k units of CJK plus a listing widens the fit band so the burst
 // unit fits the compactor alone while the full history cannot. Turn 2 burst: ~24.5k

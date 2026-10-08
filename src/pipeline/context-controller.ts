@@ -3,7 +3,7 @@ import { normalizeModelUsage } from "../model-usage.ts";
 
 /** Phase 2 context counting/control, spec docs/spec/consolidation-context-spec-v0.2.0.md §3 and §8. */
 
-export const CONTEXT_COUNTING_POLICY_VERSION = 2;
+export const CONTEXT_COUNTING_POLICY_VERSION = 3;
 
 /** Units are always explicit: exact provider tokens or estimated token units. */
 export type TokenUnits = "tokens" | "estimated_tokens";
@@ -141,7 +141,7 @@ export interface RequestContextController {
    * Returns undefined when usage is missing, zero or invalid; the reservation stays intact. */
   observeResult(observation: { usage: Usage | undefined; request: { method: CountingMethod; baseEstimate: number } }): CalibratedObservation | undefined;
   /** §7.2 bounded provider-overflow recovery: raise the fallback safety multiplier
-   * for estimated modes to at least `minimum`; never lowered within a lease. */
+   * for estimated modes to at least `minimum`; lease-local and never lowered within a lease. */
   raiseSafetyMultiplierTo(minimum: number): number;
   snapshot(): ContextDiagnostics;
 }
@@ -287,7 +287,9 @@ export function createContextController(init: {
           safetyMultiplier = observedRatio;
           observation.appliedMultiplier = safetyMultiplier;
         }
-        calibration.set(identity, { multiplier: safetyMultiplier, latest: observation });
+        // Persist only measured calibration, never a lease-local overflow bump.
+        const multiplier = Math.max(calibration.get(identity)?.multiplier ?? policy.safetyMultiplier, observedRatio);
+        calibration.set(identity, { multiplier, latest: observation });
       }
       latestObservation = observation;
       return observation;
@@ -295,7 +297,6 @@ export function createContextController(init: {
     raiseSafetyMultiplierTo: (minimum) => {
       if (Number.isFinite(minimum) && minimum > safetyMultiplier) {
         safetyMultiplier = minimum;
-        calibration.set(identity, { multiplier: safetyMultiplier, latest: latestObservation });
       }
       return safetyMultiplier;
     },

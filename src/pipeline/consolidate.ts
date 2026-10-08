@@ -304,7 +304,7 @@ export async function runConsolidation(input: ConsolidationRunInput): Promise<Co
     return decision.admissionEstimate;
   };
   /** §7.2 bounded provider-overflow recovery: the failed transport is charged, the
-   * fallback multiplier at least doubles once per lease, and the unchanged payload is
+   * fallback multiplier at least doubles locally once per lease, and the unchanged payload is
    * never resent — the driver compacts/recounts through the same gates first. */
   const onProviderContextOverflow = (request: CountOk) => {
     if (request.exact || overflowRecoveryUsed) {

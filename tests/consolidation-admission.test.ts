@@ -131,7 +131,7 @@ test("an irreducible first request — framing alone above the soft limit — ne
   assert.equal((setup.db.prepare("SELECT COUNT(*) AS n FROM budget_reservations").get() as { n: number }).n, 0);
 });
 
-test("CT04: explicit provider context overflow is classified distinctly and bumps the estimated multiplier at least 2x", async (t) => {
+test("CT04: explicit provider context overflow is classified distinctly without carrying its multiplier into later leases", async (t) => {
   const setup = fixture(t);
   const calibration = createContextCalibrationStore();
   const overflow = { ...reply([tool("workspace_list", {})], "toolUse", 17_000, 400), stopReason: "error" as const,
@@ -147,14 +147,14 @@ test("CT04: explicit provider context overflow is classified distinctly and bump
   assert.equal(charged[0]!.status, "charged");
   assert.doesNotMatch(JSON.stringify(setup.db.prepare("SELECT * FROM jobs").all()), /maximum context length/);
   const observed = createContextController({ model: controllerIdentityModel, calibration }).safetyMultiplier;
-  assert.equal(observed, 2.5, "the bounded recovery raises the fallback multiplier to at least twice its value");
-  // A second overflow after re-admission still ends blocked in the bounded gate.
+  assert.equal(observed, 1.25, "the recovery bump remains local to the failed lease");
+  // Another lease starts without the prior lease's recovery bump.
   const secondSetup = fixture(t);
   const second = fakePort([overflow]);
   assert.deepEqual(await run(secondSetup, second.port, { contextCalibration: calibration }),
     { status: "blocked", reason: "provider_context_overflow" });
-  const bumps = reservations(secondSetup.db) as { estimate_input: number }[];
-  assert.ok(bumps[0]!.estimate_input > charged[0]!.estimate_input * 1.9, "the raised multiplier feeds the next reservation");
+  const next = reservations(secondSetup.db) as { estimate_input: number }[];
+  assert.equal(next[0]!.estimate_input, charged[0]!.estimate_input, "repeated overflows do not compound across leases");
 });
 
 test("CT04: exact-count mode reports overflow without raising the multiplier", async (t) => {

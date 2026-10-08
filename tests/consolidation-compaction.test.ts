@@ -393,8 +393,8 @@ test("§7.2: a first writer overflow compacts and recounts through the same gate
   const rows = reservations(setup.db) as { estimate_input: number }[];
   assert.equal(rows.length, 4);
   assert.equal(createContextController({ model: { provider: "mock", id: "writer", api: "openai-completions",
-    contextWindow: 100_000, maxTokens: 8_000 }, calibration }).safetyMultiplier, 2.5,
-    "the bounded recovery doubled the fallback multiplier once");
+    contextWindow: 100_000, maxTokens: 8_000 }, calibration }).safetyMultiplier, 1.25,
+    "the recovery multiplier does not leak into the next lease after successful provider responses");
   const resend = rows[3]!.estimate_input;
   const candidateBase = resend / 2.5;
   assert.ok(rows[0]!.estimate_input / 1.25 * 2.4 < resend,

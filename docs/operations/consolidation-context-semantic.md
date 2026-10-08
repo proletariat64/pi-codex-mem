@@ -13,7 +13,10 @@ node eval/context-fixture.mjs --out /tmp/pi-context-256-fixture.json
 sha256sum /tmp/pi-context-256-fixture.json
 ```
 
-The output path must not exist. The file contains 256 deterministic extraction
+The output path must not exist. The generator records `evaluationTime` (the current
+time by default) and dates every source one day earlier, within the 30-day
+eligibility window. To reproduce a fixture, pass the same timestamp with
+`--evaluation-time ISO_TIMESTAMP`. The file contains 256 deterministic extraction
 payloads, notes, exact-route/conflict/correction/scope/abstention questions and
 answer criteria, both versions and explicit test budgets. It follows CT09's small
 summary corpus; selection must keep `source-255`, even when ranked last. The
@@ -34,7 +37,7 @@ Use the public APIs demonstrated by `tests/consolidation-acceptance.test.ts`:
 re-extract with a model separately for each branch.
 
 1. Seed each fixture payload with its fixed source/session/lineage IDs, canonical
-   `/synthetic/context-fixture` scope, fixed source time and exact rollout text.
+   `/synthetic/context-fixture` scope, recorded source time and exact rollout text.
    V1 receives the same text as raw memory; v2 receives `rawMemory=null` and the
    existing explicit truncation metadata. Use the unchanged version-specific
    extraction prompt hash and `textHash` for the exact extraction text.
@@ -59,7 +62,12 @@ re-extract with a model separately for each branch.
 
 Bind the approved owning Pi registry through `createConsolidationModelPort`, as
 production does. Use `ConsolidationScheduler.runPass` with the real captured
-registry, actual resolved window/output cap, idle readiness and a real clock.
+registry, actual resolved window/output cap and idle readiness. For each branch,
+anchor the injected clock at the fixture's `evaluationTime` and advance it with
+real elapsed time (for example, `Date.parse(fixture.evaluationTime) +
+Math.floor(performance.now() - startedAt)`, capturing `startedAt` at each run's start).
+Use that same clock for seeding and selection so both branches see the same source
+age; retain real elapsed time for lease and timeout enforcement.
 Do not replace requests, inject fabricated provider usage, shorten source
 selection, hard-code a summary, disable validation or dispatch hidden retries.
 The operator's runner must enforce the approved USD ceiling **before each

@@ -87,6 +87,28 @@ test("calibration store is reused only for the same model/transport/policy ident
   assert.equal(otherPolicy.safetyMultiplier, 1.25, "a replaced policy identity does not inherit the calibration");
 });
 
+test("overflow bumps remain lease-local across repeated leases and subsequent usage observations", () => {
+  const calibration = createContextCalibrationStore();
+  const next = () => createContextController({ model: writer, calibration });
+  for (let lease = 0; lease < 5; lease++) {
+    const controller = next();
+    assert.equal(controller.safetyMultiplier, 1.25);
+    controller.raiseSafetyMultiplierTo(controller.safetyMultiplier * 2);
+    assert.equal(controller.safetyMultiplier, 2.5);
+    assert.equal(next().safetyMultiplier, 1.25, "an overflow alone does not persist calibration");
+    controller.observeResult({ usage: usage({ input: 100 }), request: { method: "utf8_div4_estimate", baseEstimate: 100 } });
+    assert.equal(controller.safetyMultiplier, 2.5, "a lower observation never lowers this lease's multiplier");
+  }
+  const controller = next();
+  controller.raiseSafetyMultiplierTo(2.5);
+  controller.observeResult({ usage: usage({ input: 200 }), request: { method: "utf8_div4_estimate", baseEstimate: 100 } });
+  assert.equal(controller.safetyMultiplier, 2.5);
+  assert.equal(next().safetyMultiplier, 2, "measured calibration below the local bump is still persisted");
+  controller.observeResult({ usage: usage({ input: 300 }), request: { method: "utf8_div4_estimate", baseEstimate: 100 } });
+  assert.equal(controller.safetyMultiplier, 3);
+  assert.equal(next().safetyMultiplier, 3, "measured calibration above the local bump is still persisted");
+});
+
 test("exact counts record their observation but do not raise the safety multiplier (CT03)", () => {
   const controller = createContextController({ model: writer, counter: { count: () => ({ tokens: 1_000, identity: { provider: "fake", modelId: "writer", api: writer.api, policyVersion: DEFAULT_POLICY.version } }) } });
   const observation = controller.observeResult({

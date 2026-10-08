@@ -165,6 +165,7 @@ for (const version of ["v1", "v2"] as const) {
     const published = getPublishedGeneration(f.db, version, NOW); assert.ok(published);
     const manifest = JSON.parse(readFileSync(join(published.directory, "manifest.json"), "utf8"));
     assert.deepEqual(manifest.sources.map((source: { sourceId: string }) => source.sourceId), ["source-001"]);
+    assert.doesNotMatch(readFileSync(join(published.directory, "phase2_workspace_diff.md"), "utf8"), new RegExp(sentinel));
     for (const path of Object.keys(manifest.fileHashes)) assert.doesNotMatch(readFileSync(join(published.directory, path), "utf8"), new RegExp(sentinel));
   });
 

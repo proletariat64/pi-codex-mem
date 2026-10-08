@@ -1,4 +1,4 @@
-import type { Message, SystemMessage, Tool } from "@earendil-works/pi-ai";
+import type { Message, SystemMessage, Tool, Usage } from "@earendil-works/pi-ai";
 import { normalizeModelUsage } from "../model-usage.ts";
 
 /** Phase 2 context counting/control, spec docs/spec/consolidation-context-spec-v0.2.0.md §3 and §8. */
@@ -128,6 +128,9 @@ export interface RequestContextController {
   count(request: NormalizedRequest): CountResult;
   /** Admission check on the complete request immediately before transport (spec §3.3). */
   admission(request: NormalizedRequest, options?: { mode?: "ordinary" | "compaction" }): AdmissionDecision;
+  /** Calibrate with the usage of one completed, trustworthy request (spec §3.2).
+   * Returns undefined when usage is missing, zero or invalid; the reservation stays intact. */
+  observeResult(observation: { usage: Usage | undefined; request: { method: CountingMethod; baseEstimate: number } }): CalibratedObservation | undefined;
   snapshot(): ContextDiagnostics;
 }
 
@@ -159,6 +162,28 @@ export interface ContextDiagnostics {
   currentInputUnits: TokenUnits | undefined;
 }
 
+/** Process-local calibration state for one model/transport/policy identity (spec §3.2). */
+export interface CalibrationEntry {
+  multiplier: number;
+  latest: CalibratedObservation | undefined;
+}
+
+export interface ContextCalibrationStore {
+  get(identity: CountingIdentity): CalibrationEntry | undefined;
+  set(identity: CountingIdentity, entry: CalibrationEntry): void;
+}
+
+/** Create a store of per-identity calibrations. Reuse is confined to identical identities. */
+export function createContextCalibrationStore(): ContextCalibrationStore {
+  const entries = new Map<string, CalibrationEntry>();
+  const key = (identity: CountingIdentity) =>
+    JSON.stringify([identity.provider, identity.modelId, identity.api, identity.policyVersion]);
+  return {
+    get: (identity) => entries.get(key(identity)),
+    set: (identity, entry) => { entries.set(key(identity), entry); },
+  };
+}
+
 function countIdentity(model: ControllerModel, policy: ContextCountingPolicy, counter: MatchingTokenCounter | undefined,
   request: NormalizedRequest): { ok: true; count: CountOk } | { ok: false; reason: "unsupported_content"; kind: "image" } {
   const fallback = countModelVisibleRequest(request, policy);
@@ -179,15 +204,18 @@ export function createContextController(init: {
   model: ControllerModel;
   counter?: MatchingTokenCounter;
   policy?: ContextCountingPolicy;
+  /** Process-local calibration store; recycled only for identical identities. */
+  calibration?: ContextCalibrationStore;
 }): RequestContextController {
   const policy = init.policy ?? DEFAULT_CONTEXT_COUNTING_POLICY;
   const identity: CountingIdentity = {
     provider: init.model.provider, modelId: init.model.id, api: init.model.api, policyVersion: policy.version,
   };
   const capacity = deriveModelCapacity({ contextWindow: init.model.contextWindow, maxTokens: init.model.maxTokens }, policy);
-  let safetyMultiplier = policy.safetyMultiplier;
+  const calibration = init.calibration ?? createContextCalibrationStore();
+  let safetyMultiplier = calibration.get(identity)?.multiplier ?? policy.safetyMultiplier;
   let lastCount: CountOk | undefined;
-  let latestObservation: CalibratedObservation | undefined;
+  let latestObservation = calibration.get(identity)?.latest;
   return {
     identity,
     policy,
@@ -202,6 +230,7 @@ export function createContextController(init: {
       const mode = options?.mode ?? "ordinary";
       if (!capacity.ok) return { action: "blocked", reason: "context_capacity_unavailable" };
       const counted = countIdentity(init.model, policy, init.counter, request);
+      if (counted.ok) lastCount = counted.count;
       if (!counted.ok) return { action: "blocked", reason: "unsupported_content" };
       const { count } = counted;
       const admissionEstimate = count.exact ? count.baseEstimate : Math.ceil(count.baseEstimate * safetyMultiplier);
@@ -225,6 +254,29 @@ export function createContextController(init: {
       }
       return { action: "admit", mode, atOrAboveHardLimit: false, count, capacity: capped,
         admissionEstimate, estimateUnits };
+    },
+    observeResult: ({ usage, request }) => {
+      const normalized = normalizeModelUsage(usage);
+      if (!normalized || normalized.input <= 0 || !(request.baseEstimate > 0)) return undefined;
+      // Normalize input as uncached + cache-read + cache-write; output is not request-input usage.
+      const observedRatio = normalized.input / request.baseEstimate;
+      const observation: CalibratedObservation = {
+        observedInputTokens: normalized.input,
+        requestBaseEstimate: request.baseEstimate,
+        observedRatio,
+        appliedMultiplier: safetyMultiplier,
+        units: "tokens",
+      };
+      if (request.method !== "tokens") {
+        if (observedRatio > safetyMultiplier) {
+          // Raise to at least observedInput / requestBaseEstimate; never lower within a lease.
+          safetyMultiplier = observedRatio;
+          observation.appliedMultiplier = safetyMultiplier;
+        }
+        calibration.set(identity, { multiplier: safetyMultiplier, latest: observation });
+      }
+      latestObservation = observation;
+      return observation;
     },
     snapshot: () => ({
       identity,

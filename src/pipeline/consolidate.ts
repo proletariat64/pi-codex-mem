@@ -13,10 +13,11 @@ import { renewConsolidationLease, type ConsolidationLease } from "../store/conso
 import { createWorkspaceTools } from "./workspace-tools.ts";
 import { tokenCounterForModel, type ConsolidationModelPort } from "./model-port.ts";
 import {
-  createContextCalibrationStore, createContextController,
+  createContextCalibrationStore, createContextController, DEFAULT_CONTEXT_COUNTING_POLICY,
   type AdmissionDecision, type ContextCalibrationStore, type CountOk,
 } from "./context-controller.ts";
 import { ArtifactFormatError } from "./artifacts.ts";
+import { DIFF_POLICY_VERSION } from "./diff.ts";
 
 export interface ConsolidationRunInput {
   db: DatabaseSync;
@@ -52,7 +53,7 @@ const MAX_COMPACTIONS = 2;
 const COMPACTION_SUMMARY_BYTES = 16_384;
 /** Label identifying a host-derived summary inside working history (§5.1: derived
  * assistant context, never authoritative user or tool data). */
-export const COMPACTION_SUMMARY_LABEL = "[Derived working-context summary]";
+const COMPACTION_SUMMARY_LABEL = "[Derived working-context summary]";
 const writerTask = (version: MemoryVersion) =>
   `Consolidate this ${version} staged workspace. Read phase2_workspace_diff.md first, then selected evidence and notes. Write the required outputs using workspace tools.`;
 const COMPACTION_INSTRUCTION = "Summarize the appended writer transcript for continuation. Preserve " +
@@ -70,11 +71,15 @@ const adaptation = (version: MemoryVersion) => readFileSync(new URL(`../../promp
 /** All writer instructions and boundary semantics participate in the dirty check. */
 export function consolidationPromptHash(config: MemoryConfig, version: MemoryVersion = "v1"): string {
   return createHash("sha256").update(writerTemplate(version)).update("\n").update(adaptation(version)).update(JSON.stringify({
-    schemaVersion: 1, rendererVersion: 2, memoryVersion: version, summaryBytes: Math.min(9999, config.limits.summaryBytes),
+    schemaVersion: 1, rendererVersion: 3, memoryVersion: version, summaryBytes: Math.min(9999, config.limits.summaryBytes),
     toolResponseBytes: config.limits.toolResponseBytes, maxCalls: MAX_CALLS, maxTools: MAX_TOOLS,
     timeoutMs: TOTAL_TIMEOUT_MS, outputTokens: OUTPUT_TOKENS,
     outputAllowlist: version === "v1" ? ["MEMORY.md", "memory_summary.md", "skills/<slug>/SKILL.md"] : ["memory_summary.md"],
-    toolExecution: "sequential", contextByteRatio: 0.7, contextOverhead: 1_024,
+    toolExecution: "sequential", countingPolicy: DEFAULT_CONTEXT_COUNTING_POLICY,
+    compactionPolicy: { version: 1, maxCompactions: MAX_COMPACTIONS, summaryBytes: COMPACTION_SUMMARY_BYTES,
+      instruction: COMPACTION_INSTRUCTION, label: COMPACTION_SUMMARY_LABEL,
+      continuation: continuationInstruction(version), overflowRecoveries: 1 },
+    diffPolicyVersion: DIFF_POLICY_VERSION,
     maxValidationRepairs: 1, validationDiagnosticBytes: 512, artifactPolicyVersion: 3,
   })).digest("hex");
 }

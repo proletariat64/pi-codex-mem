@@ -13,8 +13,10 @@ Selection and operation counts are **not** proof that a model read or understood
 all evidence.
 
 Phase 2 counts the normalized model-visible request, including instructions,
-tools, messages, calls and results. A matching model/transport tokenizer takes
-priority. Otherwise `utf8_div4_estimate` uses explicit framing estimates and an
+tools, messages, calls and result content (not host display `details`). Exact counts
+require explicit matching provider/model, transport API and counting/framing policy
+version assertions. Missing or mismatched API/policy assertions are calibrated
+`tokenizer_estimate` counts, not exact. A matching tokenizer takes priority. Otherwise `utf8_div4_estimate` uses explicit framing estimates and an
 initial 1.25 safety multiplier. This heuristic is **not** a conservative upper
 bound, especially for Unicode/code. Trustworthy provider input usage (uncached +
 cache read + cache write) can raise, never lower, the multiplier within a lease.
@@ -26,7 +28,8 @@ Soft/hard/target are floor(I × 0.70/0.90/0.50). These are token capacities;
 admission estimates explicitly use `estimated_tokens` when not exact. The
 16 KiB tool-response and summary byte ceilings are different quantities.
 Every outgoing request is freshly counted and transactionally reserved.
-Missing usage retains its safety-adjusted charge, not a guaranteed upper bound.
+Missing, invalid or zero normalized input usage retains its safety-adjusted charge,
+including output-only usage; it is not a guaranteed upper bound.
 Deleting working history never refunds spent tokens or requests.
 
 ## Compaction and bounded failure
@@ -67,7 +70,9 @@ three context lines. Added/deleted files retain explicit status and no-final-new
 markers. The complete changed-path index remains authoritative. Oversized or
 pathological diffs use path-index fallback (`size`, `computation_limit`); invalid
 prior support uses `privacy_or_retention`. Revoked prior plaintext is never
-reintroduced just to improve a deletion diff.
+reintroduced just to improve a deletion diff. The 4 MiB ceiling includes the complete
+rendered heading, index, separators and UTF-8 hunks. Size fallback discards all
+hunks, never truncates the authoritative index.
 
 Status and doctor distinguish **persistent READABLE/UNAVAILABLE** from writer
 progress and host health. Body-free writer observations include counting
@@ -87,13 +92,14 @@ SQLite tables are stored. Doctor remains read-only and does not start work.
 ## Upgrade and rollback
 
 The writer identity coherently includes counting policy, compaction framing/bounds
-and diff policy; renderer revision is 3. Existing dirty checks and configuration
+and diff policy; renderer revision is 3. Counting policy 2 and diff policy 2
+invalidate earlier v0.2.0 counting/framing and rendered-size behavior. Existing dirty checks and configuration
 epochs already depend on this hash. Old blocked `context_budget` jobs acquire a
 new work key under the new valid policy. No Agent is mutated live; reload/settle
 under normal fences. Mixed job-policy identities cannot publish.
 
 Config schema remains 1; no setting or budget field is added. Generation manifests
-retain schema 1 and the optional `diffPolicyVersion` (1) / `diffFallbackReason`
+retain schema 1 and the optional `diffPolicyVersion` (2) / `diffFallbackReason`
 extension from the diff change. Legacy manifests without those fields remain
 readable; readers verify actual stored bytes against the stored hash. No new
 manifest extension is needed for process-local observations. Rollback uses the

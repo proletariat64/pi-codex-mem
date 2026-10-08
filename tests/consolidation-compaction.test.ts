@@ -10,7 +10,7 @@ import { defaultConfig, type MemoryVersion } from "../src/config.ts";
 import { openStateDb } from "../src/store/db.ts";
 import { claimConsolidation } from "../src/store/consolidation.ts";
 import { consolidationPromptHash, runConsolidation } from "../src/pipeline/consolidate.ts";
-import { createContextCalibrationStore } from "../src/pipeline/context-controller.ts";
+import { createContextCalibrationStore, createContextController } from "../src/pipeline/context-controller.ts";
 import type { ConsolidationModelPort } from "../src/pipeline/model-port.ts";
 import type { ContextCalibrationStore } from "../src/pipeline/context-controller.ts";
 
@@ -288,4 +288,67 @@ test("CT06: a full-mode summary that cannot cross the compact target ends compac
   ], noProgressWindow);
   assert.deepEqual(await run(setup, port), { status: "blocked", reason: "compaction_no_progress" });
   assert.equal(calls.length, 3);
+});
+
+const overflowReply = () => {
+  const message = reply([tool("workspace_list")], "toolUse", 17_000, 400);
+  message.stopReason = "error";
+  message.errorMessage = "400 This model's maximum context length is 65_536 tokens. However, your messages resulted in 70_000 tokens.";
+  return message;
+};
+
+test("§7.2: a first writer overflow compacts and recounts through the same gates before the resend", async (t) => {
+  const setup = fixture(t);
+  const overflowWindow: Model<Api> = { ...model, contextWindow: 100_000 };
+  const calibration = createContextCalibrationStore();
+  const { port, calls } = scriptedPort([
+    reply([{ type: "text", text: "\u754c".repeat(12_000) }, tool("workspace_list")], "toolUse"),
+    () => overflowReply(), // the provider rejects the admitted request as overflow
+    (call) => {
+      assert.ok(isCompactionCall(call), "recovery dispatches a tool-free compaction before any resend");
+      return smallSummary("recovery");
+    },
+    (call) => {
+      assert.deepEqual(call.context.messages.map((m) => m.role), ["system", "assistant", "user"],
+        "the resend carries the recounted replacement, never the unchanged payload");
+      return reply([{ type: "text", text: "Outputs written." }]);
+    },
+  ], overflowWindow);
+  assert.deepEqual(await run(setup, port, { contextCalibration: calibration }), { status: "succeeded" });
+  assert.equal(calls.length, 4);
+  const rows = reservations(setup.db) as { estimate_input: number }[];
+  assert.equal(rows.length, 4);
+  assert.equal(createContextController({ model: { provider: "mock", id: "writer", api: "openai-completions",
+    contextWindow: 100_000, maxTokens: 8_000 }, calibration }).safetyMultiplier, 2.5,
+    "the bounded recovery doubled the fallback multiplier once");
+  const resend = rows[3]!.estimate_input;
+  const candidateBase = resend / 2.5;
+  assert.ok(rows[0]!.estimate_input / 1.25 * 2.4 < resend,
+    `the doubled multiplier feeds the honest recount of the resend (${resend} vs base ${candidateBase})`);
+});
+
+test("§7.2: a second overflow after recovery ends provider_context_overflow without resending", async (t) => {
+  const setup = fixture(t);
+  const overflowWindow: Model<Api> = { ...model, contextWindow: 100_000 };
+  const { port, calls } = scriptedPort([
+    reply([{ type: "text", text: "\u754c".repeat(12_000) }, tool("workspace_list")], "toolUse"),
+    () => overflowReply(),
+    () => smallSummary("recovery"),
+    () => overflowReply(), // the resend overflows again: bounded recovery is exhausted
+    () => { throw new Error("no further resend after a second overflow"); },
+  ], overflowWindow);
+  assert.deepEqual(await run(setup, port), { status: "blocked", reason: "provider_context_overflow" });
+  assert.equal(calls.length, 4);
+  assert.equal((setup.db.prepare("SELECT COUNT(*) AS n FROM budget_reservations").get() as { n: number }).n, 4,
+    "every failed transport stays charged; no hidden third attempt");
+});
+
+test("§7.2: overflow recovery with nothing compactable stops before any resend", async (t) => {
+  const setup = fixture(t, "v1", { bigDiff: false });
+  const overflowWindow: Model<Api> = { ...model, contextWindow: 100_000 };
+  const { port, calls } = scriptedPort([
+    () => overflowReply(), // the very first request overflows: framing alone is the history
+  ], overflowWindow);
+  assert.deepEqual(await run(setup, port), { status: "blocked", reason: "provider_context_overflow" });
+  assert.equal(calls.length, 1, "no compaction of irreducible framing and no resend");
 });

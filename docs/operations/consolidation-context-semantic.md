@@ -1,10 +1,12 @@
-# Pending v0.2.0 semantic comparison procedure
+# v0.2.0 semantic comparison procedure and run record
 
-**Not executed; not authorized.** This procedure and the historical v0.1.0 release
-record do not grant permission to spend or transmit data. Obtain explicit approval
-for exact provider/model IDs, a total USD ceiling, fixture hashes, repetitions and
-output location first. The generator below is offline and uses synthetic text only.
-No new paid runner or credential discovery is enabled by this ticket.
+**Executed under a frozen authorization; outcome FAILED/INCOMPLETE.** The
+[real-model results report](consolidation-context-real-model-results.md) records
+the completed comparison. Real semantic acceptance remains unmet. This procedure
+preserves the frozen setup and execution controls; it does not authorize another
+model run or further spend. Any new comparison requires separate explicit approval
+for exact provider/model IDs, total USD ceiling, fixture hashes, repetitions and
+output location. The generator below is offline and uses synthetic text only.
 
 ## Freeze the inputs (offline)
 
@@ -55,7 +57,11 @@ re-extract with a model separately for each branch.
    fields. Budget tuning requires a new paired experiment, never only a candidate
    increase. Extraction seeding is offline and does not consume model calls.
 
-## Execute only after approval
+## Authorized execution controls (completed; no rerun authorized)
+
+The controls below governed the completed run and are retained for audit. This
+section is not authorization for additional model calls; see the [recorded
+outcome](consolidation-context-real-model-results.md).
 
 Bind the approved owning Pi registry through `createConsolidationModelPort`, as
 production does. Use `ConsolidationScheduler.runPass` with the real captured
@@ -102,5 +108,8 @@ substring matches. A manifest with 256 entries is not a correctness score.
 Record misses, wrong scope, fabricated provenance, invented approvals and forgotten
 content explicitly. Compare baseline/candidate paired results and confidence/
 repetitions chosen **before** execution; do not select the best sample. Preserve
-failed attempts and charges. The v0.2.0 release gate remains **pending** until this
-comparison and operator acceptance are recorded alongside implementation gates.
+failed attempts and charges. The comparison is recorded in the [real-model results
+report](consolidation-context-real-model-results.md), but real semantic acceptance
+remains **not met** because publication/answer coverage is incomplete and no real
+compaction occurred. The v0.2.0 release gate therefore remains **pending** alongside
+implementation gates; do not infer permission for a retry or tuned follow-up.

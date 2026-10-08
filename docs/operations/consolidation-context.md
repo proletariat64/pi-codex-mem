@@ -108,5 +108,6 @@ usage. It cannot resurrect forgotten content.
 
 **Release limitation:** deterministic mocks prove protocol/storage behavior, not
 language quality, real-provider token accuracy, complete reading or semantic
-coverage. The v0.2.0 semantic baseline-versus-candidate gate is still pending;
-historical v0.1.0 sign-off does not authorize or certify this revision.
+coverage. The v0.2.0 baseline-versus-candidate comparison has been executed but
+failed/incomplete; semantic acceptance remains unmet. See the [real-model results](consolidation-context-real-model-results.md).
+Historical v0.1.0 sign-off does not certify this revision.

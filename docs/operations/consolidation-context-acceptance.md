@@ -1,9 +1,11 @@
 # v0.2.0 implementation acceptance evidence
 
 **Implementation/mock proof, not release sign-off.** The authorized real-model
-old-writer-versus-candidate semantic comparison remains **PENDING**. No paid or
-external model run was performed for #57. Historical v0.1.0 evaluation does not
-certify this change. See the [semantic procedure](consolidation-context-semantic.md).
+old-writer-versus-candidate semantic comparison has been **EXECUTED —
+FAILED/INCOMPLETE**. Real semantic acceptance remains unmet; no candidate
+superiority or model-quality claim follows. Historical v0.1.0 evaluation does not
+certify this change. See the [real-model results](consolidation-context-real-model-results.md)
+and [semantic procedure](consolidation-context-semantic.md).
 
 ## Reproduction and environment
 
@@ -75,7 +77,7 @@ Multiple assertions exercise one public boundary, not a substitute language gate
 | CT06 | Same file: `CT06: first segment above target and second below install exactly once atomically`; `CT06: readiness lost on the second segment installs nothing`; `CT06/CT14: denied daily compactor budget on the second segment installs nothing and defers honestly`; `CT06: one oversized unit cannot fit the compactor and ends context_irreducible`; `CT06: exhausted 2-per-lease slots end compaction_limit with nothing installed`; `CT06: an unchanged-size segment summary discards the candidate with compaction_no_progress`; `CT06: full-mode invalid summary output ends compaction_output_invalid (empty, length-capped, oversized)`; `CT06: call exhaustion during a compact trigger ends model_call_budget without a reset`; `CT06: the total writer timeout ends the compact seam as total_timeout`. | Pass bounded compound transformation/failure classifications. |
 | CT07 | `consolidation-acceptance.test.ts`: `CT07 {version}: {mutation} during cancellation-ignoring compaction prevents stale continuation and publication`, mutations `correction`, `forget_note`, `forget_source`, `privacy_edit`, `selection`, `configuration`. Compaction tests also name `CT07: foreground activation during compaction discards the candidate without installing`, `CT07: lease loss during compaction ends lease_lost and installs nothing`, and `CT07: a mid-compaction abort discards the late result, charges the estimate and installs nothing`. | Pass production scheduler privacy/selection checks and late-result fences; already-sent bytes remain irrevocable. |
 | CT08 | Compaction tests: `CT08 {version}: compaction retains staged output hashes, pinned framing, tools and host lease identity`; `CT08: compaction preserves the outstanding repair diagnostic verbatim next to the labeled summary`. | Pass original framing/tool equality, staged digest stability, lease identity, v2 write isolation and absence of new note/generation rights. |
-| CT09 | Acceptance tests: `CT09 {version}: 256 selected sources retain manifest evidence through actual paged-history compaction`. | Pass complete selection/manifest/operation mock fixture; **real-model low-ranked evidence, routes, conflicts and corrections semantic proof pending**. |
+| CT09 | Acceptance tests: `CT09 {version}: 256 selected sources retain manifest evidence through actual paged-history compaction`. | Pass complete selection/manifest/operation mock fixture. The real-model comparison was executed but failed/incomplete: see [slot outcomes and semantic findings](consolidation-context-real-model-results.md). |
 | CT10 | `staging-diff.test.ts`: `a one-line edit to a large baseline file produces a local hunk, not whole-file replacement`; `empty, CRLF, Unicode, repeated-line and no-final-newline diffs are byte-deterministic across runs`; `pathological edits fall back to the complete path index with computation_limit, never a partial diff`; `a diff crossing the 4 MiB ceiling mid-manifest yields the complete index with the size reason`. | Pass deterministic parser/apply oracle, no partial path index. |
 | CT11 | `staging-incremental.test.ts`: `revoked prior plaintext never enters a diff even with oversized content`; acceptance test `CT11 {version}: revoked baseline plaintext never reaches rebuilt diffs, compactor requests or publication`. | Pass revoked baseline exclusion through actual forget/rebuild/compaction/publication path; no valid first-build baseline assumed. |
 | CT12 | Entire `make check` suite and T01–T38 behavioral matrix; `memory-diagnostics.test.ts`: `diagnostics and doctor are SELECT-only: no jobs, budgets, grants, pins or usage change` and `mock-pi status and doctor expose shared recovery blockers read-only with no model calls`. | Pass repository regression gates, existing artifacts/repair/CAS/crash/quotas/fairness/no-op contracts; no new prose-citation gate. |
@@ -130,5 +132,7 @@ reported already up to date): `make check` **624/624 passed**, 0 failed/skipped,
 **50,071.017046 ms** suite time, TypeScript passed, **9** upstream files verified.
 `npm run test:behavioral`: **60/60** labeled matrix rows passed, 0 missing,
 0 failed/skipped, no unrelated failures. `git diff --check` passed.
-The semantic gate stays pending regardless of these implementation results;
-do not mark the whole spec complete or ready to release based solely on this report.
+The implementation gates passed, but real semantic acceptance remains unmet:
+the comparison was executed but failed/incomplete, with incomplete answer coverage
+and zero real compactions. Do not mark the whole spec complete or ready to release
+based solely on these implementation results; see the [real-model evidence](consolidation-context-real-model-results.md).

@@ -352,3 +352,165 @@ test("§7.2: overflow recovery with nothing compactable stops before any resend"
   assert.deepEqual(await run(setup, port), { status: "blocked", reason: "provider_context_overflow" });
   assert.equal(calls.length, 1, "no compaction of irreducible framing and no resend");
 });
+
+// --- CT07: mid-compaction fence checks with a cancellation-ignoring transport ---
+const waitFor = async (predicate: () => boolean) => {
+  for (let i = 0; i < 2_000 && !predicate(); i++) await new Promise((resolve) => setTimeout(resolve, 5));
+};
+
+/** Writer replies stream immediately; the compaction call hangs until the test releases it. */
+function hangingCompactionPort(writerResponses: AssistantMessage[], options?: { onCompactionDispatch?: () => void }) {
+  const calls: { context: TranscriptContext }[] = [];
+  let release: ((message: AssistantMessage) => void) | undefined;
+  const port: ConsolidationModelPort = { resolve: () => smallWindow, stream: (_model, context) => {
+    calls.push({ context: structuredClone(context) });
+    const bounded = createAssistantMessageEventStream();
+    if (!(context.messages[0] as SystemMessage).toolsAdded?.length) {
+      options?.onCompactionDispatch?.();
+      release = (message) => {
+        if (message.stopReason === "error" || message.stopReason === "aborted") {
+          bounded.push({ type: "error", reason: message.stopReason, error: message });
+        } else bounded.push({ type: "done", reason: "stop", message });
+      };
+    } else {
+      const message = writerResponses.shift();
+      if (!message) throw new Error(`unexpected writer call #${calls.length}`);
+      bounded.push({ type: "done", reason: message.stopReason === "toolUse" ? "toolUse" : "stop", message });
+    }
+    return bounded;
+  } };
+  return { port, calls, release: () => release };
+}
+
+test("CT07: a mid-compaction abort discards the late result, charges the estimate and installs nothing", async (t) => {
+  const setup = fixture(t);
+  const abort = new AbortController();
+  const { port, calls, release } = hangingCompactionPort([
+    reply([{ type: "text", text: "\u754c".repeat(12_000) }, tool("workspace_list")], "toolUse"),
+    reply([{ type: "text", text: "\u754c".repeat(30_000) }, tool("workspace_list")], "toolUse"),
+  ]);
+  const runPromise = run(setup, port, { signal: abort.signal });
+  await waitFor(() => calls.length === 3 && release() !== undefined);
+  abort.abort();
+  assert.deepEqual(await runPromise, { status: "cancelled", reason: "aborted" });
+  const rows = reservations(setup.db) as { estimate_input: number; status: string; actual_input: number }[];
+  assert.equal(rows.length, 3);
+  assert.equal(rows[2]!.status, "charged");
+  assert.equal(rows[2]!.actual_input, rows[2]!.estimate_input,
+    "a cancellation-ignoring transport returns no usage; the estimate stays charged");
+  // The result lands later; the fenced seam admits no stale request, write or install.
+  release()!(reply([{ type: "text", text: "Late compaction result after abort." }]));
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(calls.length, 3);
+});
+
+test("CT07: foreground activation during compaction discards the candidate without installing", async (t) => {
+  const setup = fixture(t);
+  let readiness: "ready" | "foreground_active" = "ready";
+  const { port, calls, release } = hangingCompactionPort([
+    reply([{ type: "text", text: "\u754c".repeat(12_000) }, tool("workspace_list")], "toolUse"),
+    reply([{ type: "text", text: "\u754c".repeat(30_000) }, tool("workspace_list")], "toolUse"),
+  ], { onCompactionDispatch: () => { readiness = "foreground_active"; } });
+  const runPromise = run(setup, port, { canStartRequest: () => readiness });
+  await waitFor(() => calls.length === 3 && release() !== undefined);
+  release()!(smallSummary("discarded"));
+  assert.deepEqual(await runPromise, { status: "paused", reason: "foreground_active" });
+  assert.equal(calls.length, 3, "no resumed writer request after the discarded candidate");
+  assert.equal((setup.db.prepare("SELECT COUNT(*) AS n FROM budget_reservations").get() as { n: number }).n, 3);
+});
+
+test("CT07: lease loss during compaction ends lease_lost and installs nothing", async (t) => {
+  const setup = fixture(t);
+  const { port, calls, release } = hangingCompactionPort([
+    reply([{ type: "text", text: "\u754c".repeat(12_000) }, tool("workspace_list")], "toolUse"),
+    reply([{ type: "text", text: "\u754c".repeat(30_000) }, tool("workspace_list")], "toolUse"),
+  ]);
+  const runPromise = run(setup, port);
+  await waitFor(() => calls.length === 3 && release() !== undefined);
+  setup.db.prepare("UPDATE jobs SET owner = 'successor', fence = fence + 1 WHERE job_id = ?").run(setup.lease.jobId);
+  release()!(smallSummary("discarded"));
+  assert.deepEqual(await runPromise, { status: "blocked", reason: "lease_lost" });
+  assert.equal(calls.length, 3);
+});
+
+test("CT06: call exhaustion during a compact trigger ends model_call_budget without a reset", async (t) => {
+  const setup = fixture(t);
+  const hundredk: Model<Api> = { ...model, contextWindow: 100_000 };
+  const turns = Array.from({ length: 12 }, () =>
+    reply([{ type: "text", text: "\u754c".repeat(3_600) }, tool("workspace_list")], "toolUse"));
+  const { port, calls } = scriptedPort([...turns], hundredk);
+  assert.deepEqual(await run(setup, port), { status: "blocked", reason: "model_call_budget" });
+  assert.equal(calls.length, 12, "compaction transport shares the same call counter");
+  assert.equal((setup.db.prepare("SELECT COUNT(*) AS n FROM budget_reservations").get() as { n: number }).n, 12);
+});
+
+test("CT06: the total writer timeout ends the compact seam as total_timeout", async (t) => {
+  const setup = fixture(t);
+  let elapsed = 0;
+  const { port, calls } = scriptedPort([
+    () => reply([{ type: "text", text: "\u754c".repeat(12_000) }, tool("workspace_list")], "toolUse"),
+    () => { elapsed = 300_000; return reply([{ type: "text", text: "\u754c".repeat(30_000) }, tool("workspace_list")], "toolUse"); },
+  ]);
+  const runPromise = run(setup, port, { clock: () => NOW + 1 + elapsed });
+  // The clock is spent while turn 2 settles; the next seam fences as total_timeout.
+  assert.deepEqual(await runPromise, { status: "blocked", reason: "total_timeout" });
+  assert.ok(calls.length < 3, "no further transport after the total timeout");
+});
+
+// --- CT08/§5.3/CT14: host repair state retention and run-owned summaries ---
+const databaseDump = (db: import("node:sqlite").DatabaseSync): string => {
+  const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as { name: string }[];
+  return tables.map((table) => {
+    try { return JSON.stringify(db.prepare(`SELECT * FROM "${table.name}"`).all()); }
+    catch { return ""; }
+  }).join("\n");
+};
+
+test("CT08: compaction preserves the outstanding repair diagnostic verbatim next to the labeled summary", async (t) => {
+  const setup = fixture(t);
+  let validateCalls = 0;
+  const { port, calls } = scriptedPort([
+    reply([{ type: "text", text: "\u754c".repeat(12_000) }, tool("workspace_list")], "toolUse"),
+    // Terminal turn with invalid artifacts: the host steers one repair diagnostic.
+    () => reply([{ type: "text", text: "\u754c".repeat(30_000) }]),
+    () => smallSummary("with repair state"),
+    // The resumed writer must see framing, summary, repair instruction and continuation.
+    (call) => {
+      const roles = call.context.messages.map((m) => m.role);
+      assert.deepEqual(roles, ["system", "assistant", "user", "user"],
+        "framing + labeled summary + retained repair diagnostic + host continuation");
+      const repair = call.context.messages[2]!.content;
+      const repairText = typeof repair === "string" ? repair : (repair[0] as { text: string }).text;
+      assert.match(repairText, /^Repair the staged required artifacts/);
+      assert.match(repairText, /summary first-line marker/);
+      assert.match(repairText, /sole validation repair opportunity/);
+      return reply([{ type: "text", text: "Repaired and written." }]);
+    },
+  ]);
+  const { ArtifactFormatError } = await import("../src/pipeline/artifacts.ts");
+  const result = await run(setup, port, { validateOutputs: () => {
+    validateCalls++;
+    if (validateCalls === 1) throw new ArtifactFormatError("summary first-line marker must be literal v1");
+  } });
+  assert.deepEqual(result, { status: "succeeded" });
+  assert.equal(validateCalls, 2, "the repair allowance and validation contract survive compaction");
+  assert.equal(calls.length, 4);
+});
+
+test("§5.3/CT14: a successful compaction leaves no summary body in any durable table or log row", async (t) => {
+  const setup = fixture(t);
+  const { port, calls } = scriptedPort([
+    reply([{ type: "text", text: "\u754c".repeat(12_000) }, tool("workspace_list")], "toolUse"),
+    reply([{ type: "text", text: "\u754c".repeat(30_000) }, tool("workspace_list")], "toolUse"),
+    () => reply([{ type: "text", text: "RunOwnedBodyMarker: covered reads and decisions; nothing else." }]),
+    () => reply([{ type: "text", text: "Outputs written." }]),
+  ]);
+  assert.deepEqual(await run(setup, port), { status: "succeeded" });
+  assert.equal(calls.length, 4);
+  const dump = databaseDump(setup.db);
+  assert.doesNotMatch(dump, /RunOwnedBodyMarker/, "summaries live only in run-owned memory");
+  assert.doesNotMatch(dump, /Derived working-context summary/, "labels never leak into durable state either");
+  assert.equal((setup.db.prepare("SELECT COUNT(*) AS n FROM generations").get() as { n: number }).n, 0,
+    "a finished writer stays unpublished-by-staging until host validation and publication CAS");
+});

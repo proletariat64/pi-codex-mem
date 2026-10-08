@@ -93,12 +93,12 @@ for (const version of ["v1", "v2"] as const) {
     for (let i = 0; i < 256; i++) f.source(`source-${String(i).padStart(3, "0")}`, 24);
     const note = f.note();
     f.script([
-      () => reply(Array.from({ length: 4 }, (_, i) => tool(`read-${i}`, "workspace_read", {
+      () => reply(Array.from({ length: 8 }, (_, i) => tool(`read-${i}`, "workspace_read", {
         path: "phase2_workspace_diff.md", startLine: 1 + i * 30, maxLines: 300,
       })), "toolUse"),
       context => {
         assert.ok(context.messages[0]?.role === "system" && !context.messages[0].toolsAdded?.length, "real compactor transport is tool-free");
-        assert.equal(context.messages.filter(m => m.role === "toolResult").length, 4);
+        assert.equal(context.messages.filter(m => m.role === "toolResult").length, 8);
         return reply([{ type: "text", text: "Derived summary: staged sources and corrections remain authoritative. Next write outputs; reread originals for exact routes." }]);
       },
       context => {
@@ -126,12 +126,12 @@ for (const version of ["v1", "v2"] as const) {
     const lines = diagnostics.lines.join("\n");
     assert.equal(diagnostics.selectedReadable, true);
     assert.match(lines, /selected sources=256; selected notes=1/);
-    assert.match(lines, /requests=4; tools=(?:5|6); compactions=1/);
+    assert.match(lines, /requests=4; tools=(?:9|10); compactions=1/);
     assert.equal(f.calls.length, 4);
     assert.ok(elapsedMs < 300_000);
     assert.equal(existsSync(join(generation.directory, "MEMORY.md")), version === "v1");
     t.diagnostic(JSON.stringify({ fixture: "CT09", version, model: "mock/acceptance", counting: "utf8_div4_estimate", selected: 256, notes: 1,
-      requests: 4, tools: version === "v1" ? 6 : 5, compactions: 1, elapsedMs, available: diagnostics.selectedReadable,
+      requests: 4, tools: version === "v1" ? 10 : 9, compactions: 1, elapsedMs, available: diagnostics.selectedReadable,
       dailyInput: 1_000_000, dailyOutput: 50_000, dailyRequests: 12, semanticCoverage: "not measured" }));
   });
 

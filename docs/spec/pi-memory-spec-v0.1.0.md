@@ -7,6 +7,8 @@
 
 **Status:** Implementation contract; revision 4 approved by the user on 2026-09-30. Revision 3 validation remains signed off. Product implementation and its acceptance tests are pending.
 
+**Related proposal:** [Consolidation context management v0.2.0](consolidation-context-spec-v0.2.0.md) defines proposed Phase 2 token measurement, bounded compaction and incremental-diff improvements. It is a draft, not an implemented change or an override of this approved contract until separately approved.
+
 > Implementation authorization update: the user removed exact Pi-version requirements. Support recent daily host releases by the required capabilities, not an exact version allowlist or minimum Pi-version gate. Record the actually exercised host and peer versions as verification evidence; do not require a new multi-version matrix. Historical version references below remain source evidence, not deployment restrictions. Unrelated background/configuration contracts remain unchanged. The user additionally accepts the unavoidable provider cancellation/send race: preserve validation, safe owned-payload removal and best-effort native abort, but do not disable the Codex reader or block acceptance solely because a cached transport can send after cancellation. This exception does not authorize serving a known invalid pin or bypassing read/privacy controls.
 
 **Working package name:** `pi-memory` — a local project name, not a claim that this npm name is available  

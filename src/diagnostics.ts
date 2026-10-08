@@ -5,6 +5,7 @@ import { getPublishedGeneration } from "./store/consolidation.ts";
 import { localDay } from "./store/jobs.ts";
 import { v1PromptHash } from "./extraction/v1.ts";
 import { v2PromptHash } from "./extraction/v2.ts";
+import { writerObservation } from "./pipeline/writer-observation.ts";
 
 export interface MemoryDiagnostics {
   selectedReadable: boolean;
@@ -63,7 +64,7 @@ export function persistentDiagnostics(db: DatabaseSync, config: MemoryConfig, no
     }
     // Report the latest non-superseded state, including completion, rather than
     // resurfacing an older error after newer work has succeeded.
-    const writer = db.prepare(`SELECT status, error_code, due_at, updated_at FROM jobs
+    const writer = db.prepare(`SELECT job_id, status, error_code, due_at, updated_at FROM jobs
       WHERE kind = 'consolidate' AND memory_version = ?
         AND status != 'superseded'
       ORDER BY updated_at DESC, created_at DESC, job_id LIMIT 1`).get(version);
@@ -80,6 +81,20 @@ export function persistentDiagnostics(db: DatabaseSync, config: MemoryConfig, no
         else consolidation += "; scheduled retry; current admission unknown";
       }
     }
+    const observation = writer ? writerObservation(db, version, String(writer.job_id)) : undefined;
+    if (observation) {
+      const { counting, capacity, currentInputCount, currentInputUnits } = observation.context;
+      lines.push(`${version} writer context (process-local): ${counting.method ?? "not counted"}; policy=${counting.policyVersion}; prompt=${observation.promptHash}; multiplier=${counting.safetyMultiplier}`);
+      if (capacity) lines.push(`${version} capacity: window=${capacity.window} tokens; output reserve=${capacity.outputReserve} tokens; overhead reserve=${capacity.overheadReserve} tokens; soft=${capacity.softLimit}; hard=${capacity.hardLimit}; target=${capacity.compactTarget} tokens`);
+      lines.push(`${version} current request input=${currentInputCount ?? "unknown"} ${currentInputUnits ?? "unknown"}; selected sources=${observation.selectedSources ?? "unknown"}; selected notes=${observation.selectedNotes ?? "unknown"} (selection is not semantic coverage)`,
+        `${version} writer run: ${observation.status}; requests=${observation.requests}; tools=${observation.tools}; compactions=${observation.compactions}; elapsed=${observation.elapsedMs} ms`,
+        `${version} diff: ${observation.diffMode ?? "unknown"}; fallback=${observation.diffFallback ?? "none"}`);
+      const latest = counting.latestObservation;
+      if (latest) lines.push(`${version} observation: input=${latest.observedInputTokens} tokens; request base=${latest.requestBaseEstimate}; ratio=${latest.observedRatio}; applied multiplier=${latest.appliedMultiplier}`);
+      const compact = observation.lastCompaction;
+      if (compact) lines.push(`${version} last compaction: before=${compact.before ?? "unknown"}; after=${compact.after ?? "not installed"} ${compact.units ?? "unknown"}; result=${compact.result}`);
+      if (observation.reason) lines.push(`${version} last run reason / next retry reason: ${observation.reason}; scheduling shown separately (no admission guarantee)`);
+    } else lines.push(`${version} writer context: unavailable (no matching process-local run; counters and estimates are not persisted)`);
     lines.push(consolidation,
       `${version} readable generation: ${generation?.generationId ?? "none"}${!readable && !pipeline?.read_blocked ? " (initialization/publication pending; no eligible generation)" : ""}`);
     if (pipeline?.read_blocked) lines.push(`${version} invalidation reason: ${pipeline.block_reason ?? "unknown"}`);

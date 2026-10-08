@@ -64,7 +64,8 @@ export function prepareGenerationCandidate(input: CandidateInput): GenerationCan
     runWriter(writer) {
       // Forward the original promise: do not add a yield around writer completion or cancellation.
       return runConsolidation({ ...writer, db, directory: staged.directory, lease, config, signal, clock,
-        validateOutputs });
+        validateOutputs, selectionDiagnostics: { selectedSources: snapshot.sources.length, selectedNotes: snapshot.notes.length,
+          diffMode: staged.diffFallback ? "path_index" : "unified", diffFallback: staged.manifest.diffFallbackReason } });
     },
     publish() {
       if (signal.aborted) throw new Error("cancelled");

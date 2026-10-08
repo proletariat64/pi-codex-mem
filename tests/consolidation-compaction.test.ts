@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
 import { createAssistantMessageEventStream, type Api, type AssistantMessage, type JsonObject,
   type Message, type Model, type SystemMessage, type TranscriptContext } from "@earendil-works/pi-ai";
@@ -10,6 +11,7 @@ import { defaultConfig, type MemoryVersion } from "../src/config.ts";
 import { openStateDb } from "../src/store/db.ts";
 import { claimConsolidation } from "../src/store/consolidation.ts";
 import { consolidationPromptHash, runConsolidation } from "../src/pipeline/consolidate.ts";
+import { persistentDiagnostics } from "../src/diagnostics.ts";
 import { createContextCalibrationStore, createContextController } from "../src/pipeline/context-controller.ts";
 import type { ConsolidationModelPort } from "../src/pipeline/model-port.ts";
 import type { ContextCalibrationStore } from "../src/pipeline/context-controller.ts";
@@ -134,6 +136,21 @@ test("CT05: accumulated pages crossing the soft limit compact at the settled sea
   assert.deepEqual(rows.map((row) => row.status), ["charged", "charged", "charged", "charged"]);
   assert.ok(rows[2]!.estimate_input <= HARD, "the compaction request fits its own hard limit");
   assert.ok(rows[3]!.estimate_input <= TARGET, `the replacement is recounted at/below compactTarget (${rows[3]!.estimate_input} > ${TARGET})`);
+  const beforeDoctor = setup.db.prepare("SELECT total_changes() AS n").get()!.n;
+  const report = persistentDiagnostics(setup.db, setup.config, NOW + 2);
+  const lines = report.lines.join("\n");
+  assert.equal(report.selectedReadable, false, "successful working compaction is not a publication");
+  assert.match(lines, /utf8_div4_estimate/);
+  assert.match(lines, /estimated_tokens/);
+  assert.match(lines, /window=60000 tokens/);
+  assert.match(lines, /requests=4; tools=2; compactions=1/);
+  assert.match(lines, /last compaction:.*installed/);
+  assert.match(lines, /observation: input=10 tokens/);
+  assert.doesNotMatch(lines, /Covered:|sk-ABCD|Outputs written|界/);
+  assert.equal(setup.db.prepare("SELECT total_changes() AS n").get()!.n, beforeDoctor, "doctor is read-only");
+  const reader = new DatabaseSync(join(setup.root, "memory/state.sqlite"), { readOnly: true });
+  try { assert.deepEqual(persistentDiagnostics(reader, setup.config, NOW + 2), report,
+    "doctor's separate read-only connection observes the same store's run"); } finally { reader.close(); }
 });
 
 

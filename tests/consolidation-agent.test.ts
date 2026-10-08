@@ -188,14 +188,25 @@ test("cancellation settles when provider ignores abort, retains its reservation 
   assert.deepEqual({ ...charge }, { status: "charged", actual_output: 4_000 });
 });
 
-test("accumulated UTF-8 messages cross the soft limit before a second call without dropping earlier evidence", async (t) => {
+test("accumulated UTF-8 messages cross the soft limit and compact before any further writer transport, keeping a recounted replacement", async (t) => {
   const setup = fixture(t);
-  const { port, calls } = fakePort([reply([{ type: "text", text: "界".repeat(30_000) },
-    tool("workspace_list", {})], "toolUse")]);
+  const { port, calls } = fakePort([
+    reply([{ type: "text", text: "界".repeat(30_000) }, tool("workspace_list", {})], "toolUse"),
+    reply([{ type: "text", text: "Covered: evidence inventory read; outputs still unwritten." }]),
+    reply([{ type: "text", text: "Written." }]),
+  ]);
   port.resolve = () => ({ ...model, contextWindow: 60_000 });
-  assert.deepEqual(await run(setup, port), { status: "blocked", reason: "compaction_limit" });
-  assert.equal(calls.length, 1);
-  assert.equal((setup.db.prepare("SELECT COUNT(*) AS n FROM budget_reservations").get() as { n: number }).n, 1);
+  assert.deepEqual(await run(setup, port), { status: "succeeded" });
+  assert.equal(calls.length, 3);
+  const compaction = calls[1]?.context.messages[0];
+  assert.equal(compaction?.role, "system", "the second transport is the tool-free compaction request");
+  if (compaction?.role !== "system") throw new Error("missing compaction framing");
+  assert.equal(compaction.toolsAdded?.length, undefined, "compaction requests carry no tool declarations");
+  const replaced = calls[2]?.context.messages.map((message: { role: string }) => message.role);
+  assert.deepEqual(replaced, ["system", "assistant", "user"], "framing plus labeled summary plus host continuation");
+  assert.doesNotMatch(JSON.stringify(calls[2]?.context), /界/, "superseded tool payloads are excluded, not silently dropped");
+  assert.equal((setup.db.prepare("SELECT COUNT(*) AS n FROM budget_reservations").get() as { n: number }).n, 3,
+    "the compaction transport consumes an ordinary reservation");
 });
 
 test("unicode-heavy history that fits the window is admitted where the old byte count blocked it", async (t) => {
@@ -207,14 +218,14 @@ test("unicode-heavy history that fits the window is admitted where the old byte 
   assert.equal(calls.length, 2, "90 KB of CJK is ~22.5k estimated tokens, not 90k bytes");
 });
 
-test("foreground work pauses subsequent requests while allowing a budgeted in-flight write to finish", async (t) => {
+test("foreground work pauses returned tool writes and subsequent requests", async (t) => {
   const setup = fixture(t);
   let requests = 0;
   const { port, calls } = fakePort([reply([tool("workspace_write", { path: "MEMORY.md", content: handbook })], "toolUse")]);
   assert.deepEqual(await run(setup, port, { canStartRequest: () => ++requests === 1 ? "ready" : "foreground_active" }),
     { status: "paused", reason: "foreground_active" });
   assert.equal(calls.length, 1);
-  assert.equal(readFileSync(join(setup.directory, "MEMORY.md"), "utf8"), handbook);
+  assert.throws(() => readFileSync(join(setup.directory, "MEMORY.md")), /ENOENT/);
 });
 
 test("a 30-second lease heartbeat aborts a fenced-out request before any provider tool can write", { timeout: 2_000 }, async (t) => {

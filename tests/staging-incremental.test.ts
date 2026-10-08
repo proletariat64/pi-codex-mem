@@ -67,6 +67,38 @@ test("local hunks against a legacy published baseline record the diff policy wit
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("a pathological baseline edit records the computation_limit fallback reason in the manifest", () => {
+  const root = mkdtempSync(join(tmpdir(), "memory-pathological-"));
+  try {
+    const pathological = (prefix: string): string => {
+      const lines: string[] = [];
+      for (let i = 0; i < 30_000; i++) lines.push(i % 2 === 0 ? `u${i}-${prefix}` : "common");
+      return `${lines.map((line) => `${line}\n`).join("")}tail-${prefix}\n`;
+    };
+    const first = buildStaging({ root, jobId: "first", snapshot: snap([source("a", pathological("old"))]), promptHash: "prompt" });
+    writeFileSync(join(first.directory, "MEMORY.md"), "handbook\n");
+    writeFileSync(join(first.directory, "memory_summary.md"), "v1\nsummary\n");
+    publish(first);
+    const prior = first.directory;
+    // Every other line differs, so the bounded diff cannot finish and must
+    // fall back to the complete path index instead of a partial diff.
+    const nextSnap = snap([source("a", pathological("new"))]);
+    const next = buildStaging({ root, jobId: "next", snapshot: nextSnap, promptHash: "prompt", priorDir: prior });
+    assert.equal(next.diffFallback, true);
+    assert.equal(next.manifest.diffFallbackReason, "computation_limit");
+    assert.equal(next.manifest.diffPolicyVersion, 1);
+    const text = readFileSync(join(next.directory, "phase2_workspace_diff.md"), "utf8");
+    assert.match(text, /exceeded its computation limit/);
+    assert.match(text, /- modified: raw_memories\.md/);
+    assert.ok(!text.includes("--- a/"), "no partial diff may be emitted");
+    assert.ok(!text.includes("+u1"), "pathological plaintext leaked into the fallback");
+    assert.ok(Buffer.byteLength(text) < 4096);
+    const repeat = buildStaging({ root, jobId: "repeat", snapshot: nextSnap, promptHash: "prompt", priorDir: prior });
+    assert.equal(readFileSync(join(repeat.directory, "phase2_workspace_diff.md"), "utf8"), text);
+    assert.equal(repeat.manifest.diffFallbackReason, "computation_limit");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("revoked prior plaintext never enters a diff even with oversized content", () => {
   const root = mkdtempSync(join(tmpdir(), "memory-revoked-"));
   const marker = "PRIVATE RETIRED CONTENT";

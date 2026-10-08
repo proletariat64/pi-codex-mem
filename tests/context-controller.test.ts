@@ -69,7 +69,7 @@ const visibleLedger = (noisy = false) => {
 /** Controller fixtures: the 272k-token writer model from spec §1.1. */
 const writer = { provider: "fake", id: "writer", api: "openai-completions", contextWindow: 272_000, maxTokens: 8_192 };
 const matchingCounter = (tokens: number) => ({
-  count: () => ({ tokens, identity: { provider: "fake", modelId: "writer" } }),
+  count: () => ({ tokens, identity: { provider: "fake", modelId: "writer", api: writer.api, policyVersion: policy.version } }),
 });
 const mismatchedCounter = (tokens: number) => ({
   count: () => ({ tokens, identity: { provider: "other-provider", modelId: "sibling-tokenizer" } }),
@@ -161,6 +161,30 @@ test("estimated admission applies the ceiling of baseEstimate times the safety m
   assert.equal(decision.count.units, "estimated_tokens");
   assert.equal(decision.admissionEstimate, 127, "ceil(101 * 1.25)");
   assert.equal(decision.estimateUnits, "estimated_tokens");
+});
+
+test("CT03: exact token counts require explicit matching transport and framing policy identities", () => {
+  for (const assertion of [
+    {},
+    { api: writer.api },
+    { policyVersion: policy.version },
+    { api: "openai-responses", policyVersion: policy.version },
+    { api: writer.api, policyVersion: policy.version + 1 },
+  ]) {
+    const controller = createContextController({ model: writer, counter: {
+      count: () => ({ tokens: 100, identity: { provider: writer.provider, modelId: writer.id, ...assertion } }),
+    } });
+    const decision = controller.admission({ messages: [] });
+    assert.ok(decision.action !== "blocked");
+    assert.equal(decision.count.method, "tokenizer_estimate", JSON.stringify(assertion));
+    assert.equal(decision.count.exact, false);
+    assert.equal(decision.admissionEstimate, 125);
+    controller.observeResult({ usage: { ...hostUsage, input: 200, cacheRead: 0, cacheWrite: 0 },
+      request: decision.count });
+    const calibrated = controller.admission({ messages: [] });
+    assert.ok(calibrated.action !== "blocked");
+    assert.equal(calibrated.admissionEstimate, 200, "identity-mismatched tokenizers still calibrate");
+  }
 });
 
 test("admission is blocked when capacity is unusable or content is unsupported", () => {

@@ -88,7 +88,7 @@ test("calibration store is reused only for the same model/transport/policy ident
 });
 
 test("exact counts record their observation but do not raise the safety multiplier (CT03)", () => {
-  const controller = createContextController({ model: writer, counter: { count: () => ({ tokens: 1_000, identity: { provider: "fake", modelId: "writer" } }) } });
+  const controller = createContextController({ model: writer, counter: { count: () => ({ tokens: 1_000, identity: { provider: "fake", modelId: "writer", api: writer.api, policyVersion: DEFAULT_POLICY.version } }) } });
   const observation = controller.observeResult({
     usage: usage({ input: 1_050 }),
     request: { method: "tokens", baseEstimate: 1_000 },
@@ -106,9 +106,9 @@ test("diagnostics snapshot reports counting policy, multiplier, observation and 
   assert.ok(controller.observeResult({ usage: usage({ input: 1_300 }), request: { method: "utf8_div4_estimate", baseEstimate: 1_000 } }));
   controller.admission({ messages });
   const snapshot = controller.snapshot();
-  assert.deepEqual(snapshot.identity, { provider: "fake", modelId: "writer", api: "openai-completions", policyVersion: 1 });
+  assert.deepEqual(snapshot.identity, { provider: "fake", modelId: "writer", api: "openai-completions", policyVersion: DEFAULT_POLICY.version });
   assert.equal(snapshot.counting.method, "utf8_div4_estimate");
-  assert.equal(snapshot.counting.policyVersion, 1);
+  assert.equal(snapshot.counting.policyVersion, DEFAULT_POLICY.version);
   assert.equal(snapshot.counting.safetyMultiplier, 1.3);
   assert.equal(snapshot.counting.latestObservation?.observedInputTokens, 1_300);
   assert.equal(snapshot.capacity?.window, 272_000);

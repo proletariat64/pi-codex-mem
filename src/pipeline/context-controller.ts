@@ -3,7 +3,7 @@ import { normalizeModelUsage } from "../model-usage.ts";
 
 /** Phase 2 context counting/control, spec docs/spec/consolidation-context-spec-v0.2.0.md §3 and §8. */
 
-export const CONTEXT_COUNTING_POLICY_VERSION = 1;
+export const CONTEXT_COUNTING_POLICY_VERSION = 2;
 
 /** Units are always explicit: exact provider tokens or estimated token units. */
 export type TokenUnits = "tokens" | "estimated_tokens";
@@ -74,10 +74,19 @@ export interface CountingIdentity {
   policyVersion: number;
 }
 
+/** An adapter asserts the model, transport and complete request/framing policy it counted.
+ * Omitted assertions remain usable estimates, never exact provider-token counts. */
+export interface TokenCounterIdentity {
+  provider: string;
+  modelId: string;
+  api?: string;
+  policyVersion?: number;
+}
+
 /** Optional matching-counter seam: a provider adapter's tokenizer, adapted behind the model port. */
 export interface MatchingTokenCounter {
   /** Count the normalized request, declaring the model/transport identity that produced the count. */
-  count(request: NormalizedRequest): { tokens: number; identity: { provider: string; modelId: string; api?: string } } | undefined;
+  count(request: NormalizedRequest): { tokens: number; identity: TokenCounterIdentity } | undefined;
 }
 
 export interface CountOk {
@@ -193,9 +202,9 @@ function countIdentity(model: ControllerModel, policy: ContextCountingPolicy, co
   if (!fallback.ok) return fallback;
   const counted = counter?.count(request);
   if (counted && Number.isSafeInteger(counted.tokens) && counted.tokens > 0) {
-    const { provider, modelId, api } = counted.identity;
+    const { provider, modelId, api, policyVersion } = counted.identity;
     const matches = provider === model.provider && modelId === model.id
-      && (api === undefined || api === model.api);
+      && api === model.api && policyVersion === policy.version;
     if (matches) return { ok: true, count: { ok: true, method: "tokens", units: "tokens", exact: true, baseEstimate: counted.tokens } };
     // A tokenizer for a vaguely related model is an estimate, not exact (spec §3.1).
     return { ok: true, count: { ok: true, method: "tokenizer_estimate", units: "estimated_tokens", exact: false, baseEstimate: counted.tokens } };

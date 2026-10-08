@@ -1,5 +1,7 @@
 # v1 consolidation and publication
 
+Both writers now use [Phase 2 context management](consolidation-context.md), including token-valued admission, bounded compaction and local incremental diffs. See its acceptance record for measured mock evidence and the still-pending real-model semantic gate.
+
 Issue #7 connects existing v1 extractions to a private consolidation Agent and the next session's `pi_memory` prompt section. Development and verification use a fake Pi/model boundary with real temporary Git repositories, JSONL and SQLite; those checks do not establish real-model memory quality.
 
 Automatic work uses one-shot scheduling and pauses new requests while foreground work is active. `/memory run --now` runs eligible extraction followed by consolidation passes for the selected write targets; both phases share the configured daily budgets. The selected version controls reading. Issue #8 adds v2 consolidation and publication through the shared scheduler, with one store-wide writer lease and separate generations. Issue #9 adds the three read-only detail tools described in [retrieval.md](retrieval.md). An unbuilt selected version never falls back to the other version.
@@ -10,7 +12,7 @@ The writer sees only staged evidence, shared notes, supported prior outputs and 
 
 Content hashes cover version, selection and retention policy, prompts, notes, shared epoch and generated outputs. Unchanged content skips the model. A complete changed-path index replaces a unified diff above 4 MiB. When prior support expires or is revoked, the diff contains paths only and never copies prior learning or evidence plaintext. The manifest records the fallback reason.
 
-The writer is limited to five minutes, 12 model calls, 40 tool calls and 4,000 output tokens per call. Each request accounts for its complete accumulated context and reserves the shared daily budget. Missing provider usage keeps the conservative reservation. Invalid output can receive one repair inside the same run and limits. Cancellation, context exhaustion and failed validation discard unpublished staging.
+The writer is limited to five minutes, 12 model calls, 40 tool calls and 4,000 output tokens per call. Each request accounts for its complete accumulated context and reserves the shared daily budget. Missing provider usage keeps the safety-adjusted reservation, which is not a guaranteed upper bound. Invalid output can receive one repair inside the same run and limits. Cancellation, context exhaustion and failed validation discard unpublished staging.
 
 Revision 3 validation follows Codex: require the handbook file and a UTF-8 summary starting with literal `v1`. Heading order, handbook fields, prose references and a 9,999-byte summary cap are not v1 rejection rules. `summaryBytes` is a writer target. The approved Pi addition checks recent index topics belong to project/valid-date groups and older topics to project groups; nested children inherit grouping without repeated citations. Empty indices are valid. Selected evidence/note integrity, physical allowlists and secret scanning remain separate host safeguards; integrity failures do not receive a model repair. No remaining evidence or notes produces deterministic minimal files without requiring all candidates to match those templates. Semantic evaluation, not format validation, checks claims.
 

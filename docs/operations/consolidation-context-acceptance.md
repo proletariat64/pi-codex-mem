@@ -44,8 +44,8 @@ The final measured `make check` run yielded:
 
 | Version | Model | Counting | Sources/notes | Requests | Tools | Compactions | Writer pass wall time | Available |
 |---|---|---|---|---:|---:|---:|---:|---|
-| v1 | mock/acceptance | utf8_div4_estimate | 256 / 1 | 4 | 6 | 1 | 10009.915993 ms | yes |
-| v2 | mock/acceptance | utf8_div4_estimate | 256 / 1 | 4 | 5 | 1 | 1547.28903 ms | yes |
+| v1 | mock/acceptance | utf8_div4_estimate | 256 / 1 | 4 | 6 | 1 | 4506.062125 ms | yes |
+| v2 | mock/acceptance | utf8_div4_estimate | 256 / 1 | 4 | 5 | 1 | 1388.926399 ms | yes |
 
 Times measure `scheduler.runPass`, excluding fixture construction, and are single
 local samples under concurrent suite load, not latency targets or provider timing.
@@ -102,7 +102,7 @@ inconclusive push-only checks; TypeScript's repository gate is the confirmed che
 
 Final gate record after synchronization with integration tip **e6dbad4** (merge
 reported already up to date): `make check` **619/619 passed**, 0 failed/skipped,
-**53,424.134605 ms** suite time, TypeScript passed, **9** upstream files verified.
+**47,230.731045 ms** suite time, TypeScript passed, **9** upstream files verified.
 `npm run test:behavioral`: **60/60** labeled matrix rows passed, 0 missing,
 0 failed/skipped, no unrelated failures. `git diff --check` passed.
 The semantic gate stays pending regardless of these implementation results;

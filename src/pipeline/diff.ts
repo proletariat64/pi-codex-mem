@@ -232,42 +232,81 @@ function splitGroups(ops: readonly Op[]): Group[] {
 
 function renderHunks(ops: readonly Op[], oldLines: readonly FileLine[], newLines: readonly FileLine[]): string[] {
   const hunks: string[] = [];
-  const groups = splitGroups(ops);
-  for (const group of groups) {
-    // Windows in 0-based [start, end) line coordinates with three context lines.
-    const oldStart = group.hasDel ? group.oldFirst - CONTEXT_LINES : group.anchorOld - CONTEXT_LINES;
-    const oldEnd = group.hasDel ? group.oldLast + 1 + CONTEXT_LINES : group.anchorOld + CONTEXT_LINES;
-    const newStart = group.hasIns ? group.newFirst - CONTEXT_LINES : group.anchorNew - CONTEXT_LINES;
-    const newEnd = group.hasIns ? group.newLast + 1 + CONTEXT_LINES : group.anchorNew + CONTEXT_LINES;
-    const ow0 = Math.max(0, oldStart);
-    const ow1 = Math.min(oldLines.length, oldEnd);
-    const nw0 = Math.max(0, newStart);
-    const nw1 = Math.min(newLines.length, newEnd);
-    const lines: string[] = [`@@ -${ow0 + (ow1 > ow0 ? 1 : 0)},${ow1 - ow0} +${nw0 + (nw1 > nw0 ? 1 : 0)},${nw1 - nw0} @@`];
-    for (const op of ops) {
+  const oldLen = oldLines.length;
+  const newLen = newLines.length;
+  for (const group of splitGroups(ops)) {
+    // Consume up to CONTEXT_LINES leading context lines from the same run
+    // directly before the group; a larger run contributes only its last lines.
+    let start = group.firstOp;
+    let lead = CONTEXT_LINES;
+    while (lead > 0 && start > 0) {
+      const previous = ops[start - 1]!;
+      if (previous.t !== 0 || previous.n > lead) break;
+      start--;
+      lead -= previous.n;
+    }
+    const leadOp = lead > 0 && start > 0 && ops[start - 1]!.t === 0 ? start - 1 : -1;
+    const leadLines = leadOp >= 0 ? lead : 0;
+    let end = group.endOp;
+    let tail = CONTEXT_LINES;
+    while (tail > 0 && end < ops.length) {
+      const next = ops[end]!;
+      if (next.t !== 0 || next.n > tail) break;
+      end++;
+      tail -= next.n;
+    }
+    const tailOp = tail > 0 && end < ops.length && ops[end]!.t === 0 ? end : -1;
+    const tailLines = tailOp >= 0 ? tail : 0;
+    // One entry per emitted body line; counts and header starts come from real
+    // emitted lines so the header can never disagree with the body.
+    const entries: { kind: " " | "-" | "+"; text: string; x: number; y: number; marker: boolean }[] = [];
+    const markers: number[] = [];
+    const emitSame = (x: number, y: number): void => {
+      const line = oldLines[x]!;
+      entries.push({ kind: " ", text: line.text, x, y, marker: false });
+      if (x === oldLen - 1 && !line.newline) markers.push(entries.length);
+    };
+    if (leadOp >= 0) {
+      const op = ops[leadOp]!;
+      for (let j = op.n - leadLines; j < op.n; j++) emitSame(op.x + j, op.y + j);
+    }
+    for (let index = start; index < end; index++) {
+      const op = ops[index]!;
       if (op.t === 0) {
-        const from = Math.max(0, Math.min(ow0 - op.x, nw0 - op.y));
-        const until = Math.min(op.n, Math.max(ow1 - op.x, nw1 - op.y));
-        for (let j = from; j < until; j++) {
-          const x = op.x + j;
-          const y = op.y + j;
-          if ((x >= ow0 && x < ow1) || (y >= nw0 && y < nw1)) {
-            lines.push(` ${oldLines[x]!.text}`);
-            if (x === oldLines.length - 1 && !oldLines[x]!.newline) lines.push("\\ No newline at end of file");
-          }
-        }
+        for (let j = 0; j < op.n; j++) emitSame(op.x + j, op.y + j);
       } else if (op.t === 1) {
-        for (let j = Math.max(0, ow0 - op.x); j < Math.min(op.n, ow1 - op.x); j++) {
+        for (let j = 0; j < op.n; j++) {
           const x = op.x + j;
-          lines.push(`-${oldLines[x]!.text}`);
-          if (x === oldLines.length - 1 && !oldLines[x]!.newline) lines.push("\\ No newline at end of file");
+          const line = oldLines[x]!;
+          entries.push({ kind: "-", text: line.text, x, y: -1, marker: false });
+          if (x === oldLen - 1 && !line.newline) markers.push(entries.length);
         }
       } else {
-        for (let j = Math.max(0, nw0 - op.y); j < Math.min(op.n, nw1 - op.y); j++) {
+        for (let j = 0; j < op.n; j++) {
           const y = op.y + j;
-          lines.push(`+${newLines[y]!.text}`);
-          if (y === newLines.length - 1 && !newLines[y]!.newline) lines.push("\\ No newline at end of file");
+          const line = newLines[y]!;
+          entries.push({ kind: "+", text: line.text, x: -1, y, marker: false });
+          if (y === newLen - 1 && !line.newline) markers.push(entries.length);
         }
+      }
+    }
+    if (tailOp >= 0) {
+      const op = ops[tailOp]!;
+      for (let j = 0; j < tailLines; j++) emitSame(op.x + j, op.y + j);
+    }
+    if (!entries.length) continue;
+    const oldSide = entries.filter((entry) => entry.kind !== "+");
+    const newSide = entries.filter((entry) => entry.kind !== "-");
+    const oldText = oldSide.length ? oldSide[0]!.x + 1 : group.anchorOld;
+    const newText = newSide.length ? newSide[0]!.y + 1 : group.anchorNew;
+    const lines: string[] = [`@@ -${oldText},${oldSide.length} +${newText},${newSide.length} @@`];
+    let markerCursor = 0;
+    for (let index = 0; index < entries.length; index++) {
+      const entry = entries[index]!;
+      lines.push(`${entry.kind}${entry.text}`);
+      if (markerCursor < markers.length && markers[markerCursor] === index + 1) {
+        lines.push("\\ No newline at end of file");
+        markerCursor++;
       }
     }
     hunks.push(`${lines.join("\n")}\n`);

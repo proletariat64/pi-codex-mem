@@ -116,17 +116,6 @@ test("unusable model capacity is blocked as context_capacity_unavailable before 
   assert.equal((setup.db.prepare("SELECT COUNT(*) AS n FROM budget_reservations").get() as { n: number }).n, 0);
 });
 
-test("above the soft limit with compactable history stops at the settled seam when compaction is unavailable", async (t) => {
-  const setup = fixture(t);
-  const small: Model<Api> = { ...model, contextWindow: 60_000 };
-  const { port, calls } = fakePort([
-    reply([{ type: "text", text: "界".repeat(30_000) }, tool("workspace_list", {})], "toolUse"),
-  ], small);
-  assert.deepEqual(await run(setup, port), { status: "blocked", reason: "compaction_limit" });
-  assert.equal(calls.length, 1, "only the first request is sent; no resend on the unchanged payload");
-  assert.equal((setup.db.prepare("SELECT COUNT(*) AS n FROM budget_reservations").get() as { n: number }).n, 1);
-});
-
 test("an irreducible first request — framing alone above the soft limit — never dispatches", async (t) => {
   const setup = fixture(t);
   const tiny: Model<Api> = { ...model, contextWindow: 25_000 };

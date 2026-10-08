@@ -218,14 +218,14 @@ test("unicode-heavy history that fits the window is admitted where the old byte 
   assert.equal(calls.length, 2, "90 KB of CJK is ~22.5k estimated tokens, not 90k bytes");
 });
 
-test("foreground work pauses subsequent requests while allowing a budgeted in-flight write to finish", async (t) => {
+test("foreground work pauses returned tool writes and subsequent requests", async (t) => {
   const setup = fixture(t);
   let requests = 0;
   const { port, calls } = fakePort([reply([tool("workspace_write", { path: "MEMORY.md", content: handbook })], "toolUse")]);
   assert.deepEqual(await run(setup, port, { canStartRequest: () => ++requests === 1 ? "ready" : "foreground_active" }),
     { status: "paused", reason: "foreground_active" });
   assert.equal(calls.length, 1);
-  assert.equal(readFileSync(join(setup.directory, "MEMORY.md"), "utf8"), handbook);
+  assert.throws(() => readFileSync(join(setup.directory, "MEMORY.md")), /ENOENT/);
 });
 
 test("a 30-second lease heartbeat aborts a fenced-out request before any provider tool can write", { timeout: 2_000 }, async (t) => {

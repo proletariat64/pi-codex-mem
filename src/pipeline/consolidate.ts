@@ -601,7 +601,7 @@ export async function runConsolidation(input: ConsolidationRunInput): Promise<Co
       tools: createWorkspaceTools(input.directory, { memoryVersion: version, responseBytes: Math.min(input.config.limits.toolResponseBytes, 16_384) }),
       thinkingLevel: "off" }, streamFn, toolExecution: "sequential",
       beforeToolCall: async () => {
-        if (!fence() || result) return { block: true, reason: result?.reason ?? "writer_stopped", terminate: true };
+        if (!fence() || result || !readinessGate()) return { block: true, reason: result?.reason ?? "writer_stopped", terminate: true };
         return undefined;
       }, finishTurn: (turn) => {
         if (result) return { action: "end" };

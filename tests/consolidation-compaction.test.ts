@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createAssistantMessageEventStream, type Api, type AssistantMessage, type JsonObject,
@@ -352,6 +352,31 @@ test("§7.2: overflow recovery with nothing compactable stops before any resend"
   assert.deepEqual(await run(setup, port), { status: "blocked", reason: "provider_context_overflow" });
   assert.equal(calls.length, 1, "no compaction of irreducible framing and no resend");
 });
+
+for (const reason of ["foreground_active", "configuration_changed"] as const) {
+  test(`CT07: ${reason} after a provider tool-call reply pauses before workspace execution`, async (t) => {
+    const setup = fixture(t);
+    let readiness: "ready" | "foreground_active" = "ready";
+    const { port, calls } = scriptedPort([
+      () => {
+        const response = reply([tool("workspace_write", {
+          path: "MEMORY.md", content: "Must not be written after readiness loss.",
+        })], "toolUse");
+        // Lose readiness at the provider response boundary, after dispatch admission
+        // but before the Agent can execute the returned workspace tool call.
+        if (reason === "configuration_changed") setup.config.generate = false;
+        else readiness = "foreground_active";
+        return response;
+      },
+      () => { throw new Error("no provider dispatch after readiness loss"); },
+    ]);
+    const result = await run(setup, port, { canStartRequest: () => readiness });
+    assert.equal(existsSync(join(setup.directory, "MEMORY.md")), false,
+      "readiness loss prevents the returned workspace write");
+    assert.deepEqual(result, { status: "paused", reason });
+    assert.equal(calls.length, 1, "no subsequent provider dispatch");
+  });
+}
 
 // --- CT07: mid-compaction fence checks with a cancellation-ignoring transport ---
 const waitFor = async (predicate: () => boolean) => {

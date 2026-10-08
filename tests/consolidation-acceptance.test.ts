@@ -135,6 +135,39 @@ for (const version of ["v1", "v2"] as const) {
       dailyInput: 1_000_000, dailyOutput: 50_000, dailyRequests: 12, semanticCoverage: "not measured" }));
   });
 
+  test(`CT11 ${version}: revoked baseline plaintext never reaches rebuilt diffs, compactor requests or publication`, async (t) => {
+    const f = fixture(t, version); f.source("source-000"); f.note();
+    const sentinel = "REVOKED_BASELINE_PRIVATE_SENTINEL";
+    f.script([
+      () => reply([
+        ...(version === "v1" ? [tool("handbook", "workspace_write", { path: "MEMORY.md", content: `# Memory\\n\\n${sentinel}\\n` })] : []),
+        tool("summary", "workspace_write", { path: "memory_summary.md", content: MINIMAL_V1_SUMMARY.replace("## User Profile\n", `## User Profile\n- ${sentinel}\n`) }),
+      ], "toolUse"), () => reply([{ type: "text", text: "Done" }]),
+    ]);
+    assert.deepEqual(await f.scheduler.runPass(), [{ status: "published" }]);
+    assert.equal(forgetEvidence({ root: f.root, db: f.db, kind: "source", id: "source-000", now: NOW }).forgotten, true);
+    f.source("source-001");
+    const rebuiltStart = f.calls.length;
+    f.script([
+      f.largeTurn,
+      context => { assert.doesNotMatch(JSON.stringify(context), new RegExp(sentinel)); return reply([{ type: "text", text: "Derived new eligible evidence only." }]); },
+      context => {
+        assert.doesNotMatch(JSON.stringify(context), new RegExp(sentinel));
+        return reply([
+          ...(version === "v1" ? [tool("handbook", "workspace_write", { path: "MEMORY.md", content: "# Memory\\n\\nNew eligible evidence.\\n" })] : []),
+          tool("summary", "workspace_write", { path: "memory_summary.md", content: MINIMAL_V1_SUMMARY }),
+        ], "toolUse");
+      }, () => reply([{ type: "text", text: "Done" }]),
+    ]);
+    assert.deepEqual(await f.scheduler.runPass(), [{ status: "published" }]);
+    assert.equal(f.calls.length - rebuiltStart, 4);
+    for (const request of f.calls.slice(rebuiltStart)) assert.doesNotMatch(JSON.stringify(request), new RegExp(sentinel));
+    const published = getPublishedGeneration(f.db, version, NOW); assert.ok(published);
+    const manifest = JSON.parse(readFileSync(join(published.directory, "manifest.json"), "utf8"));
+    assert.deepEqual(manifest.sources.map((source: { sourceId: string }) => source.sourceId), ["source-001"]);
+    for (const path of Object.keys(manifest.fileHashes)) assert.doesNotMatch(readFileSync(join(published.directory, path), "utf8"), new RegExp(sentinel));
+  });
+
   test(`CT13 ${version}: upgrade and rollback preserve notes, enrollment, charged usage and legacy hash-verified manifests`, async (t) => {
     const f = fixture(t, version); f.config.schedule.maxConsolidationSources = 8;
     f.source("source-000"); const note = f.note();

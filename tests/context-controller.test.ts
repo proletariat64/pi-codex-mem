@@ -4,6 +4,7 @@ import type { Message } from "@earendil-works/pi-ai";
 import {
   DEFAULT_CONTEXT_COUNTING_POLICY,
   countModelVisibleRequest,
+  createContextController,
   deriveModelCapacity,
 } from "../src/pipeline/context-controller.ts";
 
@@ -64,6 +65,116 @@ const visibleLedger = (noisy = false) => {
   ];
   return { messages, expected };
 };
+
+/** Controller fixtures: the 272k-token writer model from spec §1.1. */
+const writer = { provider: "fake", id: "writer", api: "openai-completions", contextWindow: 272_000, maxTokens: 8_192 };
+const matchingCounter = (tokens: number) => ({
+  count: () => ({ tokens, identity: { provider: "fake", modelId: "writer" } }),
+});
+const mismatchedCounter = (tokens: number) => ({
+  count: () => ({ tokens, identity: { provider: "other-provider", modelId: "sibling-tokenizer" } }),
+});
+
+/** CT01: a settled tool transcript whose evidence body is ~404 KB of English text. */
+const english404kb = (() => {
+  const sentence = "The consolidated writer preserves decided facts, corrections and conflicts across sessions. ";
+  const body = sentence.repeat(Math.ceil((404 * 1024) / Buffer.byteLength(sentence))).slice(0, 404 * 1024);
+  const tool = { name: "read_file", description: "Read a file from the staged workspace.",
+    parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } };
+  const messages: Message[] = [
+    { role: "system", content: "You are the consolidation writer for this staged workspace.",
+      sections: { boundaries: "Preserve corrections and conflicts verbatim." }, toolsAdded: [tool], timestamp: 1 },
+    { role: "user", content: "Consolidate this staged workspace; read phase2_workspace_diff.md first.", timestamp: 2 },
+    { role: "assistant", usage: hostUsage, api: "openai-completions", provider: "fake", model: "writer",
+      stopReason: "toolUse", timestamp: 3,
+      content: [{ type: "text", text: "Reading the diff first." },
+        { type: "toolCall", id: "call-1", name: "read_file", arguments: { path: "phase2_workspace_diff.md" } }] },
+    { role: "toolResult", toolCallId: "call-1", toolName: "read_file", isError: false, timestamp: 4,
+      content: [{ type: "text", text: body }] },
+  ];
+  return messages;
+})();
+
+test("CT01: 272k window admits a ~404 KB English request under estimated admission while the old byte compare rejects it", () => {
+  const controller = createContextController({ model: writer });
+  // The §1.1 regression, reproduced at module level: bytes, not tokens, cross the old gate.
+  const legacyBytes = Buffer.byteLength(JSON.stringify({ messages: english404kb }), "utf8");
+  const legacyLimit = Math.floor((272_000 - 4_000 - 1_024) * 0.7);
+  assert.ok(legacyBytes > legacyLimit, `legacy byte compare rejects at ${legacyBytes} > ${legacyLimit}`);
+  assert.ok(legacyBytes >= 404 * 1024);
+  const decision = controller.admission({ messages: english404kb });
+  assert.equal(decision.action, "admit");
+  assert.ok(decision.count.ok);
+  assert.equal(decision.count.method, "utf8_div4_estimate");
+  assert.equal(decision.count.units, "estimated_tokens");
+  assert.ok(decision.admissionEstimate > Math.ceil((404 * 1024) / 4) * 1.25,
+    "full framing and reserves are included, not just the body");
+  assert.ok(decision.admissionEstimate <= decision.capacity.softLimit);
+  assert.equal(decision.estimateUnits, "estimated_tokens");
+});
+
+test("CT01: exact-count mode admits the same request through a matching counter", () => {
+  const controller = createContextController({ model: writer, counter: matchingCounter(101_000) });
+  const decision = controller.admission({ messages: english404kb });
+  assert.equal(decision.action, "admit");
+  assert.ok(decision.count.ok);
+  assert.equal(decision.count.method, "tokens");
+  assert.equal(decision.count.units, "tokens");
+  assert.equal(decision.count.exact, true);
+  assert.equal(decision.admissionEstimate, 101_000);
+  assert.equal(decision.estimateUnits, "tokens");
+});
+
+// Bands: soft=186_883, hard=240_278, compactTarget=133_488 for the 272k window.
+test("admission bands: at/below soft admits; above soft compacts at the next safe seam", () => {
+  const at = (tokens: number, mode?: "ordinary" | "compaction") =>
+    createContextController({ model: writer, counter: matchingCounter(tokens) }).admission({ messages: [] }, { mode });
+  assert.equal(at(133_488).action, "admit");
+  assert.equal(at(186_883).action, "admit");
+  const soft = at(186_884);
+  assert.equal(soft.action, "compact");
+  assert.equal(soft.atOrAboveHardLimit, false);
+  const atHard = at(240_278);
+  assert.equal(atHard.action, "compact");
+  assert.equal(atHard.atOrAboveHardLimit, false);
+  const aboveHard = at(240_279);
+  assert.equal(aboveHard.action, "compact");
+  assert.equal(aboveHard.atOrAboveHardLimit, true, "no ordinary request may be sent above the hard limit");
+});
+
+test("admission bands: compaction requests use their own hard limit", () => {
+  const at = (tokens: number) =>
+    createContextController({ model: writer, counter: matchingCounter(tokens) }).admission({ messages: [] }, { mode: "compaction" });
+  assert.equal(at(240_278).action, "admit");
+  const oversized = at(240_279);
+  assert.equal(oversized.action, "blocked");
+  assert.equal(oversized.reason, "compaction_input_oversized");
+});
+
+test("estimated admission applies the ceiling of baseEstimate times the safety multiplier", () => {
+  const controller = createContextController({ model: writer, counter: mismatchedCounter(101) });
+  const decision = controller.admission({ messages: [] });
+  assert.equal(decision.action, "admit");
+  assert.ok(decision.count.ok);
+  assert.equal(decision.count.method, "tokenizer_estimate", "wrong tokenizer identity is an estimate, not exact (CT03)");
+  assert.equal(decision.count.exact, false);
+  assert.equal(decision.count.units, "estimated_tokens");
+  assert.equal(decision.admissionEstimate, 127, "ceil(101 * 1.25)");
+  assert.equal(decision.estimateUnits, "estimated_tokens");
+});
+
+test("admission is blocked when capacity is unusable or content is unsupported", () => {
+  const broken = createContextController({ model: { ...writer, contextWindow: -1 } });
+  const capacityDecision = broken.admission({ messages: [] });
+  assert.equal(capacityDecision.action, "blocked");
+  assert.equal(capacityDecision.reason, "context_capacity_unavailable");
+  const controller = createContextController({ model: writer });
+  const binary = controller.admission({ messages: [
+    { role: "user", content: [{ type: "image", data: "b", mimeType: "image/png" }], timestamp: 1 },
+  ] as Message[] });
+  assert.equal(binary.action, "blocked");
+  assert.equal(binary.reason, "unsupported_content");
+});
 
 test("countModelVisibleRequest counts instructions, tools, calls, arguments and results exactly once (CT02)", () => {
   const { messages, expected } = visibleLedger();

@@ -218,6 +218,29 @@ test("a diff crossing the 4 MiB ceiling mid-manifest yields the complete index w
   assert.ok(Buffer.byteLength(diff.text) < 4096);
 });
 
+test("the complete rendered diff includes heading, index and UTF-8 bytes in its 4 MiB ceiling", () => {
+  const path = "rollout_summaries/source.md";
+  // This single added unterminated line has 153 bytes of heading/index/hunk framing.
+  const fits = workspaceDiff(new Map(), new Map([[path, "x".repeat(4_194_151)]]));
+  assert.equal(Buffer.byteLength(fits.text), 4_194_304);
+  assert.equal(fits.fallback, false, "exactly at the ceiling is allowed");
+  for (const body of ["x".repeat(4_194_200), "x".repeat(4_194_151) + "x",
+    "x".repeat(4_194_150) + "界"]) {
+    const diff = workspaceDiff(new Map(), new Map([[path, body]]));
+    assert.equal(diff.fallback, true);
+    assert.equal(diff.reason, "size");
+    assert.match(diff.text, /Complete changed-path index:/);
+    assert.match(diff.text, /- added: rollout_summaries\/source\.md/);
+    assert.doesNotMatch(diff.text, /\+\+\+|xxx|界/);
+  }
+  // Additional index entries and section separators also belong to the full bound.
+  const many = workspaceDiff(new Map([["gone.md", ""]]),
+    new Map([[path, "x".repeat(4_194_151)], ["empty.md", ""]]));
+  assert.equal(many.reason, "size");
+  assert.deepEqual(many.text.split("\n").filter(line => /^- (added|deleted): /.test(line)),
+    ["- added: empty.md", "- deleted: gone.md", `- added: ${path}`]);
+});
+
 test("randomized line edits round-trip through the unified diff and stay deterministic", () => {
   // Deterministic xorshift PRNG: the test vetoes machine- or run-dependent output.
   let state = 0x2f6e2b1;

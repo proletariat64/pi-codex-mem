@@ -114,7 +114,11 @@ export function workspaceDiff(prior: Map<string, string>, next: Map<string, stri
   }
   if (!reason) {
     // Sections can be empty when every change involves empty files.
-    return { text: sections.length ? `# Workspace changes\n\n${indexLines(changes)}\n\n${sections.join("\n")}` : `# Workspace changes\n\n${indexLines(changes)}\n`, fallback: false, reason: null };
+    const text = sections.length ? `# Workspace changes\n\n${indexLines(changes)}\n\n${sections.join("\n")}` : `# Workspace changes\n\n${indexLines(changes)}\n`;
+    if (Buffer.byteLength(text, "utf8") <= 4 * 1024 * 1024) return { text, fallback: false, reason: null };
+    // The ceiling covers headings, the authoritative index and separators too.
+    // Discard all plaintext detail; never truncate the complete changed-path index.
+    reason = "size";
   }
   const notice = reason === "size"
     ? "Unified diff omitted: output exceeds the 4 MiB ceiling. Read every added or modified staged file separately and remove claims supported only by deleted inputs. "

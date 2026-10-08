@@ -24,14 +24,27 @@ const smallWindow: Model<Api> = { ...model, contextWindow: 60_000 };
 const SOFT = Math.floor((60_000 - 4_000 - 1_024) * 0.7);
 const HARD = Math.floor((60_000 - 4_000 - 1_024) * 0.9);
 const TARGET = Math.floor((60_000 - 4_000 - 1_024) * 0.5);
+/** Segmented-fixture window: I = 38_976; soft = 27_283; hard = 35_078; target = 19_488.
+ *  The writer's irreducible framing counts ~14,100 estimated units, so a clean-slate
+ *  replacement with two small labeled summaries still fits the install target. */
+const segmentWindow: Model<Api> = { ...model, contextWindow: 44_000 };
+const SEG_HARD = Math.floor((44_000 - 4_000 - 1_024) * 0.9);
+const SEG_TARGET = Math.floor((44_000 - 4_000 - 1_024) * 0.5);
+/** Full-mode no-progress window: target 19,988 leaves room for framing plus only a
+ *  short summary, so a valid but long summary fails the target honestly. */
+const noProgressWindow: Model<Api> = { ...model, contextWindow: 45_000 };
 
-function fixture(t: test.TestContext, memoryVersion: MemoryVersion = "v1") {
+function fixture(t: test.TestContext, memoryVersion: MemoryVersion = "v1", options?: { bigDiff?: boolean }) {
   const root = mkdtempSync(join(tmpdir(), "pi-context-compaction-"));
   const repo = join(root, "repo"); mkdirSync(repo); execFileSync("git", ["init", "-q"], { cwd: repo });
   const directory = join(root, "staging"); mkdirSync(directory); mkdirSync(join(directory, "rollout_summaries"));
   writeFileSync(join(directory, "rollout_summaries/source.md"), "User adopted TypeScript.");
   if (memoryVersion === "v1") writeFileSync(join(directory, "raw_memories.md"), "TypeScript was adopted.");
-  writeFileSync(join(directory, "phase2_workspace_diff.md"), "Added rollout_summaries/source.md");
+  if (options?.bigDiff) {
+    // A ~42 KB CJK diff makes one full workspace_read page return ~16 KiB of tool text.
+    const line = "\u754c".repeat(64) + " evidence line";
+    writeFileSync(join(directory, "phase2_workspace_diff.md"), Array.from({ length: 200 }, () => line).join("\n"));
+  } else writeFileSync(join(directory, "phase2_workspace_diff.md"), "Added rollout_summaries/source.md");
   const db = openStateDb(join(root, "memory"));
   t.after(() => { db.close(); rmSync(root, { recursive: true, force: true }); });
   const config = defaultConfig("UTC");
@@ -54,15 +67,15 @@ function tool(name: string, args: JsonObject = {}, id = name) {
 type Step = (call: { context: TranscriptContext; options?: unknown }) =>
   AssistantMessage | Promise<AssistantMessage>;
 
-function scriptedPort(steps: Step[]) {
+function scriptedPort(steps: Array<Step | AssistantMessage>, portModel: Model<Api> = smallWindow) {
   const calls: { context: TranscriptContext; options?: unknown }[] = [];
-  const port: ConsolidationModelPort = { resolve: () => smallWindow, stream: (_model, context, options) => {
+  const port: ConsolidationModelPort = { resolve: () => portModel, stream: (_model, context, options) => {
     calls.push({ context: structuredClone(context), options });
     const step = steps[calls.length - 1];
     if (!step) throw new Error(`Unexpected port call #${calls.length}`);
     const bounded = createAssistantMessageEventStream();
     void (async () => {
-      const message = await step({ context, options });
+      const message = typeof step === "function" ? await step({ context, options }) : step;
       if (message.stopReason === "error" || message.stopReason === "aborted") {
         bounded.push({ type: "error", reason: message.stopReason, error: message });
       } else {
@@ -123,3 +136,156 @@ test("CT05: accumulated pages crossing the soft limit compact at the settled sea
   assert.ok(rows[3]!.estimate_input <= TARGET, `the replacement is recounted at/below compactTarget (${rows[3]!.estimate_input} > ${TARGET})`);
 });
 
+
+// --- §5.2 segmented fallback: shared burst script on the segmentWindow fixture ---
+// Turn 1 (small): ~6k units of CJK plus a listing widens the fit band so the burst
+// unit fits the compactor alone while the full history cannot. Turn 2 burst: ~24.5k
+// units in one settled unit (text plus one ~16 KiB read page, results counted whole).
+const segmentTurn1 = () => reply([{ type: "text", text: "\u754c".repeat(7_300) }, tool("workspace_list")], "toolUse");
+const segmentBurstTurn = (text = 22_000) =>
+  reply([{ type: "text", text: "\u754c".repeat(text) }, tool("workspace_read", { path: "phase2_workspace_diff.md" })], "toolUse");
+const smallSummary = (marker: string) =>
+  reply([{ type: "text", text: `Summary ${marker}: decisions, references, corrections and next reads.` }]);
+
+test("CT06: first segment above target and second below install exactly once atomically", async (t) => {
+  const setup = fixture(t, "v1", { bigDiff: true });
+  const { port, calls } = scriptedPort([
+    segmentTurn1(),
+    segmentBurstTurn(),
+    (call) => {
+      assert.ok(isCompactionCall(call), "segment 1 is a tool-free compaction request");
+      assert.ok(!JSON.stringify(call.context.messages.slice(1)).includes("workspace_read"),
+        "the oversized burst unit is excluded from the oldest contiguous range");
+      return smallSummary("one");
+    },
+    (call) => {
+      assert.ok(isCompactionCall(call), "segment 2 is a tool-free compaction request");
+      assert.match(JSON.stringify(call.context.messages), /phase2_workspace_diff\.md/,
+        "segment 2 covers the contiguous burst unit, call and results whole");
+      return smallSummary("two");
+    },
+    (call) => {
+      const roles = call.context.messages.map((m) => m.role);
+      assert.deepEqual(roles, ["system", "assistant", "assistant", "user"],
+        "framing + two labeled summaries + host continuation, installed once");
+      const summaries = call.context.messages.filter((m) => m.role === "assistant");
+      assert.equal(summaries.length, 2);
+      for (const summary of summaries) {
+        const text = (summary as AssistantMessage).content[0]!;
+        assert.equal(text.type, "text");
+        assert.match((text as { text: string }).text, /^\[Derived working-context summary\]/);
+      }
+      return reply([{ type: "text", text: "Outputs written." }]);
+    },
+  ], segmentWindow);
+  assert.deepEqual(await run(setup, port), { status: "succeeded" });
+  assert.equal(calls.length, 5, "writer, writer, segment, segment, resumed writer");
+  const rows = reservations(setup.db) as { estimate_input: number; status: string }[];
+  assert.equal(rows.length, 5);
+  assert.deepEqual(rows.map((row) => row.status), Array.from({ length: 5 }, () => "charged"));
+  assert.ok(rows[3]!.estimate_input <= SEG_HARD, "each segment request fits the compactor's own hard limit");
+  assert.ok(rows[4]!.estimate_input <= SEG_TARGET, `the installed replacement is at/below target (${rows[4]!.estimate_input})`);
+});
+
+test("CT06: readiness lost on the second segment installs nothing", async (t) => {
+  const setup = fixture(t, "v1", { bigDiff: true });
+  let readiness: "ready" | "configuration_changed" = "ready";
+  const { port, calls } = scriptedPort([
+    segmentTurn1(),
+    segmentBurstTurn(),
+    () => { readiness = "configuration_changed"; return smallSummary("one"); }, // flip while the segment-2 seam re-checks
+    () => { throw new Error("segment 2 must not dispatch after ownership loss"); },
+  ], segmentWindow);
+  assert.deepEqual(await run(setup, port, { canStartRequest: () => readiness }),
+    { status: "paused", reason: "configuration_changed" });
+  assert.equal(calls.length, 3, "live history is unchanged: no second segment, no resumed writer request");
+  assert.equal((setup.db.prepare("SELECT COUNT(*) AS n FROM budget_reservations").get() as { n: number }).n, 3);
+});
+
+test("CT06/CT14: denied daily compactor budget on the second segment installs nothing and defers honestly", async (t) => {
+  const setup = fixture(t, "v1", { bigDiff: true });
+  setup.config.limits.dailyInputTokens = 28_500;
+  const { port, calls } = scriptedPort([
+    segmentTurn1(),
+    segmentBurstTurn(),
+    () => smallSummary("one"),
+    () => { throw new Error("segment 2 must not dispatch when daily admission denies"); },
+  ], segmentWindow);
+  const result = await run(setup, port);
+  assert.deepEqual(result, { status: "budget_deferred", reason: "input_budget" });
+  assert.equal(calls.length, 3);
+  assert.equal((setup.db.prepare("SELECT COUNT(*) AS n FROM budget_reservations").get() as { n: number }).n, 3,
+    "the failed compaction keeps the prior state unpublished-by-staging and charges only spent transports");
+  assert.doesNotMatch(JSON.stringify(setup.db.prepare("SELECT * FROM jobs").all()), /Summary one/, "no generated body in logs");
+  assert.equal((setup.db.prepare("SELECT COUNT(*) AS n FROM generations").get() as { n: number }).n, 0);
+});
+
+test("CT06: one oversized unit cannot fit the compactor and ends context_irreducible", async (t) => {
+  const setup = fixture(t, "v1", { bigDiff: true });
+  const { port, calls } = scriptedPort([
+    segmentTurn1(),
+    segmentBurstTurn(28_000),
+    () => smallSummary("one"),
+    () => { throw new Error("the oversized unit must never be dispatched"); },
+  ], segmentWindow);
+  assert.deepEqual(await run(setup, port), { status: "blocked", reason: "context_irreducible" });
+  assert.equal(calls.length, 3);
+  assert.doesNotMatch(JSON.stringify(calls[2]?.context), /Outputs written/, "nothing installs over a live unchanged history");
+});
+
+test("CT06: exhausted 2-per-lease slots end compaction_limit with nothing installed", async (t) => {
+  const setup = fixture(t, "v1", { bigDiff: true });
+  const { port, calls } = scriptedPort([
+    segmentTurn1(),
+    segmentBurstTurn(),
+    () => reply([{ type: "text", text: "Summary one: short decisions and reads." }]),
+    // A valid (within the 16 KiB cap) but long second summary keeps the candidate above target.
+    () => reply([{ type: "text", text: 'Summary two: ' + "\u754c".repeat(5_400) }]),
+    () => { throw new Error("the third slot must never dispatch"); },
+  ], segmentWindow);
+  assert.deepEqual(await run(setup, port), { status: "blocked", reason: "compaction_limit" });
+  assert.equal(calls.length, 4);
+  assert.equal((setup.db.prepare("SELECT COUNT(*) AS n FROM budget_reservations").get() as { n: number }).n, 4);
+});
+
+test("CT06: an unchanged-size segment summary discards the candidate with compaction_no_progress", async (t) => {
+  const setup = fixture(t, "v1", { bigDiff: true });
+  const { port, calls } = scriptedPort([
+    () => reply([{ type: "text", text: "\u754c".repeat(2_000) }, tool("workspace_list")], "toolUse"),
+    () => reply([{ type: "text", text: "\u754c".repeat(25_000) }, tool("workspace_read", { path: "phase2_workspace_diff.md" })], "toolUse"),
+    // A same-size summary of the oldest range: valid but without measurable reduction.
+    () => reply([{ type: "text", text: "Same-size: " + "\u754c".repeat(5_400) }]),
+  ], segmentWindow);
+  assert.deepEqual(await run(setup, port), { status: "blocked", reason: "compaction_no_progress" });
+  assert.equal(calls.length, 3, "the failing segment ends the attempt without dispatching the candidate");
+});
+
+test("CT06: full-mode invalid summary output ends compaction_output_invalid (empty, length-capped, oversized)", async (t) => {
+  for (const response of [
+    reply([]),                                         // completed but empty text
+    reply([{ type: "text", text: "cut off mid-sentence" }], "length"), // output-cap hit
+    reply([{ type: "text", text: "\u754c".repeat(6_000) }]),            // > 16 KiB representation
+  ]) {
+    const setup = fixture(t);
+    const { port, calls } = scriptedPort([
+      reply([{ type: "text", text: "\u754c".repeat(12_000) }, tool("workspace_list")], "toolUse"),
+      reply([{ type: "text", text: "\u754c".repeat(30_000) }, tool("workspace_list")], "toolUse"),
+      () => response,
+    ]);
+    assert.deepEqual(await run(setup, port), { status: "blocked", reason: "compaction_output_invalid" },
+      `invalid summary must end the attempt (${JSON.stringify(response.stopReason)})`);
+    assert.equal(calls.length, 3);
+  }
+});
+
+test("CT06: a full-mode summary that cannot cross the compact target ends compaction_no_progress", async (t) => {
+  const setup = fixture(t);
+  const { port, calls } = scriptedPort([
+    reply([{ type: "text", text: "\u754c".repeat(5_600) }, tool("workspace_list")], "toolUse"),
+    reply([{ type: "text", text: "\u754c".repeat(5_600) }, tool("workspace_list")], "toolUse"),
+    // A valid (~15 KiB, within cap) but long summary that cannot reach the target.
+    () => reply([{ type: "text", text: "\u754c".repeat(5_000) }]),
+  ], noProgressWindow);
+  assert.deepEqual(await run(setup, port), { status: "blocked", reason: "compaction_no_progress" });
+  assert.equal(calls.length, 3);
+});

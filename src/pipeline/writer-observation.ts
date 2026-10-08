@@ -8,6 +8,8 @@ import type { ContextDiagnostics, TokenUnits } from "./context-controller.ts";
 export interface WriterObservation {
   jobId: string;
   promptHash: string;
+  compactionPolicyVersion: number;
+  diffPolicyVersion: number;
   context: ContextDiagnostics;
   selectedSources?: number;
   selectedNotes?: number;

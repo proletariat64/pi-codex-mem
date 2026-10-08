@@ -172,6 +172,8 @@ test("CT05: accumulated pages crossing the soft limit compact at the settled sea
   assert.equal(report.selectedReadable, false, "successful working compaction is not a publication");
   assert.match(lines, /utf8_div4_estimate/);
   assert.match(lines, /estimated_tokens/);
+  assert.match(lines, /compactionPolicy=1; diffPolicy=1/);
+  assert.match(lines, /model=mock\/writer; transport=openai-completions/);
   assert.match(lines, /window=60000 tokens/);
   assert.match(lines, /requests=4; tools=2; compactions=1/);
   assert.match(lines, /last compaction:.*installed/);

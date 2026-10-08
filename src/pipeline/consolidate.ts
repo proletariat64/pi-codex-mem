@@ -54,6 +54,7 @@ const OUTPUT_TOKENS = 4_000;
 const MAX_COMPACTIONS = 2;
 /** §5: summary representation limit, a byte cap separate from token limits. */
 const COMPACTION_SUMMARY_BYTES = 16_384;
+const COMPACTION_POLICY_VERSION = 1;
 /** Label identifying a host-derived summary inside working history (§5.1: derived
  * assistant context, never authoritative user or tool data). */
 const COMPACTION_SUMMARY_LABEL = "[Derived working-context summary]";
@@ -79,7 +80,7 @@ export function consolidationPromptHash(config: MemoryConfig, version: MemoryVer
     timeoutMs: TOTAL_TIMEOUT_MS, outputTokens: OUTPUT_TOKENS,
     outputAllowlist: version === "v1" ? ["MEMORY.md", "memory_summary.md", "skills/<slug>/SKILL.md"] : ["memory_summary.md"],
     toolExecution: "sequential", countingPolicy: DEFAULT_CONTEXT_COUNTING_POLICY,
-    compactionPolicy: { version: 1, maxCompactions: MAX_COMPACTIONS, summaryBytes: COMPACTION_SUMMARY_BYTES,
+    compactionPolicy: { version: COMPACTION_POLICY_VERSION, maxCompactions: MAX_COMPACTIONS, summaryBytes: COMPACTION_SUMMARY_BYTES,
       instruction: COMPACTION_INSTRUCTION, label: COMPACTION_SUMMARY_LABEL,
       continuation: continuationInstruction(version), overflowRecoveries: 1 },
     diffPolicyVersion: DIFF_POLICY_VERSION,
@@ -247,6 +248,7 @@ export async function runConsolidation(input: ConsolidationRunInput): Promise<Co
   const observe = () => {
     try { recordWriterObservation(input.db, version, {
       jobId: input.lease.jobId, promptHash: input.lease.promptHash, context: contextController.snapshot(),
+      compactionPolicyVersion: COMPACTION_POLICY_VERSION, diffPolicyVersion: DIFF_POLICY_VERSION,
       ...input.selectionDiagnostics, requests: calls, tools, compactions,
       elapsedMs: Math.max(0, clock() - startedAt), status: result?.status ?? "running",
       reason: result?.reason, lastCompaction,

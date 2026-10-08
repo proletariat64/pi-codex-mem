@@ -336,6 +336,37 @@ export async function runConsolidation(input: ConsolidationRunInput): Promise<Co
       resolve();
     }, { once: true });
   });
+  /** Shared transport bookkeeping; admission/fences and response handling stay at their own seams. */
+  const reserveRequest = (admissionEstimate: number): string | undefined => {
+    const id = randomUUID();
+    let budget: ReturnType<typeof reserveModelCall>;
+    try {
+      budget = reserveModelCall(input.db, { id, now: clock(), timezone: input.config.timezone,
+        provider: model.provider, model: model.id, estimate: { input: admissionEstimate, output: maxTokens },
+        limits: { input: input.config.limits.dailyInputTokens, output: input.config.limits.dailyOutputTokens,
+          requests: input.config.limits.dailyRequests } });
+    } catch { halt({ status: "blocked", reason: "budget_store_unavailable" }); return undefined; }
+    if (!budget.ok) { halt({ status: "budget_deferred", reason: budget.reason }); return undefined; }
+    pendingReservations.add(id); calls++;
+    observe();
+    return id;
+  };
+  const interruptOnAbort = (signal: AbortSignal) => {
+    let remove = () => {};
+    const interrupted = new Promise<never>((_, reject) => {
+      const listener = () => reject(new Error("aborted"));
+      signal.addEventListener("abort", listener, { once: true });
+      remove = () => signal.removeEventListener("abort", listener);
+      if (signal.aborted) listener();
+    });
+    return { interrupted, remove };
+  };
+  const settleResult = (id: string, message: AssistantMessage, count: CountOk) => {
+    const usage = usableUsage(message);
+    charge(id, usage);
+    if (usage) contextController.observeResult({ usage: message.usage,
+      request: { method: count.method, baseEstimate: count.baseEstimate } });
+  };
   const compactTarget = contextController.capacity.ok ? contextController.capacity.capacity.compactTarget : 0;
 
   /** §5 tool-free compaction transport: the same fenced seam, call counter and daily
@@ -346,25 +377,10 @@ export async function runConsolidation(input: ConsolidationRunInput): Promise<Co
     if (!fence()) return { ok: false, halted: true };
     if (!readinessGate()) return { ok: false, halted: true };
     if (calls >= MAX_CALLS) { halt({ status: "blocked", reason: "model_call_budget" }); return { ok: false, halted: true }; }
-    const id = randomUUID();
-    let budget: ReturnType<typeof reserveModelCall>;
-    try {
-      // §7.1: attempted compactor transport consumes ordinary request/daily limits.
-      budget = reserveModelCall(input.db, { id, now: clock(), timezone: input.config.timezone,
-        provider: model.provider, model: model.id, estimate: { input: admissionEstimate, output: maxTokens },
-        limits: { input: input.config.limits.dailyInputTokens, output: input.config.limits.dailyOutputTokens,
-          requests: input.config.limits.dailyRequests } });
-    } catch { halt({ status: "blocked", reason: "budget_store_unavailable" }); return { ok: false, halted: true }; }
-    if (!budget.ok) { halt({ status: "budget_deferred", reason: budget.reason }); return { ok: false, halted: true }; }
-    pendingReservations.add(id); calls++;
-    observe();
-    let removeInterrupt = () => {};
-    const interrupted = new Promise<never>((_, reject) => {
-      const listener = () => reject(new Error("aborted"));
-      controller.signal.addEventListener("abort", listener, { once: true });
-      removeInterrupt = () => controller.signal.removeEventListener("abort", listener);
-      if (controller.signal.aborted) listener();
-    });
+    // §7.1: attempted compactor transport consumes ordinary request/daily limits.
+    const id = reserveRequest(admissionEstimate);
+    if (!id) return { ok: false, halted: true };
+    const { interrupted, remove: removeInterrupt } = interruptOnAbort(controller.signal);
     try {
       if (controller.signal.aborted) throw new Error("aborted");
       input.onRequestStarted?.();
@@ -373,10 +389,7 @@ export async function runConsolidation(input: ConsolidationRunInput): Promise<Co
           timeoutMs: Math.max(1, TOTAL_TIMEOUT_MS - (clock() - startedAt)), maxRetries: 0 }), interrupted]);
       // §3.2: reconcile trustworthy usage and calibrate the estimate of this exact sent request.
       const message = await Promise.race([provider.result(), interrupted]);
-      const usage = usableUsage(message);
-      charge(id, usage);
-      if (usage) contextController.observeResult({ usage: message.usage,
-        request: { method: count.method, baseEstimate: count.baseEstimate } });
+      settleResult(id, message, count);
       if (!fence()) return { ok: false, halted: true };
       if (message.stopReason === "error") {
         if (isProviderContextOverflow(message.errorMessage)) {
@@ -551,39 +564,15 @@ export async function runConsolidation(input: ConsolidationRunInput): Promise<Co
       return bounded;
     }
     const requestCount: CountOk = decision.count;
-    const id = randomUUID();
-    let budget: ReturnType<typeof reserveModelCall>;
-    try {
-      // §7.1: transactional reservation of request capacity before dispatch — the
-      // calibrated safety-adjusted estimate (or exact tokens) in estimated mode.
-      budget = reserveModelCall(input.db, { id, now: clock(), timezone: input.config.timezone,
-        provider: model.provider, model: model.id, estimate: { input: decision.admissionEstimate, output: maxTokens },
-        limits: { input: input.config.limits.dailyInputTokens, output: input.config.limits.dailyOutputTokens,
-          requests: input.config.limits.dailyRequests } });
-    } catch {
-      halt({ status: "blocked", reason: "budget_store_unavailable" }); return rejectRequest();
-    }
-    if (!budget.ok) { halt({ status: "budget_deferred", reason: budget.reason }); return rejectRequest(); }
-    pendingReservations.add(id); calls++;
-    observe();
+    // §7.1: reserve the complete safety-adjusted request before dispatch.
+    const id = reserveRequest(decision.admissionEstimate);
+    if (!id) return rejectRequest();
     const signal = options?.signal ? AbortSignal.any([controller.signal, options.signal]) : controller.signal;
     // Return a bounded protocol stream even if a transport ignores cancellation or never settles.
     void (async () => {
-      let removeAbort = () => {};
-      const interrupted = new Promise<never>((_, reject) => {
-        const listener = () => reject(new Error("aborted"));
-        signal.addEventListener("abort", listener, { once: true });
-        removeAbort = () => signal.removeEventListener("abort", listener);
-        if (signal.aborted) listener();
-      });
-      // §3.2: reconcile trustworthy usage and calibrate the estimate of this exact sent
-      // request; missing or invalid usage keeps the estimated reservation intact.
-      const settle = (message: AssistantMessage) => {
-        const usage = usableUsage(message);
-        charge(id, usage);
-        if (usage) contextController.observeResult({ usage: message.usage,
-          request: { method: requestCount.method, baseEstimate: requestCount.baseEstimate } });
-      };
+      const { interrupted, remove: removeAbort } = interruptOnAbort(signal);
+      // §3.2: missing or invalid input usage keeps the reservation intact.
+      const settle = (message: AssistantMessage) => settleResult(id, message, requestCount);
       try {
         if (signal.aborted) throw new Error("aborted");
         input.onRequestStarted?.();

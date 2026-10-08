@@ -112,7 +112,10 @@ export function workspaceDiff(prior: Map<string, string>, next: Map<string, stri
     if (bytes > 4 * 1024 * 1024) { reason = "size"; sections.length = 0; continue; }
     sections.push(section);
   }
-  if (!reason) return { text: `# Workspace changes\n\n${indexLines(changes)}\n\n${sections.join("\n")}`, fallback: false, reason: null };
+  if (!reason) {
+    // Sections can be empty when every change involves empty files.
+    return { text: sections.length ? `# Workspace changes\n\n${indexLines(changes)}\n\n${sections.join("\n")}` : `# Workspace changes\n\n${indexLines(changes)}\n`, fallback: false, reason: null };
+  }
   const notice = reason === "size"
     ? "Unified diff omitted: output exceeds the 4 MiB ceiling. Read every added or modified staged file separately and remove claims supported only by deleted inputs. "
     : "Unified diff omitted: the bounded diff algorithm exceeded its computation limit. Read every added or modified staged file separately and remove claims supported only by deleted inputs. ";

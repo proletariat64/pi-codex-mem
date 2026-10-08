@@ -177,6 +177,45 @@ test("empty, CRLF, Unicode, repeated-line and no-final-newline diffs are byte-de
   }
 });
 
+test("pathological edits fall back to the complete path index with computation_limit, never a partial diff", () => {
+  // Every other line differs, so the shortest edit script exceeds the bounded
+  // edit-distance cap and no section may be emitted.
+  const pathological = (prefix: string): string => {
+    const lines = [];
+    for (let i = 0; i < 30_000; i++) lines.push(i % 2 === 0 ? `u${prefix}${i}` : "common");
+    return `${lines.map((line) => `${line}
+`).join("")}tail-${prefix}
+`;
+  };
+  const prior = new Map([["huge.md", pathological("old")], ["small.txt", "tiny\n"]]);
+  const next = new Map([["huge.md", pathological("new")], ["small.txt", "touched\n"]]);
+  const first = workspaceDiff(prior, next);
+  const second = workspaceDiff(prior, next);
+  assert.equal(first.text, second.text, "fallback text differs between runs");
+  assert.deepEqual(first, { text: first.text, fallback: true, reason: "computation_limit" });
+  assert.ok(!first.text.includes("--- a/huge.md"), "partial diff emitted for a pathological file");
+  assert.ok(!first.text.includes("+u"), "pathological plaintext leaked into the fallback");
+  assert.equal(
+    first.text.split("\n").filter((line) => /^- (added|deleted|modified): /.test(line)).join("\n"),
+    "- modified: huge.md\n- modified: small.txt",
+  );
+  assert.ok(first.text.length < 4096, "fallback index is not bounded");
+});
+
+test("a diff crossing the 4 MiB ceiling mid-manifest yields the complete index with the size reason", () => {
+  const line = `${"x".repeat(64 * 1024)}\n`;
+  const prior = new Map<string, string>();
+  const next = new Map(["big-a.md", "big-b.md"].reduce((acc, path, index) => { acc.set(path, line.repeat(30 + index * 12)); return acc; }, new Map<string, string>()));
+  const diff = workspaceDiff(prior, next);
+  assert.deepEqual(diff, { text: diff.text, fallback: true, reason: "size" });
+  assert.equal(
+    diff.text.split("\n").filter((l) => /^- (added|deleted|modified): /.test(l)).join("\n"),
+    "- added: big-a.md\n- added: big-b.md",
+  );
+  assert.ok(!diff.text.includes("+++ "), "partial diff emitted past the ceiling");
+  assert.ok(Buffer.byteLength(diff.text) < 4096);
+});
+
 test("randomized line edits round-trip through the unified diff and stay deterministic", () => {
   // Deterministic xorshift PRNG: the test vetoes machine- or run-dependent output.
   let state = 0x2f6e2b1;

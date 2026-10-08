@@ -84,7 +84,7 @@ function extractSections(text: string): { path: string; hunks: HunkRange[] }[] {
     const oldHeader = lines[index++]!;
     assert.ok(lines[index]!.startsWith("+++ "), "missing +++ header");
     const plusHeader = lines[index++]!;
-    const path = oldHeader.startsWith("--- /dev/null") ? plusHeader.slice("+++ ".length) : oldHeader.slice("--- a/".length);
+    const path = oldHeader.startsWith("--- /dev/null") ? plusHeader.slice("+++ b/".length) : oldHeader.slice("--- a/".length);
     const body: string[] = [];
     while (index < lines.length && !lines[index]!.startsWith("--- ")) body.push(lines[index++]!);
     sections.push(parseSection(path, body.join("\n")));
@@ -150,6 +150,8 @@ test("empty, CRLF, Unicode, repeated-line and no-final-newline diffs are byte-de
     { name: "unicode lines", prior: new Map([["u.md", "中文\nemoji 🎉\n"], ["gone.md", "孤证\n"]]), next: new Map([["u.md", "中文\nemoji 🎉!\n"]]) },
     { name: "repeated lines", prior: new Map([["r.md", "a\na\na\na\na\n"]]), next: new Map([["r.md", "a\na\nb\na\na\na\n"]]) },
     { name: "degenerate repeated lines", prior: new Map([["r.md", "a\na\na\n"]]), next: new Map([["r.md", "a\nb\na\n"]]) },
+    { name: "added file with full text", prior: new Map([["kept.md", "stable\n"]]), next: new Map([["kept.md", "stable\n"], ["new.md", "first\nsecond\n"]]) },
+    { name: "deleted file with content", prior: new Map([["kept.md", "stable\n"], ["gone.md", "first\nsecond\n"]]), next: new Map([["kept.md", "stable\n"]]) },
     { name: "newline added", prior: new Map([["n.md", "without newline"]]), next: new Map([["n.md", "without newline\n"]]) },
     { name: "newline removed", prior: new Map([["n.md", "with\nnewline\n"]]), next: new Map([["n.md", "with\nnewline"]]) },
     { name: "both sides lack a final newline", prior: new Map([["n.md", "x\ny"]]), next: new Map([["n.md", "x\nz"]]) },

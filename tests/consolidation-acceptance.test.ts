@@ -1,18 +1,20 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createAssistantMessageEventStream, type Api, type AssistantMessage, type JsonObject, type Model, type TranscriptContext } from "@earendil-works/pi-ai";
 import { defaultConfig, type MemoryVersion } from "../src/config.ts";
 import { openStateDb, recordSnapshot, recordCapturePrivacy } from "../src/store/db.ts";
 import { claimDueExtractions, enqueueExtraction, commitExtraction } from "../src/store/jobs.ts";
-import { getPublishedGeneration, selectConsolidation } from "../src/store/consolidation.ts";
+import { claimConsolidation, finishConsolidation, getPublishedGeneration, selectConsolidation } from "../src/store/consolidation.ts";
 import { v1PromptHash } from "../src/extraction/v1.ts";
 import { v2PromptHash } from "../src/extraction/v2.ts";
 import { addNote, forgetNote } from "../src/control/notes.ts";
 import { forgetEvidence } from "../src/control/forget.ts";
 import { ConsolidationScheduler } from "../src/pipeline/scheduler.ts";
+import { consolidationPromptHash } from "../src/pipeline/consolidate.ts";
+import { prepareGenerationCandidate } from "../src/pipeline/candidate.ts";
 import type { ConsolidationModelPort } from "../src/pipeline/model-port.ts";
 import { textHash } from "../src/pipeline/staging.ts";
 import { persistentDiagnostics } from "../src/diagnostics.ts";
@@ -58,7 +60,7 @@ function fixture(t: test.TestContext, version: MemoryVersion) {
     })();
     return stream;
   } };
-  const scheduler = new ConsolidationScheduler({ db, root, config: () => config, modelPort: () => port,
+  const scheduler = new ConsolidationScheduler({ db, root, config: () => structuredClone(config), modelPort: () => port,
     now: () => NOW, isForegroundIdle: () => true,
     timer: { schedule: () => ({ cancel() {} }) } });
   t.after(async () => { await scheduler.stop(); db.close(); rmSync(root, { recursive: true, force: true }); });
@@ -133,7 +135,58 @@ for (const version of ["v1", "v2"] as const) {
       dailyInput: 1_000_000, dailyOutput: 50_000, dailyRequests: 12, semanticCoverage: "not measured" }));
   });
 
-  for (const mutation of ["correction", "forget_note", "forget_source", "privacy_edit", "selection"] as const) {
+  test(`CT13 ${version}: upgrade and rollback preserve notes, enrollment, charged usage and legacy hash-verified manifests`, async (t) => {
+    const f = fixture(t, version); f.config.schedule.maxConsolidationSources = 8;
+    f.source("source-000"); const note = f.note();
+    f.script([
+      () => reply([
+        ...(version === "v1" ? [tool("handbook", "workspace_write", { path: "MEMORY.md", content: "# Memory\\n\\nSynthetic evidence.\\n" })] : []),
+        tool("summary", "workspace_write", { path: "memory_summary.md", content: MINIMAL_V1_SUMMARY }),
+      ], "toolUse"),
+      () => reply([{ type: "text", text: "Done" }]),
+    ]);
+    assert.deepEqual(await f.scheduler.runPass(), [{ status: "published" }]);
+    const saved = readFileSync(note.textPath, "utf8");
+    const enrolled = f.db.prepare("SELECT * FROM source_revisions ORDER BY source_id").all();
+    const usage = f.db.prepare("SELECT * FROM budget_usage ORDER BY local_day, provider, model").all();
+    const legacyHash = version === "v1" ? "8d116ea8078aa2831a609b3188051d0bb7ce86de7cc54747c772150da20283ee" : "4ffeae99c14b461fecf471efef544ad1d4a3c1e746d6a586d1574f60c37c3436";
+    // Simulate a legacy producer, upgrade, then rollback under captured distinct hashes.
+    // This is storage compatibility proof, not executing an old Pi binary or semantic comparison.
+    for (const policy of [legacyHash, consolidationPromptHash(f.config, version), legacyHash]) {
+      const snapshot = selectConsolidation(f.db, { memoryVersion: version, now: NOW, maxSources: 8 });
+      const lease = claimConsolidation(f.db, { memoryVersion: version, owner: "compat", promptHash: policy, now: NOW }); assert.ok(lease);
+      const candidate = prepareGenerationCandidate({ db: f.db, root: f.root, lease, snapshot, config: f.config, signal: new AbortController().signal, clock: () => NOW });
+      candidate.writeMinimal(); assert.equal(candidate.publish(), true); candidate.dispose();
+      const generation = getPublishedGeneration(f.db, version, NOW); assert.ok(generation);
+      assert.equal(generation.promptHash, policy);
+      const path = join(generation.directory, "manifest.json");
+      const manifest = JSON.parse(readFileSync(path, "utf8"));
+      // Legacy optional-field shape with its actual stored hash, never a reserialized assumed hash.
+      delete manifest.diffPolicyVersion; delete manifest.diffFallbackReason;
+      const legacyText = JSON.stringify(manifest) + "\n";
+      writeFileSync(path, legacyText);
+      f.db.prepare("UPDATE generations SET manifest_hash = ? WHERE generation_id = ?").run(textHash(legacyText), generation.generationId);
+      assert.ok(acquireEvidencePin({ db: f.db, root: f.root, memoryVersion: version, now: NOW }));
+      writeFileSync(path, legacyText + " ");
+      assert.equal(acquireEvidencePin({ db: f.db, root: f.root, memoryVersion: version, now: NOW }), null, "old-shaped manifests still require the actual stored hash");
+      writeFileSync(path, legacyText);
+      assert.equal(readFileSync(note.textPath, "utf8"), saved);
+      assert.deepEqual(f.db.prepare("SELECT * FROM source_revisions ORDER BY source_id").all(), enrolled);
+      assert.deepEqual(f.db.prepare("SELECT * FROM budget_usage ORDER BY local_day, provider, model").all(), usage);
+      assert.equal(f.config.schedule.maxConsolidationSources, 8);
+    }
+    const snapshot = selectConsolidation(f.db, { memoryVersion: version, now: NOW });
+    const lease = claimConsolidation(f.db, { memoryVersion: version, owner: "old", promptHash: legacyHash, now: NOW }); assert.ok(lease);
+    const candidate = prepareGenerationCandidate({ db: f.db, root: f.root, lease, snapshot, config: f.config, signal: new AbortController().signal, clock: () => NOW });
+    candidate.writeMinimal();
+    addNote({ root: f.root, db: f.db, action: "correct", text: "Invalidate before rollback publication", scope: "global", provenance, now: NOW });
+    assert.equal(candidate.publish(), false, "rollback cannot revive invalidated content"); candidate.dispose();
+    assert.equal(getPublishedGeneration(f.db, version, NOW), null);
+    assert.deepEqual(f.db.prepare("SELECT * FROM budget_usage ORDER BY local_day, provider, model").all(), usage);
+    finishConsolidation(f.db, lease, "superseded", "publication_cas", NOW);
+  });
+
+  for (const mutation of ["correction", "forget_note", "forget_source", "privacy_edit", "selection", "configuration"] as const) {
     test(`CT07 ${version}: ${mutation} during cancellation-ignoring compaction prevents stale continuation and publication`, async (t) => {
       const f = fixture(t, version); f.source("source-000"); const note = f.note();
       f.script([
@@ -144,6 +197,7 @@ for (const version of ["v1", "v2"] as const) {
           else if (mutation === "forget_note") forgetNote({ root: f.root, db: f.db, noteId: note.noteId, now: NOW });
           else if (mutation === "forget_source") forgetEvidence({ root: f.root, db: f.db, kind: "source", id: "source-000", now: NOW });
           else if (mutation === "privacy_edit") recordCapturePrivacy(f.db, { capturedAt: NOW, revokedSourceIds: ["source-000"] });
+          else if (mutation === "configuration") f.config.limits.summaryBytes++;
           else f.source("source-001");
           // Transport deliberately returns late rather than honoring the signal.
           await new Promise(resolve => setImmediate(resolve));

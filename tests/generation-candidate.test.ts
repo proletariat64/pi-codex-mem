@@ -152,6 +152,16 @@ for (const version of ["v1", "v2"] as const) {
     assert.equal(existsSync(generation.directory), true);
   });
 
+  test(`CT13 ${version}: publication rejects an old-policy lease after a policy identity change`, t => {
+    const f = fixture(t);
+    const { candidate, lease } = f.prepare(version);
+    candidate.writeMinimal();
+    f.db.prepare("UPDATE jobs SET prompt_hash = 'new-policy' WHERE job_id = ?").run(lease.jobId);
+    assert.equal(candidate.publish(), false, "mixed-policy work cannot become the readable pointer");
+    assert.equal(getPublishedGeneration(f.db, version, NOW), null);
+    candidate.dispose();
+  });
+
   test(`${version} candidate reports CAS rejection without owning global orphan cleanup`, t => {
     const f = fixture(t);
     const { candidate, staging, lease } = f.prepare(version);

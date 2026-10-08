@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
@@ -12,6 +12,7 @@ import { openStateDb } from "../src/store/db.ts";
 import { claimConsolidation } from "../src/store/consolidation.ts";
 import { consolidationPromptHash, runConsolidation } from "../src/pipeline/consolidate.ts";
 import { persistentDiagnostics } from "../src/diagnostics.ts";
+import { textHash } from "../src/pipeline/staging.ts";
 import { createContextCalibrationStore, createContextController } from "../src/pipeline/context-controller.ts";
 import type { ConsolidationModelPort } from "../src/pipeline/model-port.ts";
 import type { ContextCalibrationStore } from "../src/pipeline/context-controller.ts";
@@ -99,6 +100,35 @@ const run = (setup: ReturnType<typeof fixture>, port: ConsolidationModelPort,
   clock: () => NOW + 1, contextCalibration: createContextCalibrationStore(), ...extra });
 const reservations = (db: import("node:sqlite").DatabaseSync) =>
   db.prepare("SELECT estimate_input, estimate_output, actual_input, status FROM budget_reservations ORDER BY rowid").all();
+
+for (const version of ["v1", "v2"] as const) {
+  test(`CT08 ${version}: compaction retains staged output hashes, pinned framing, tools and host lease identity`, async (t) => {
+    const setup = fixture(t, version);
+    const leaseBefore = structuredClone(setup.lease);
+    const output = "Existing staged output before compaction.\n";
+    const { port, calls } = scriptedPort([
+      () => reply([{ type: "text", text: "界".repeat(40_000) }, tool("workspace_write", { path: "memory_summary.md", content: output })], "toolUse"),
+      call => {
+        assert.ok(isCompactionCall(call));
+        assert.equal(textHash(readFileSync(join(setup.directory, "memory_summary.md"), "utf8")), textHash(output));
+        return reply([{ type: "text", text: "DERIVED: preserve outputs and host identity; this creates no provenance." }]);
+      },
+      call => {
+        assert.deepEqual(call.context.messages[0], calls[0]!.context.messages[0], "trusted original instructions and tool schemas survive exactly");
+        assert.match(JSON.stringify(call.context.messages.at(-1)), new RegExp(`Consolidate this ${version}`));
+        assert.equal(textHash(readFileSync(join(setup.directory, "memory_summary.md"), "utf8")), textHash(output));
+        return reply([tool("workspace_write", { path: "MEMORY.md", content: "# Memory\\n" })], "toolUse");
+      },
+      () => reply([{ type: "text", text: "Done" }]),
+    ]);
+    assert.deepEqual(await run(setup, port), { status: "succeeded" });
+    assert.deepEqual(setup.lease, leaseBefore);
+    assert.equal(existsSync(join(setup.directory, "MEMORY.md")), version === "v1", "compaction cannot broaden the version output allowlist");
+    assert.equal(textHash(readFileSync(join(setup.directory, "memory_summary.md"), "utf8")), textHash(output));
+    assert.equal(setup.db.prepare("SELECT COUNT(*) AS n FROM notes").get()!.n, 0);
+    assert.equal(setup.db.prepare("SELECT COUNT(*) AS n FROM generations").get()!.n, 0);
+  });
+}
 
 test("CT05: accumulated pages crossing the soft limit compact at the settled seam and install a recounted replacement", async (t) => {
   const setup = fixture(t);

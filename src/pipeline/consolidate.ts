@@ -13,10 +13,12 @@ import { renewConsolidationLease, type ConsolidationLease } from "../store/conso
 import { createWorkspaceTools } from "./workspace-tools.ts";
 import { tokenCounterForModel, type ConsolidationModelPort } from "./model-port.ts";
 import {
-  createContextCalibrationStore, createContextController,
+  createContextCalibrationStore, createContextController, DEFAULT_CONTEXT_COUNTING_POLICY,
   type AdmissionDecision, type ContextCalibrationStore, type CountOk,
 } from "./context-controller.ts";
 import { ArtifactFormatError } from "./artifacts.ts";
+import { DIFF_POLICY_VERSION } from "./diff.ts";
+import { recordWriterObservation, type WriterObservation } from "./writer-observation.ts";
 
 export interface ConsolidationRunInput {
   db: DatabaseSync;
@@ -34,6 +36,8 @@ export interface ConsolidationRunInput {
   validateOutputs?: () => void;
   /** Process-local calibration store shared per model/transport/policy identity (spec §3.2). */
   contextCalibration?: ContextCalibrationStore;
+  /** Host selection/diff metadata, never evidence bodies. */
+  selectionDiagnostics?: Pick<WriterObservation, "selectedSources" | "selectedNotes" | "diffMode" | "diffFallback">;
 }
 
 export interface ConsolidationRunResult {
@@ -50,9 +54,10 @@ const OUTPUT_TOKENS = 4_000;
 const MAX_COMPACTIONS = 2;
 /** §5: summary representation limit, a byte cap separate from token limits. */
 const COMPACTION_SUMMARY_BYTES = 16_384;
+const COMPACTION_POLICY_VERSION = 1;
 /** Label identifying a host-derived summary inside working history (§5.1: derived
  * assistant context, never authoritative user or tool data). */
-export const COMPACTION_SUMMARY_LABEL = "[Derived working-context summary]";
+const COMPACTION_SUMMARY_LABEL = "[Derived working-context summary]";
 const writerTask = (version: MemoryVersion) =>
   `Consolidate this ${version} staged workspace. Read phase2_workspace_diff.md first, then selected evidence and notes. Write the required outputs using workspace tools.`;
 const COMPACTION_INSTRUCTION = "Summarize the appended writer transcript for continuation. Preserve " +
@@ -70,11 +75,15 @@ const adaptation = (version: MemoryVersion) => readFileSync(new URL(`../../promp
 /** All writer instructions and boundary semantics participate in the dirty check. */
 export function consolidationPromptHash(config: MemoryConfig, version: MemoryVersion = "v1"): string {
   return createHash("sha256").update(writerTemplate(version)).update("\n").update(adaptation(version)).update(JSON.stringify({
-    schemaVersion: 1, rendererVersion: 2, memoryVersion: version, summaryBytes: Math.min(9999, config.limits.summaryBytes),
+    schemaVersion: 1, rendererVersion: 3, memoryVersion: version, summaryBytes: Math.min(9999, config.limits.summaryBytes),
     toolResponseBytes: config.limits.toolResponseBytes, maxCalls: MAX_CALLS, maxTools: MAX_TOOLS,
     timeoutMs: TOTAL_TIMEOUT_MS, outputTokens: OUTPUT_TOKENS,
     outputAllowlist: version === "v1" ? ["MEMORY.md", "memory_summary.md", "skills/<slug>/SKILL.md"] : ["memory_summary.md"],
-    toolExecution: "sequential", contextByteRatio: 0.7, contextOverhead: 1_024,
+    toolExecution: "sequential", countingPolicy: DEFAULT_CONTEXT_COUNTING_POLICY,
+    compactionPolicy: { version: COMPACTION_POLICY_VERSION, maxCompactions: MAX_COMPACTIONS, summaryBytes: COMPACTION_SUMMARY_BYTES,
+      instruction: COMPACTION_INSTRUCTION, label: COMPACTION_SUMMARY_LABEL,
+      continuation: continuationInstruction(version), overflowRecoveries: 1 },
+    diffPolicyVersion: DIFF_POLICY_VERSION,
     maxValidationRepairs: 1, validationDiagnosticBytes: 512, artifactPolicyVersion: 3,
   })).digest("hex");
 }
@@ -235,6 +244,17 @@ export async function runConsolidation(input: ConsolidationRunInput): Promise<Co
   /** §5.3 run-owned compaction state: counters, a private install candidate and the
    * synthetic failure records; a crash/reload drops all of it and nothing is persisted. */
   let compactions = 0;
+  let lastCompaction: WriterObservation["lastCompaction"];
+  const observe = () => {
+    try { recordWriterObservation(input.db, version, {
+      jobId: input.lease.jobId, promptHash: input.lease.promptHash, context: contextController.snapshot(),
+      compactionPolicyVersion: COMPACTION_POLICY_VERSION, diffPolicyVersion: DIFF_POLICY_VERSION,
+      ...input.selectionDiagnostics, requests: calls, tools, compactions,
+      elapsedMs: Math.max(0, clock() - startedAt), status: result?.status ?? "running",
+      reason: result?.reason, lastCompaction,
+    }); } catch { /* Diagnostics never authorize or interrupt writer work. */ }
+  };
+  observe();
   let pendingInstall: Message[] | undefined;
   let pendingOverflowRecovery = false;
   let repairMessage: Message | undefined;
@@ -256,7 +276,7 @@ export async function runConsolidation(input: ConsolidationRunInput): Promise<Co
       result ??= { status: "blocked", reason: "budget_store_unavailable" };
     }
   };
-  const halt = (next: ConsolidationRunResult) => { result ??= next; };
+  const halt = (next: ConsolidationRunResult) => { result ??= next; observe(); };
   /** Readiness fence shared by writer and compactor seams: configuration, foreground
    * idle and scheduler checks repeat before every request and tool execution (§4). */
   const readinessGate = (): boolean => {
@@ -335,6 +355,7 @@ export async function runConsolidation(input: ConsolidationRunInput): Promise<Co
     } catch { halt({ status: "blocked", reason: "budget_store_unavailable" }); return { ok: false, halted: true }; }
     if (!budget.ok) { halt({ status: "budget_deferred", reason: budget.reason }); return { ok: false, halted: true }; }
     pendingReservations.add(id); calls++;
+    observe();
     let removeInterrupt = () => {};
     const interrupted = new Promise<never>((_, reject) => {
       const listener = () => reject(new Error("aborted"));
@@ -383,7 +404,7 @@ export async function runConsolidation(input: ConsolidationRunInput): Promise<Co
    * Candidates are constructed, validated and recounted off to the side; only the final
    * validated candidate reaches the driver, which performs the single atomic swap.
    * Live history is never touched on failure. */
-  const runCompaction = async (live: readonly Message[]): Promise<"installed" | "nothing" | "failed"> => {
+  const compactCandidate = async (live: readonly Message[]): Promise<"installed" | "nothing" | "failed"> => {
     if (!hasCompactableHistory(live)) return "nothing"; // host framing alone is irreducible (§7.3)
     if (compactions >= MAX_COMPACTIONS) { halt({ status: "blocked", reason: "compaction_limit" }); return "failed"; }
     const { framing, units } = conversationalUnits(live);
@@ -472,6 +493,19 @@ export async function runConsolidation(input: ConsolidationRunInput): Promise<Co
     return "installed";
   };
 
+  const runCompaction = async (live: readonly Message[]): Promise<"installed" | "nothing" | "failed"> => {
+    const before = measureWriterRequest(live);
+    lastCompaction = { before, units: contextController.snapshot().currentInputUnits, result: "running" };
+    observe();
+    const outcome = await compactCandidate(live);
+    const after = outcome === "installed" && pendingInstall ? measureWriterRequest(pendingInstall) : undefined;
+    if (outcome !== "installed") measureWriterRequest(live); // failed private candidate is not live occupancy
+    lastCompaction = { before, after, units: contextController.snapshot().currentInputUnits,
+      result: outcome === "failed" ? result?.reason ?? "failed" : outcome };
+    observe();
+    return outcome;
+  };
+
   const streamFn: StreamFn = (_model, context, options) => {
     const bounded = createAssistantMessageEventStream();
     const rejectRequest = () => {
@@ -487,6 +521,7 @@ export async function runConsolidation(input: ConsolidationRunInput): Promise<Co
     // proves the next request fits. Figures are tokens or explicitly labeled estimated
     // token units, never the old serial byte count.
     const decision = contextController.admission({ messages: context.messages }, { mode: "ordinary" });
+    observe();
     if (decision.action === "blocked") {
       halt({ status: "blocked",
         reason: decision.reason === "unsupported_content" ? "unsupported_content" : "context_capacity_unavailable" });
@@ -528,6 +563,7 @@ export async function runConsolidation(input: ConsolidationRunInput): Promise<Co
     }
     if (!budget.ok) { halt({ status: "budget_deferred", reason: budget.reason }); return rejectRequest(); }
     pendingReservations.add(id); calls++;
+    observe();
     const signal = options?.signal ? AbortSignal.any([controller.signal, options.signal]) : controller.signal;
     // Return a bounded protocol stream even if a transport ignores cancellation or never settles.
     void (async () => {
@@ -634,6 +670,7 @@ export async function runConsolidation(input: ConsolidationRunInput): Promise<Co
     agent.subscribe((event) => {
       if (event.type === "tool_execution_start") {
         tools++;
+        observe();
         if (tools > MAX_TOOLS) abort({ status: "blocked", reason: "tool_budget" });
       }
     });
@@ -670,10 +707,13 @@ export async function runConsolidation(input: ConsolidationRunInput): Promise<Co
     if (result) return result;
     if (!fence()) return result ?? { status: "blocked", reason: "lease_lost" };
     const last = agent.state.messages.filter((message): message is AssistantMessage => message.role === "assistant").at(-1);
-    return last?.stopReason === "stop" ? { status: "succeeded" } : { status: "retry_wait", reason: "provider_error" };
+    result = last?.stopReason === "stop" ? { status: "succeeded" } : { status: "retry_wait", reason: "provider_error" };
+    return result;
   } catch {
-    return result ?? { status: "blocked", reason: "writer_error" };
+    result ??= { status: "blocked", reason: "writer_error" };
+    return result;
   } finally {
+    observe();
     clearTimeout(timer); clearInterval(heartbeat);
     input.signal.removeEventListener("abort", onAbort);
     for (const id of pendingReservations) charge(id);

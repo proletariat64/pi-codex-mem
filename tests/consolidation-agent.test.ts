@@ -133,7 +133,8 @@ test("writer reserves each accumulated context, defers before an over-budget req
   assert.equal(calls.length, 1);
   const budget = setup.db.prepare("SELECT actual_input, actual_output, call_count FROM budget_usage").get() as
     { actual_input: number; actual_output: number; call_count: number };
-  assert.ok(budget.actual_input > 30_000, "the entire pinned writer and tool definitions are reserved");
+  assert.ok(budget.actual_input > 10_000, "the entire pinned writer and tool definitions are reserved");
+  assert.ok(budget.actual_input < 30_000, "the reservation is estimated tokens, not the old byte count");
   assert.equal(budget.actual_output, 4_000);
   assert.equal(budget.call_count, 1);
 });
@@ -187,14 +188,23 @@ test("cancellation settles when provider ignores abort, retains its reservation 
   assert.deepEqual({ ...charge }, { status: "charged", actual_output: 4_000 });
 });
 
-test("accumulated UTF-8 messages exceed context before a second call without dropping earlier evidence", async (t) => {
+test("accumulated UTF-8 messages cross the soft limit before a second call without dropping earlier evidence", async (t) => {
   const setup = fixture(t);
   const { port, calls } = fakePort([reply([{ type: "text", text: "界".repeat(30_000) },
     tool("workspace_list", {})], "toolUse")]);
-  port.resolve = () => ({ ...model, contextWindow: 120_000 });
-  assert.deepEqual(await run(setup, port), { status: "blocked", reason: "context_budget" });
+  port.resolve = () => ({ ...model, contextWindow: 60_000 });
+  assert.deepEqual(await run(setup, port), { status: "blocked", reason: "compaction_limit" });
   assert.equal(calls.length, 1);
   assert.equal((setup.db.prepare("SELECT COUNT(*) AS n FROM budget_reservations").get() as { n: number }).n, 1);
+});
+
+test("unicode-heavy history that fits the window is admitted where the old byte count blocked it", async (t) => {
+  const setup = fixture(t);
+  const { port, calls } = fakePort([reply([{ type: "text", text: "界".repeat(30_000) },
+    tool("workspace_list", {})], "toolUse"), reply([{ type: "text", text: "Written." }])]);
+  port.resolve = () => ({ ...model, contextWindow: 120_000 });
+  assert.deepEqual(await run(setup, port), { status: "succeeded" });
+  assert.equal(calls.length, 2, "90 KB of CJK is ~22.5k estimated tokens, not 90k bytes");
 });
 
 test("foreground work pauses subsequent requests while allowing a budgeted in-flight write to finish", async (t) => {

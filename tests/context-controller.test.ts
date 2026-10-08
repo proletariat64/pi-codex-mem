@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import type { Message } from "@earendil-works/pi-ai";
+import { normalizeContext, type Message } from "@earendil-works/pi-ai";
 import {
   DEFAULT_CONTEXT_COUNTING_POLICY,
   countModelVisibleRequest,
@@ -39,7 +39,7 @@ const visibleLedger = (noisy = false) => {
     + div4(userText) + policy.messageFramingTokens
     + div4(assistantText) + policy.messageFramingTokens
     + div4("read_file") + div4(JSON.stringify(callArguments)) + policy.toolCallFramingTokens
-    + div4("read_file") + div4(resultText) + div4(JSON.stringify(resultDetails)) + policy.toolResultFramingTokens;
+    + div4("read_file") + div4(resultText) + policy.toolResultFramingTokens;
   const messages: Message[] = noisy ? [
     { role: "system", content: instruction, sections: { summary: section }, toolsAdded: [tool], timestamp: 1 },
     { role: "user", content: userText, timestamp: 2 },
@@ -194,6 +194,28 @@ test("countModelVisibleRequest ignores host-only metadata, IDs and serialization
   // The old byte-compare baseline would differ; the normalized count must not.
   assert.notEqual(Buffer.byteLength(JSON.stringify({ messages: visibleLedger().messages }), "utf8"),
     Buffer.byteLength(JSON.stringify({ messages: visibleLedger(true).messages }), "utf8"));
+});
+
+test("CT02: normalized 16 KiB tool content is counted once regardless of host display details", () => {
+  const text = "x".repeat(16_384);
+  const messages: Message[] = [
+    { role: "assistant", api: "openai-completions", provider: "fake", model: "writer", usage: hostUsage,
+      timestamp: 1, stopReason: "toolUse", content: [
+        { type: "thinking", thinking: "Replay reasoning", thinkingSignature: "reasoning_content" },
+        { type: "toolCall", id: "read", name: "read_file", arguments: {} },
+      ] },
+    { role: "toolResult", toolCallId: "read", toolName: "read_file", timestamp: 2, isError: false,
+      content: [{ type: "text", text }] },
+  ];
+  const plain = normalizeContext({ messages });
+  const decorated = normalizeContext({ messages: messages.map(message => message.role === "toolResult"
+    ? { ...message, details: { text, bytes: 16_384 } } : message) });
+  assert.deepEqual(decorated.messages[1]!.content, plain.messages[1]!.content);
+  assert.deepEqual(countModelVisibleRequest(decorated), countModelVisibleRequest(plain));
+  const withoutReasoning = countModelVisibleRequest({ messages: [messages[1]!] });
+  const withReasoning = countModelVisibleRequest(plain);
+  assert.ok(withoutReasoning.ok && withReasoning.ok);
+  assert.ok(withReasoning.baseEstimate > withoutReasoning.baseEstimate, "replayed assistant content is not discarded with host details");
 });
 
 test("countModelVisibleRequest counts each effective tool declaration exactly once (CT02)", () => {

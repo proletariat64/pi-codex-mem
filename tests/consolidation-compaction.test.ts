@@ -209,7 +209,8 @@ test("CT04: output-only compactor usage retains its input charge and denies the 
 // unit fits the compactor alone while the full history cannot. Turn 2 burst: ~24.5k
 // units in one settled unit (text plus one ~16 KiB read page, results counted whole).
 const segmentTurn1 = () => reply([{ type: "text", text: "\u754c".repeat(7_300) }, tool("workspace_list")], "toolUse");
-const segmentBurstTurn = (text = 22_000) =>
+// Additional visible text keeps the segment fixture oversized now that host details are excluded.
+const segmentBurstTurn = (text = 27_500) =>
   reply([{ type: "text", text: "\u754c".repeat(text) }, tool("workspace_read", { path: "phase2_workspace_diff.md" })], "toolUse");
 const smallSummary = (marker: string) =>
   reply([{ type: "text", text: `Summary ${marker}: decisions, references, corrections and next reads.` }]);
@@ -291,7 +292,7 @@ test("CT06: one oversized unit cannot fit the compactor and ends context_irreduc
   const setup = fixture(t, "v1", { bigDiff: true });
   const { port, calls } = scriptedPort([
     segmentTurn1(),
-    segmentBurstTurn(28_000),
+    segmentBurstTurn(33_500),
     () => smallSummary("one"),
     () => { throw new Error("the oversized unit must never be dispatched"); },
   ], segmentWindow);
@@ -319,7 +320,7 @@ test("CT06: an unchanged-size segment summary discards the candidate with compac
   const setup = fixture(t, "v1", { bigDiff: true });
   const { port, calls } = scriptedPort([
     () => reply([{ type: "text", text: "\u754c".repeat(2_000) }, tool("workspace_list")], "toolUse"),
-    () => reply([{ type: "text", text: "\u754c".repeat(25_000) }, tool("workspace_read", { path: "phase2_workspace_diff.md" })], "toolUse"),
+    () => reply([{ type: "text", text: "\u754c".repeat(30_500) }, tool("workspace_read", { path: "phase2_workspace_diff.md" })], "toolUse"),
     // A same-size summary of the oldest range: valid but without measurable reduction.
     () => reply([{ type: "text", text: "Same-size: " + "\u754c".repeat(5_400) }]),
   ], segmentWindow);

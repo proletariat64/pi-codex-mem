@@ -373,7 +373,8 @@ export function countModelVisibleRequest(
       baseEstimate += policy.toolResultFramingTokens + div4(message.toolName);
       const text = countTextBlocks(message.content);
       if (!text.ok) return { ok: false, reason: "unsupported_content", kind: "image" };
-      baseEstimate += text.units + (message.details === undefined ? 0 : div4(JSON.stringify(message.details)));
+      // Tool details are host display metadata; adapters transmit content, not this duplicate payload.
+      baseEstimate += text.units;
     }
   }
   for (const tool of effectiveTools(request.messages)) {

@@ -4,6 +4,7 @@ import { join, relative, resolve } from "node:path";
 import type { ConsolidationSnapshot } from "../store/consolidation.ts";
 import type { MemoryVersion } from "../config.ts";
 import { renderSelectedEvidence } from "./artifacts.ts";
+import { diffFileHunks, DIFF_POLICY_VERSION, DIFF_TOTAL_WORK, type WorkBudget } from "./diff.ts";
 import { generatedOutput, readWorkspaceUtf8, safeWorkspacePath, workspaceInventory } from "./workspace-tools.ts";
 
 export const textHash = (text: string): string => createHash("sha256").update(text).digest("hex");
@@ -23,8 +24,13 @@ export interface StagingManifest {
   sources: { sourceId: string; extractionId: string; path: string; outputHash: string; cwd: string; workspaceKey: string }[];
   notes: { noteId: string; path: string; textHash: string; scope: string; action?: string; createdAt?: number }[];
   fileHashes: Record<string, string>;
-  diffFallbackReason?: "privacy_or_retention" | "size";
+  /** Diff policy of the producing writer; optional so legacy manifests stay readable (spec §9). */
+  diffPolicyVersion?: number;
+  diffFallbackReason?: DiffFallbackReason;
 }
+
+/** Recorded in the manifest whenever a diff falls back to the path-only index. */
+export type DiffFallbackReason = "privacy_or_retention" | "size" | "computation_limit";
 
 export interface StagedWorkspace {
   directory: string;
@@ -67,40 +73,50 @@ function priorFiles(directory: string | undefined, snapshot: ConsolidationSnapsh
 
 function changedPathIndex(priorPaths: string[], priorHashes: Record<string, string>, next: Map<string, string>): string {
   const paths = [...new Set([...priorPaths, ...next.keys()])].sort();
-  const changes = paths.flatMap((path) => {
+  const changes: { path: string; kind: "added" | "deleted" | "modified" }[] = [];
+  for (const path of paths) {
     const current = next.get(path);
     const had = priorPaths.includes(path);
-    if (had && current !== undefined && priorHashes[path] === textHash(current)) return [];
-    return [`- ${!had ? "added" : current === undefined ? "deleted" : "modified"}: ${path}`];
-  });
-  return `# Workspace changes\n\nPrior plaintext omitted because support, retention, invalidation epoch, or integrity changed. Read added/modified staged files separately and remove claims supported only by deleted inputs. Complete changed-path index:\n\n${changes.join("\n")}\n`;
+    if (had && current !== undefined && priorHashes[path] === textHash(current)) continue;
+    changes.push({ path, kind: !had ? "added" : current === undefined ? "deleted" : "modified" });
+  }
+  return `# Workspace changes\n\nPrior plaintext omitted because support, retention, invalidation epoch, or integrity changed. Read added/modified staged files separately and remove claims supported only by deleted inputs. Complete changed-path index:\n\n${indexLines(changes)}\n`;
 }
 
-/** Full-file unified hunks deliberately avoid heuristic/machine-dependent diff ordering. */
-export function workspaceDiff(prior: Map<string, string>, next: Map<string, string>): { text: string; fallback: boolean } {
-  const changes: { path: string; kind: string }[] = [];
-  const hunks: string[] = [];
-  let bytes = 0;
-  let fallback = false;
-  for (const path of [...new Set([...prior.keys(), ...next.keys()])].sort()) {
-    const old = prior.get(path), current = next.get(path);
+const indexLines = (changes: { path: string; kind: "added" | "deleted" | "modified" }[]): string =>
+  changes.map(({ path, kind }) => `- ${kind}: ${path}`).join("\n");
+
+/** Deterministic line-level unified diff with an always-present authoritative path index (spec §6). */
+export function workspaceDiff(prior: Map<string, string>, next: Map<string, string>): { text: string; fallback: boolean; reason: "size" | "computation_limit" | null } {
+  const paths = [...new Set([...prior.keys(), ...next.keys()])].sort();
+  const changes: { path: string; kind: "added" | "deleted" | "modified" }[] = [];
+  for (const path of paths) {
+    const old = prior.get(path);
+    const current = next.get(path);
     if (old === current) continue;
     changes.push({ path, kind: old === undefined ? "added" : current === undefined ? "deleted" : "modified" });
-    if (fallback) continue;
-    const oldLines = old === undefined || old === "" ? [] : old.replace(/\n$/, "").split("\n");
-    const newLines = current === undefined || current === "" ? [] : current.replace(/\n$/, "").split("\n");
-    const deletion = oldLines.map((line) => `-${line}`);
-    if (old !== undefined && old !== "" && !old.endsWith("\n")) deletion.push("\\ No newline at end of file");
-    const addition = newLines.map((line) => `+${line}`);
-    if (current !== undefined && current !== "" && !current.endsWith("\n")) addition.push("\\ No newline at end of file");
-    const hunk = [`--- ${old === undefined ? "/dev/null" : `a/${path}`}`, `+++ ${current === undefined ? "/dev/null" : `b/${path}`}`,
-      `@@ -${oldLines.length ? 1 : 0},${oldLines.length} +${newLines.length ? 1 : 0},${newLines.length} @@`,
-      ...deletion, ...addition].join("\n") + "\n";
-    bytes += Buffer.byteLength(hunk);
-    if (bytes > 4 * 1024 * 1024) { fallback = true; hunks.length = 0; }
-    else hunks.push(hunk);
   }
-  return { fallback, text: fallback ? `# Workspace changes\n\nUnified diff exceeds 4 MiB. Read every added or modified file separately; remove unsupported claims from deleted inputs. Complete changed-path index:\n\n${changes.map(({ path, kind }) => `- ${kind}: ${path}`).join("\n")}\n` : `# Workspace changes\n\n${hunks.join("\n") || "No content changes.\n"}` };
+  if (!changes.length) return { text: "# Workspace changes\n\nNo content changes.\n", fallback: false, reason: null };
+  const budget: WorkBudget = { left: DIFF_TOTAL_WORK };
+  let bytes = 0;
+  let reason: "size" | "computation_limit" | null = null;
+  const sections: string[] = [];
+  for (const { path, kind } of changes) {
+    if (reason) continue;
+    const outcome = diffFileHunks(prior.get(path) ?? "", next.get(path) ?? "", budget);
+    if (outcome.overrun) { reason = outcome.overrun; sections.length = 0; continue; }
+    if (!outcome.hunks) continue;
+    // Added and deleted files show their complete text; modified files show local hunks.
+    const section = `--- ${kind === "added" ? "/dev/null" : `a/${path}`}\n+++ ${kind === "deleted" ? "/dev/null" : `b/${path}`}\n${outcome.hunks}`;
+    bytes += Buffer.byteLength(section);
+    if (bytes > 4 * 1024 * 1024) { reason = "size"; sections.length = 0; continue; }
+    sections.push(section);
+  }
+  if (!reason) return { text: `# Workspace changes\n\n${indexLines(changes)}\n\n${sections.join("\n")}`, fallback: false, reason: null };
+  const notice = reason === "size"
+    ? "Unified diff omitted: output exceeds the 4 MiB ceiling. Read every added or modified staged file separately and remove claims supported only by deleted inputs. "
+    : "Unified diff omitted: the bounded diff algorithm exceeded its computation limit. Read every added or modified staged file separately and remove claims supported only by deleted inputs. ";
+  return { text: `# Workspace changes\n\n${notice}Complete changed-path index:\n\n${indexLines(changes)}\n`, fallback: true, reason };
 }
 
 export function buildStaging(options: { root: string; jobId: string; snapshot: ConsolidationSnapshot; promptHash: string; summaryBytes?: number; priorDir?: string }): StagedWorkspace {
@@ -149,7 +165,7 @@ export function buildStaging(options: { root: string; jobId: string; snapshot: C
   const outputHashes = Object.fromEntries([...files].filter(([path]) => generatedOutput(path, memoryVersion)).map(([path, text]) => [path, textHash(text)]));
   const inputHash = textHash(JSON.stringify({ contentKey, outputHashes }));
   const privacyFallback = Boolean(options.priorDir && !prior.valid);
-  const diff = privacyFallback ? { text: changedPathIndex(prior.paths, prior.manifest?.fileHashes ?? {}, files), fallback: true } : workspaceDiff(prior.files, files);
+  const diff = privacyFallback ? { text: changedPathIndex(prior.paths, prior.manifest?.fileHashes ?? {}, files), fallback: true, reason: "privacy_or_retention" as const } : workspaceDiff(prior.files, files);
   files.set("phase2_workspace_diff.md", diff.text);
   for (const [path, text] of files) {
     const absolute = safeWorkspacePath(directory, path, true);
@@ -157,7 +173,8 @@ export function buildStaging(options: { root: string; jobId: string; snapshot: C
     if (parent) mkdirSync(safeWorkspacePath(directory, parent, true), { recursive: true, mode: 0o700 });
     writeFileSync(absolute, text, { flag: "wx", mode: generatedOutput(path, memoryVersion) || path === "phase2_workspace_diff.md" ? 0o600 : 0o400 });
   }
-  const manifest: StagingManifest = { schemaVersion: 1, memoryVersion, selectionHash: snapshot.selectionHash, controlEpoch: snapshot.controlEpoch, promptHash, inputHash, contentKey, retentionDeadline: snapshot.retentionDeadline, sources: sourceManifest, notes: noteManifest, fileHashes: {}, ...(diff.fallback ? { diffFallbackReason: privacyFallback ? "privacy_or_retention" as const : "size" as const } : {}) };
+  const diffFallbackReason: DiffFallbackReason | undefined = diff.fallback ? (privacyFallback ? "privacy_or_retention" : diff.reason ?? "size") : undefined;
+  const manifest: StagingManifest = { schemaVersion: 1, memoryVersion, selectionHash: snapshot.selectionHash, controlEpoch: snapshot.controlEpoch, promptHash, inputHash, contentKey, retentionDeadline: snapshot.retentionDeadline, sources: sourceManifest, notes: noteManifest, fileHashes: {}, diffPolicyVersion: DIFF_POLICY_VERSION, ...(diffFallbackReason ? { diffFallbackReason } : {}) };
   // Host-owned note IDs and applicability are available before the model writes claims.
   // Workspace tools can read the manifest but cannot replace it.
   writeFileSync(safeWorkspacePath(directory, "manifest.json", true), JSON.stringify(manifest, null, 2) + "\n", { flag: "wx", mode: 0o600 });

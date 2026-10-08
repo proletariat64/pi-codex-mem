@@ -1,4 +1,4 @@
-import type { Message } from "@earendil-works/pi-ai";
+import type { Message, SystemMessage, Tool } from "@earendil-works/pi-ai";
 import { normalizeModelUsage } from "../model-usage.ts";
 
 /** Phase 2 context counting/control, spec docs/spec/consolidation-context-spec-v0.2.0.md §3 and §8. */
@@ -65,6 +65,90 @@ export interface CapacityInput {
 export type CapacityResult =
   | { ok: true; capacity: ResolvedModelCapacity }
   | { ok: false; reason: "capacity_invalid"; field: "contextWindow" | "maxTokens" | "inputLimit" };
+
+/** The normalized provider-visible request: transcript messages only (never host envelopes). */
+export interface NormalizedRequest {
+  messages: readonly Message[];
+}
+
+export type CountResult =
+  | { ok: true; method: CountingMethod; units: TokenUnits; exact: boolean; /** Model-visible text, tools and framing, counted exactly once. */ baseEstimate: number }
+  | { ok: false; reason: "unsupported_content"; kind: "image" };
+
+const div4 = (text: string): number => Math.ceil(Buffer.byteLength(text, "utf8") / 4);
+
+function systemText(message: SystemMessage): string {
+  const parts: string[] = [];
+  if (typeof message.content === "string") parts.push(message.content);
+  else for (const block of message.content) parts.push(block.type === "text" ? block.text : "");
+  for (const [name, value] of Object.entries(message.sections ?? {})) {
+    parts.push(name);
+    if (value !== null) parts.push(value);
+  }
+  return parts.join("\n");
+}
+
+/** Replay declarations and removals to the final effective set; count each once (spec §3.1). */
+function effectiveTools(messages: readonly Message[]): Tool[] {
+  const effective = new Map<string, Tool>();
+  for (const message of messages) {
+    if (message.role !== "system") continue;
+    for (const tool of message.toolsAdded ?? []) effective.set(tool.name, tool);
+    for (const removed of message.toolsRemoved ?? []) effective.delete(removed.name);
+  }
+  return [...effective.values()];
+}
+
+function countTextBlocks(blocks: readonly { type: "text" | "image"; text?: string }[]):
+  { ok: true; units: number } | { ok: false } {
+  let units = 0;
+  for (const block of blocks) {
+    if (block.type === "image") return { ok: false };
+    units += div4(block.text ?? "");
+  }
+  return { ok: true, units };
+}
+
+/** Count the normalized model-visible request with the utf8_div4 fallback (spec §3.1–3.2).
+ * Host-only metadata, IDs and host serialization envelopes are not model-visible text. */
+export function countModelVisibleRequest(
+  request: NormalizedRequest,
+  policy: ContextCountingPolicy = DEFAULT_CONTEXT_COUNTING_POLICY,
+): CountResult {
+  let baseEstimate = 0;
+  for (const message of request.messages) {
+    if (message.role === "system") {
+      baseEstimate += div4(systemText(message)) + policy.messageFramingTokens;
+    } else if (message.role === "user") {
+      if (typeof message.content === "string") {
+        baseEstimate += div4(message.content) + policy.messageFramingTokens;
+      } else {
+        const text = countTextBlocks(message.content);
+        if (!text.ok) return { ok: false, reason: "unsupported_content", kind: "image" };
+        baseEstimate += text.units + policy.messageFramingTokens;
+      }
+    } else if (message.role === "assistant") {
+      baseEstimate += policy.messageFramingTokens;
+      for (const block of message.content) {
+        if (block.type === "text") baseEstimate += div4(block.text);
+        else if (block.type === "thinking") baseEstimate += div4(block.thinking);
+        else if (block.type === "toolCall") {
+          baseEstimate += div4(block.name) + div4(JSON.stringify(block.arguments)) + policy.toolCallFramingTokens;
+        }
+      }
+    } else {
+      baseEstimate += policy.toolResultFramingTokens + div4(message.toolName);
+      const text = countTextBlocks(message.content);
+      if (!text.ok) return { ok: false, reason: "unsupported_content", kind: "image" };
+      baseEstimate += text.units + (message.details === undefined ? 0 : div4(JSON.stringify(message.details)));
+    }
+  }
+  for (const tool of effectiveTools(request.messages)) {
+    baseEstimate += policy.toolDeclarationFramingTokens + div4(tool.name) + div4(tool.description)
+      + div4(JSON.stringify(tool.parameters));
+  }
+  return { ok: true, method: "utf8_div4_estimate", units: "estimated_tokens", exact: false, baseEstimate };
+}
 
 /** Validate the resolved capacity and derive limits per spec §3.3. Rejects missing,
  * non-finite, non-integral or non-positive values and non-positive input limits. */

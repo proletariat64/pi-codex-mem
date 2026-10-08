@@ -10,7 +10,7 @@ import { defaultConfig, type MemoryVersion } from "../src/config.ts";
 import { openStateDb } from "../src/store/db.ts";
 import { claimConsolidation } from "../src/store/consolidation.ts";
 import { consolidationPromptHash, runConsolidation } from "../src/pipeline/consolidate.ts";
-import { createContextCalibrationStore, createContextController } from "../src/pipeline/context-controller.ts";
+import { createContextCalibrationStore, createContextController, DEFAULT_CONTEXT_COUNTING_POLICY } from "../src/pipeline/context-controller.ts";
 import type { ConsolidationModelPort, ConsolidationTokenCount } from "../src/pipeline/model-port.ts";
 import type { ContextCalibrationStore, NormalizedRequest } from "../src/pipeline/context-controller.ts";
 
@@ -99,7 +99,7 @@ test("CT01: exact matching-tokenizer admission reserves exact tokens without a s
   const { port, calls } = fakePort([
     reply([{ type: "text", text: englishHeavy }, tool("workspace_list", {})], "toolUse"),
     reply([{ type: "text", text: "Written." }], "stop", 0, 0),
-  ], model, () => ({ tokens: 150_000, counterIdentity: { provider: "mock", modelId: "writer" } }));
+  ], model, () => ({ tokens: 150_000, counterIdentity: { provider: "mock", modelId: "writer", api: model.api, policyVersion: DEFAULT_CONTEXT_COUNTING_POLICY.version } }));
   assert.deepEqual(await run(setup, port), { status: "succeeded" });
   assert.equal(calls.length, 2);
   const rows = reservations(setup.db) as { estimate_input: number }[];
@@ -154,7 +154,7 @@ test("CT04: explicit provider context overflow is classified distinctly and bump
 test("CT04: exact-count mode reports overflow without raising the multiplier", async (t) => {
   const setup = fixture(t);
   const calibration = createContextCalibrationStore();
-  const counter = () => ({ tokens: 150_000, counterIdentity: { provider: "mock", modelId: "writer" } });
+  const counter = () => ({ tokens: 150_000, counterIdentity: { provider: "mock", modelId: "writer", api: model.api, policyVersion: DEFAULT_CONTEXT_COUNTING_POLICY.version } });
   const overflow = { ...reply([], "error", 150_000, 0), errorMessage: "prompt is too long: 150_012 tokens > 150_000 maximum" };
   const { port, calls } = fakePort([overflow], model, counter);
   assert.deepEqual(await run(setup, port, { contextCalibration: calibration }),
@@ -186,6 +186,19 @@ test("CT04: underestimation is calibrated into the next estimate and cannot gran
   assert.equal(budget.actual_input, 120_000, "the underestimate is charged honestly");
   assert.equal((setup.db.prepare("SELECT COUNT(*) AS n FROM budget_reservations").get() as { n: number }).n, 1,
     "the second request is denied at daily admission, not dispatched");
+});
+
+test("CT04: output-only writer usage retains the input reservation and denies further daily input", async (t) => {
+  const setup = fixture(t);
+  setup.config.limits.dailyInputTokens = 30_000;
+  const { port, calls } = fakePort([
+    reply([tool("workspace_list", {})], "toolUse", 0, 5),
+    reply([{ type: "text", text: "Must not dispatch" }]),
+  ]);
+  assert.deepEqual(await run(setup, port), { status: "budget_deferred", reason: "input_budget" });
+  assert.equal(calls.length, 1);
+  const rows = reservations(setup.db) as { estimate_input: number; actual_input: number }[];
+  assert.equal(rows[0]!.actual_input, rows[0]!.estimate_input);
 });
 
 test("CT02: unicode-heavy accumulated history that fits the window is admitted where bytes previously blocked it", async (t) => {

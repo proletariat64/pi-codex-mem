@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import type { Message } from "@earendil-works/pi-ai";
+import { normalizeContext, type Message, type Model } from "@earendil-works/pi-ai";
+import { stream as openAIStream } from "@earendil-works/pi-ai/api/openai-completions";
 import {
   DEFAULT_CONTEXT_COUNTING_POLICY,
   countModelVisibleRequest,
@@ -39,7 +40,7 @@ const visibleLedger = (noisy = false) => {
     + div4(userText) + policy.messageFramingTokens
     + div4(assistantText) + policy.messageFramingTokens
     + div4("read_file") + div4(JSON.stringify(callArguments)) + policy.toolCallFramingTokens
-    + div4("read_file") + div4(resultText) + div4(JSON.stringify(resultDetails)) + policy.toolResultFramingTokens;
+    + div4("read_file") + div4(resultText) + policy.toolResultFramingTokens;
   const messages: Message[] = noisy ? [
     { role: "system", content: instruction, sections: { summary: section }, toolsAdded: [tool], timestamp: 1 },
     { role: "user", content: userText, timestamp: 2 },
@@ -69,7 +70,7 @@ const visibleLedger = (noisy = false) => {
 /** Controller fixtures: the 272k-token writer model from spec §1.1. */
 const writer = { provider: "fake", id: "writer", api: "openai-completions", contextWindow: 272_000, maxTokens: 8_192 };
 const matchingCounter = (tokens: number) => ({
-  count: () => ({ tokens, identity: { provider: "fake", modelId: "writer" } }),
+  count: () => ({ tokens, identity: { provider: "fake", modelId: "writer", api: writer.api, policyVersion: policy.version } }),
 });
 const mismatchedCounter = (tokens: number) => ({
   count: () => ({ tokens, identity: { provider: "other-provider", modelId: "sibling-tokenizer" } }),
@@ -163,6 +164,30 @@ test("estimated admission applies the ceiling of baseEstimate times the safety m
   assert.equal(decision.estimateUnits, "estimated_tokens");
 });
 
+test("CT03: exact token counts require explicit matching transport and framing policy identities", () => {
+  for (const assertion of [
+    {},
+    { api: writer.api },
+    { policyVersion: policy.version },
+    { api: "openai-responses", policyVersion: policy.version },
+    { api: writer.api, policyVersion: policy.version + 1 },
+  ]) {
+    const controller = createContextController({ model: writer, counter: {
+      count: () => ({ tokens: 100, identity: { provider: writer.provider, modelId: writer.id, ...assertion } }),
+    } });
+    const decision = controller.admission({ messages: [] });
+    assert.ok(decision.action !== "blocked");
+    assert.equal(decision.count.method, "tokenizer_estimate", JSON.stringify(assertion));
+    assert.equal(decision.count.exact, false);
+    assert.equal(decision.admissionEstimate, 125);
+    controller.observeResult({ usage: { ...hostUsage, input: 200, cacheRead: 0, cacheWrite: 0 },
+      request: decision.count });
+    const calibrated = controller.admission({ messages: [] });
+    assert.ok(calibrated.action !== "blocked");
+    assert.equal(calibrated.admissionEstimate, 200, "identity-mismatched tokenizers still calibrate");
+  }
+});
+
 test("admission is blocked when capacity is unusable or content is unsupported", () => {
   const broken = createContextController({ model: { ...writer, contextWindow: -1 } });
   const capacityDecision = broken.admission({ messages: [] });
@@ -194,6 +219,41 @@ test("countModelVisibleRequest ignores host-only metadata, IDs and serialization
   // The old byte-compare baseline would differ; the normalized count must not.
   assert.notEqual(Buffer.byteLength(JSON.stringify({ messages: visibleLedger().messages }), "utf8"),
     Buffer.byteLength(JSON.stringify({ messages: visibleLedger(true).messages }), "utf8"));
+});
+
+test("CT02: normalized 16 KiB tool content is counted once regardless of host display details", async () => {
+  const text = "x".repeat(16_384);
+  const messages: Message[] = [
+    { role: "assistant", api: "openai-completions", provider: "fake", model: "writer", usage: hostUsage,
+      timestamp: 1, stopReason: "toolUse", content: [
+        { type: "thinking", thinking: "Replay reasoning", thinkingSignature: "reasoning_content" },
+        { type: "toolCall", id: "read", name: "read_file", arguments: {} },
+      ] },
+    { role: "toolResult", toolCallId: "read", toolName: "read_file", timestamp: 2, isError: false,
+      content: [{ type: "text", text }] },
+  ];
+  const plain = normalizeContext({ messages });
+  const decorated = normalizeContext({ messages: messages.map(message => message.role === "toolResult"
+    ? { ...message, details: { text, bytes: 16_384 } } : message) });
+  assert.deepEqual(decorated.messages[1]!.content, plain.messages[1]!.content);
+  const model: Model<"openai-completions"> = { ...writer, api: "openai-completions", name: "Writer",
+    baseUrl: "https://example.invalid", reasoning: true, input: ["text"], cost: hostUsage.cost };
+  const payloads: unknown[] = [];
+  for (const context of [plain, decorated]) {
+    // Capture adapter conversion only: stop before any HTTP or external model call.
+    await openAIStream(model, context, { apiKey: "fixture-only", onPayload: payload => {
+      payloads.push(payload);
+      throw new Error("Conversion captured; dispatch forbidden");
+    }, fetch: async () => { throw new Error("Network forbidden"); } }).result();
+  }
+  assert.equal(payloads.length, 2);
+  assert.deepEqual(payloads[1], payloads[0], "the installed adapter does not transmit tool details");
+  assert.match(JSON.stringify(payloads[0]), /Replay reasoning/, "replayed reasoning stays model-visible");
+  assert.deepEqual(countModelVisibleRequest(decorated), countModelVisibleRequest(plain));
+  const withoutReasoning = countModelVisibleRequest({ messages: [messages[1]!] });
+  const withReasoning = countModelVisibleRequest(plain);
+  assert.ok(withoutReasoning.ok && withReasoning.ok);
+  assert.ok(withReasoning.baseEstimate > withoutReasoning.baseEstimate, "replayed assistant content is not discarded with host details");
 });
 
 test("countModelVisibleRequest counts each effective tool declaration exactly once (CT02)", () => {

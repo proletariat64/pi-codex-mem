@@ -49,7 +49,7 @@ test("local hunks against a legacy published baseline record the diff policy wit
     const next = buildStaging({ root, jobId: "next", snapshot: nextSnap, promptHash: "prompt", priorDir: first.directory });
     assert.equal(next.diffFallback, false, "a legacy baseline must remain a valid incremental baseline");
     assert.equal(next.manifest.schemaVersion, 1);
-    assert.equal(next.manifest.diffPolicyVersion, 1);
+    assert.equal(next.manifest.diffPolicyVersion, 2);
     assert.equal(next.manifest.diffFallbackReason, undefined);
     const text = readFileSync(join(next.directory, "phase2_workspace_diff.md"), "utf8");
     assert.equal(
@@ -62,7 +62,7 @@ test("local hunks against a legacy published baseline record the diff policy wit
     assert.ok(Buffer.byteLength(text) < 3000, "a one-line edit to a large baseline must stay local");
     const repeat = buildStaging({ root, jobId: "repeat", snapshot: nextSnap, promptHash: "prompt", priorDir: first.directory });
     assert.equal(readFileSync(join(repeat.directory, "phase2_workspace_diff.md"), "utf8"), text);
-    assert.equal(repeat.manifest.diffPolicyVersion, 1);
+    assert.equal(repeat.manifest.diffPolicyVersion, 2);
     assert.equal(repeat.manifest.diffFallbackReason, undefined);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
@@ -86,7 +86,7 @@ test("a pathological baseline edit records the computation_limit fallback reason
     const next = buildStaging({ root, jobId: "next", snapshot: nextSnap, promptHash: "prompt", priorDir: prior });
     assert.equal(next.diffFallback, true);
     assert.equal(next.manifest.diffFallbackReason, "computation_limit");
-    assert.equal(next.manifest.diffPolicyVersion, 1);
+    assert.equal(next.manifest.diffPolicyVersion, 2);
     const text = readFileSync(join(next.directory, "phase2_workspace_diff.md"), "utf8");
     assert.match(text, /exceeded its computation limit/);
     assert.match(text, /- modified: raw_memories\.md/);
@@ -111,7 +111,7 @@ test("revoked prior plaintext never enters a diff even with oversized content", 
     const next = buildStaging({ root, jobId: "next", snapshot: snap([source("a", "safe\n")], 1), promptHash: "prompt", priorDir: first.directory });
     assert.equal(next.diffFallback, true);
     assert.equal(next.manifest.diffFallbackReason, "privacy_or_retention");
-    assert.equal(next.manifest.diffPolicyVersion, 1);
+    assert.equal(next.manifest.diffPolicyVersion, 2);
     const text = readFileSync(join(next.directory, "phase2_workspace_diff.md"), "utf8");
     assert.match(text, /Prior plaintext omitted/);
     assert.match(text, /- deleted: rollout_summaries\/b__choice-b\.md/);

@@ -22,8 +22,8 @@ staging, validation and publication code. Real provider model/version/tokenizer
 measurements: **unavailable**. No runtime accuracy claim follows from mock usage.
 
 The final gate results are recorded below after the final branch synchronization.
-Logs are captured outside the repository at `/tmp/impl-57-make-check.log` and
-`/tmp/impl-57-behavioral.log`; these paths are local evidence, not durable artifacts.
+Review-fix logs are captured outside the repository at `/tmp/review-make-check.log`
+and `/tmp/review-behavioral.log`; these paths are local evidence, not durable artifacts.
 The behavioral runner checks all discovered tests and requires the existing
 **60** labeled T01–T38 version/cross-version matrix rows; the matrix row count is
 not the total suite count.
@@ -33,7 +33,7 @@ not the total suite count.
 `consolidation-acceptance.test.ts` emits body-free JSON via `t.diagnostic` for
 both `CT09 {version}: 256 selected sources retain manifest evidence through actual
 paged-history compaction` cases. This is **real compaction code with mock
-transport**, not a real-model compaction/semantic measurement. Four complete
+transport**, not a real-model compaction/semantic measurement. Eight complete
 workspace-read results cross the soft limit; a tool-free compactor request is
 observed, replacement installs, writes settle, and CAS publishes. Every selected
 source/note path remains present and the actual manifest hash matches storage.
@@ -44,8 +44,8 @@ The final measured `make check` run yielded:
 
 | Version | Model | Counting | Sources/notes | Requests | Tools | Compactions | Writer pass wall time | Available |
 |---|---|---|---|---:|---:|---:|---:|---|
-| v1 | mock/acceptance | utf8_div4_estimate | 256 / 1 | 4 | 6 | 1 | 4506.062125 ms | yes |
-| v2 | mock/acceptance | utf8_div4_estimate | 256 / 1 | 4 | 5 | 1 | 1388.926399 ms | yes |
+| v1 | mock/acceptance | utf8_div4_estimate | 256 / 1 | 4 | 10 | 1 | 3510.206453 ms | yes |
+| v2 | mock/acceptance | utf8_div4_estimate | 256 / 1 | 4 | 9 | 1 | 1433.697141 ms | yes |
 
 Times measure `scheduler.runPass`, excluding fixture construction, and are single
 local samples under concurrent suite load, not latency targets or provider timing.
@@ -97,12 +97,37 @@ Code-review-graph was absent initially, then rebuilt locally without embeddings
 or cloud access (`build --skip-postprocess`); depth-2 impact inspection identified
 scheduler/candidate/extension and diagnostics consumers before edits. The graph
 has unresolved call sites; focused source/test inspection supplemented it. Active
-LSP diagnostics reported no findings, with one confirmed clean file and three
-inconclusive push-only checks; TypeScript's repository gate is the confirmed check.
+diagnostics on the five changed production files reported 63 auxiliary style
+warnings/hints in existing constructs, not TypeScript errors. The repository's
+TypeScript gate is the confirmed type check. The graph was refreshed and change
+impact analyzed against the actual default branch `origin/main` before final commit.
 
-Final gate record after synchronization with integration tip **e6dbad4** (merge
-reported already up to date): `make check` **619/619 passed**, 0 failed/skipped,
-**47,230.731045 ms** suite time, TypeScript passed, **9** upstream files verified.
+## Integration review corrections
+
+- Output-only usage previously allowed both writer and compactor to release their
+  input estimates and dispatch another request. Both transport regressions first
+  failed (`succeeded` instead of `input_budget`), then passed with the estimate
+  retained and the subsequent writer denied.
+- A normalized 16 KiB tool-result fixture previously counted 8,226 estimated units
+  with display details versus 4,123 without. The installed OpenAI adapter's payload
+  conversion is identical with/without details (captured before dispatch, no HTTP).
+  Counts now agree, retaining replayed reasoning and unsupported-image rejection.
+- Missing transport/framing identity previously passed as exact `tokens`. Absent
+  or mismatched API/policy assertions now remain calibrated `tokenizer_estimate`;
+  exact fixtures declare all identities. Counting policy advances to 2.
+- A 4,194,200-character added file previously emitted over-ceiling plaintext.
+  Complete-rendered-text checks now return `size` with the complete path index.
+  Exact-ceiling, +1 byte, UTF-8 and additional-index boundaries pass. Diff policy
+  advances to 2; old optional manifest fields remain readable.
+- Writer/compactor share narrow reservation, abort-listener and settlement helpers;
+  distinct stream forwarding, validation and gate ordering remain unchanged.
+  Cancellation, overflow, daily limits, slots, calls and timeout regressions pass.
+- CT09 and segmented fixtures use additional **visible** history now that display
+  details no longer inflate counts; selection and shipped resource bounds stay fixed.
+
+Final gate record after synchronization with integration tip **64f5eaa** (merge
+reported already up to date): `make check` **624/624 passed**, 0 failed/skipped,
+**50,071.017046 ms** suite time, TypeScript passed, **9** upstream files verified.
 `npm run test:behavioral`: **60/60** labeled matrix rows passed, 0 missing,
 0 failed/skipped, no unrelated failures. `git diff --check` passed.
 The semantic gate stays pending regardless of these implementation results;

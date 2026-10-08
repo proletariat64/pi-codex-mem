@@ -13,7 +13,7 @@
  * caller must fall back to the complete changed-path index and record
  * `computation_limit`; the 4 MiB output ceiling yields `size`.
  */
-export const DIFF_POLICY_VERSION = 1;
+export const DIFF_POLICY_VERSION = 2;
 
 /** Context lines shown around every changed region. */
 const CONTEXT_LINES = 3;

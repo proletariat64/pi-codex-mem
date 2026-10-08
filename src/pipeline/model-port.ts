@@ -2,13 +2,15 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 import type { ModelRef } from "../config.ts";
-import type { MatchingTokenCounter, NormalizedRequest } from "./context-controller.ts";
+import type { MatchingTokenCounter, NormalizedRequest, TokenCounterIdentity } from "./context-controller.ts";
 
 /** Result of the optional matching-counter seam: tokens plus the tokenizer's own identity. */
 export interface ConsolidationTokenCount {
   tokens: number;
-  /** The model/transport identity whose tokenizer produced the count; compared with the resolved model. */
-  counterIdentity: { provider: string; modelId: string; api?: string };
+  /** Assert the resolved model/API and full counting/framing policy version.
+   * The controller compares all assertions with its captured model and policy;
+   * missing/mismatched assertions are calibrated estimates, not exact counts. */
+  counterIdentity: TokenCounterIdentity;
 }
 
 export interface ConsolidationModelPort {

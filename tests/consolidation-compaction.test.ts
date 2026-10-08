@@ -172,7 +172,7 @@ test("CT05: accumulated pages crossing the soft limit compact at the settled sea
   assert.equal(report.selectedReadable, false, "successful working compaction is not a publication");
   assert.match(lines, /utf8_div4_estimate/);
   assert.match(lines, /estimated_tokens/);
-  assert.match(lines, /compactionPolicy=1; diffPolicy=1/);
+  assert.match(lines, /compactionPolicy=1; diffPolicy=2/);
   assert.match(lines, /model=mock\/writer; transport=openai-completions/);
   assert.match(lines, /window=60000 tokens/);
   assert.match(lines, /requests=4; tools=2; compactions=1/);
@@ -186,12 +186,31 @@ test("CT05: accumulated pages crossing the soft limit compact at the settled sea
 });
 
 
+test("CT04: output-only compactor usage retains its input charge and denies the resumed writer", async (t) => {
+  const setup = fixture(t);
+  setup.config.limits.dailyInputTokens = 50_000;
+  const { port, calls } = scriptedPort([
+    reply([{ type: "text", text: "界".repeat(12_000) }, tool("workspace_list")], "toolUse"),
+    reply([{ type: "text", text: "界".repeat(30_000) }, tool("workspace_list")], "toolUse"),
+    call => {
+      assert.ok(isCompactionCall(call));
+      return reply([{ type: "text", text: "Short derived summary" }], "stop", 0, 5);
+    },
+    reply([{ type: "text", text: "Must not dispatch" }]),
+  ]);
+  assert.deepEqual(await run(setup, port), { status: "budget_deferred", reason: "input_budget" });
+  assert.equal(calls.length, 3);
+  const rows = reservations(setup.db) as { estimate_input: number; actual_input: number }[];
+  assert.equal(rows[2]!.actual_input, rows[2]!.estimate_input);
+});
+
 // --- §5.2 segmented fallback: shared burst script on the segmentWindow fixture ---
 // Turn 1 (small): ~6k units of CJK plus a listing widens the fit band so the burst
 // unit fits the compactor alone while the full history cannot. Turn 2 burst: ~24.5k
 // units in one settled unit (text plus one ~16 KiB read page, results counted whole).
 const segmentTurn1 = () => reply([{ type: "text", text: "\u754c".repeat(7_300) }, tool("workspace_list")], "toolUse");
-const segmentBurstTurn = (text = 22_000) =>
+// Additional visible text keeps the segment fixture oversized now that host details are excluded.
+const segmentBurstTurn = (text = 27_500) =>
   reply([{ type: "text", text: "\u754c".repeat(text) }, tool("workspace_read", { path: "phase2_workspace_diff.md" })], "toolUse");
 const smallSummary = (marker: string) =>
   reply([{ type: "text", text: `Summary ${marker}: decisions, references, corrections and next reads.` }]);
@@ -273,7 +292,7 @@ test("CT06: one oversized unit cannot fit the compactor and ends context_irreduc
   const setup = fixture(t, "v1", { bigDiff: true });
   const { port, calls } = scriptedPort([
     segmentTurn1(),
-    segmentBurstTurn(28_000),
+    segmentBurstTurn(33_500),
     () => smallSummary("one"),
     () => { throw new Error("the oversized unit must never be dispatched"); },
   ], segmentWindow);
@@ -301,7 +320,7 @@ test("CT06: an unchanged-size segment summary discards the candidate with compac
   const setup = fixture(t, "v1", { bigDiff: true });
   const { port, calls } = scriptedPort([
     () => reply([{ type: "text", text: "\u754c".repeat(2_000) }, tool("workspace_list")], "toolUse"),
-    () => reply([{ type: "text", text: "\u754c".repeat(25_000) }, tool("workspace_read", { path: "phase2_workspace_diff.md" })], "toolUse"),
+    () => reply([{ type: "text", text: "\u754c".repeat(30_500) }, tool("workspace_read", { path: "phase2_workspace_diff.md" })], "toolUse"),
     // A same-size summary of the oldest range: valid but without measurable reduction.
     () => reply([{ type: "text", text: "Same-size: " + "\u754c".repeat(5_400) }]),
   ], segmentWindow);

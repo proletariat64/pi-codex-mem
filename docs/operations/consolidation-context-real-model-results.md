@@ -121,6 +121,73 @@ A subsequent bounded reader-guidance follow-up is separate from the Phase 2
 writer implementation. Offline guidance tests cannot convert these recorded
 failures into semantic passes or establish real compaction.
 
+### Run 006: new publications with paired old/new reader guidance
+
+Runner `40e73978d41e10256bc23c47b61204597e99321f` executed one new
+standard-fixture experiment. Both real writers and the new readers used
+`38ce511b003e96566d71eaa7817c2159ffee2f9e`; the old reader used `f087c670`.
+Extraction/consolidation policies, fixture, questions, model and limits were
+unchanged. Reader guidance was an explicitly separate foreground follow-up,
+not a claimed Phase 2 evidence-loss fix.
+
+An offline attempt to relocate run-005 publications failed the production
+`artifact_integrity` check: publication directories are bound to their canonical
+root. No identity was rewritten or validation bypassed. Instead, run 006 made
+new genuine publications and restored each snapshot to its **same canonical
+root** before the paired reader arms. All 1,220 run-005 files remained unchanged.
+
+| Slot | Publication / result | Provider requests | Executed tools | Elapsed (s) | Real compactions |
+|---|---|---:|---:|---:|---:|
+| Writer v1 | No; `model_call_budget` | 12 | 15 | 51.535 generation | 0 |
+| Writer v2 | Yes | 11 | 10 | 25.457 generation | 0 |
+| Old/new v1 readers | Unavailable; no publication | 0 | 0 | Not run | Not applicable |
+| Old v2 reader | Complete; exact scope path omitted | 10 | 6 | 26.941 wall | No writer executed |
+| New v2 reader | All four original fact criteria pass | 13 | 9 | 28.056 wall | No writer executed |
+
+The v2 readers used the same generation and manifest, configuration, questions,
+constant answer instructions and tool schemas. Only reader guidance differed.
+The new reader delivered both routes and conflict rules, the exact workspace
+path with no unsupported cross-project reuse, and deployment approver/date
+abstention. All four responses were final answers within the original four-call
+limit. The old reader still omitted the exact workspace path after reading it.
+Supersession was supported by the combined pinned writer summary and rollout;
+the cited rollout alone does not name the superseded route. The new abstention
+session used two distinct searches despite the single-query fallback guidance;
+factual success does not establish complete guidance compliance.
+
+This is one legacy `renderSection` consumer comparison, not a native foreground
+carrier-admission or full-host equivalence proof, nor evidence of general reader
+superiority. Both v1 reader arms have unavailable outputs, not abstentions.
+**Writer-and-answer acceptance remains unresolved:** both versions must publish
+and deliver the required facts. Both writer observations and all actual writer
+transcripts show zero compactions; compaction acceptance is still pending.
+
+The 46 provider requests settled with no new unknown usage or infrastructure
+fault. Run 006 added USD 0.10679425 to the estimate. Global accounting is now
+**USD 0.72274875 settled + USD 0.04409125 preserved unknown reservation =
+USD 0.76684000 accounted** against the USD 20 estimated cap. These are not
+invoices; the historical unknown actual charge remains unresolved. Paid calls
+stopped after the assigned attempts, with no retries. The full private review is
+`semantic-run-006/result-review.md`.
+
+Offline comparison with run-005 candidate v1 explains the completion boundary:
+run 006 used ten reading/navigation requests, then requested the required writes
+at requests 11 and 12. Its last response was still `toolUse`; request 13 was
+correctly rejected before genuine final confirmation, output validation or
+publication. Run 005 used eight reading/navigation requests, wrote at 9 and 10,
+and finished with a genuine stop at 11. Both used 15 tools and identical writer
+system/task/tool declarations. This was not context overflow. The final run-006
+write acknowledgement was not archived, so its successful completion cannot be
+asserted from retained artifacts.
+
+Neither trajectory disclosed the actual request cap or remaining host counters
+to the writer, despite requiring final confirmation. That visibility gap is a
+credible contributor, not proof that guidance guarantees completion. A generic
+host-budget-framing follow-up must preserve the limits, genuine stop and
+validation/publication gates, and needs separate real-model verification. It
+must not salvage the failed run or replace its evidence. Private diagnosis:
+`semantic-run-006/v1-completion-diagnosis.md`.
+
 ## Semantic findings and compaction (runs 003/004)
 
 The frozen questions required `/api/source-255` to supersede `/api/old` for
@@ -179,14 +246,17 @@ PR-ready declaration follow from this result.
 
 Private evidence is retained outside this repository under
 `/home/ubuntu/dev/spec-notes/consolidation-context-v0.2.0/`, including the
-run-002 through run-005 plans, ledgers, slot results and traces. The
+run-002 through run-006 plans, ledgers, slot results and traces. The
 run-004 factual review is `semantic-run-004/result-review.md` and the run-005
-review is `semantic-run-005/result-review.md`; private synthetic
+review is `semantic-run-005/result-review.md`. Run 006 is reviewed in
+`semantic-run-006/result-review.md`; private synthetic
 source and generated bodies are not reproduced in this public report.
 
 The run-004 continuation used the isolated support checkout
 `test/context-semantic-runner` at `787107f9641ab4ab7b84a65d79c8f4d077313774`;
 run 003 used runner `37d57b7c7b8e03b9d5ba58d3e5c55b6be19149cb`. These runner
 commits preserve guarded plans/traces, are not product candidates, and their
-scripts reference local frozen checkout paths. The evaluated product candidate
-remains `f087c670df4c609439de627990661d30792d28c1`.
+scripts reference local frozen checkout paths. The original comparison evaluated
+`f087c670df4c609439de627990661d30792d28c1`. The separately identified run-006
+follow-up evaluated `38ce511b003e96566d71eaa7817c2159ffee2f9e` with new reader
+guidance; it does not replace the original comparison or its failed slots.

@@ -86,7 +86,42 @@ Each of the four newly attempted nonpublished slots has four `no-answer` records
 the preserved run-003 failure also has four blocked `no-answer` records. Those
 are unavailable outputs, not successful semantic abstentions.
 
-## Semantic findings and compaction
+### Run 005: corrected answer-tool validation
+
+A separately authorized standard-fixture repetition used runner
+`f78dd7e13ad8419327da218fe568dd534844f149`, including the SDK argument-validation
+fix at `9948a2d`. It kept the original fixture, producer commits, model, questions
+and limits. It did not overwrite earlier failures or introduce controlled history.
+The candidate was evaluated in a separate detached checkout at `f087c670`;
+documentation commits on the integration branch were not substituted for the
+frozen producer.
+
+| Producer/version | Publication | Writer + answer requests | Elapsed writer / total (s) | Semantic limitation | Real compactions |
+|---|---|---:|---:|---|---:|
+| Baseline v1 | No; `context_budget` | 4 + 0 | 26.863 / 30.354 | No answers available | 0 |
+| Candidate v1 | Yes | 11 + 12 | 68.646 / 105.086 | Source-128 answer reached its four-request limit without final text | 0 |
+| Baseline v2 | Yes | 12 + 12 | 41.212 / 75.952 | Exact project path omitted from scope answer | 0 |
+| Candidate v2 | Yes | 11 + 12 | 37.880 / 75.057 | Exact project path omitted from scope answer | 0 |
+
+All four assigned attempts finished once: 74 provider requests, no new unknown
+usage, and no infrastructure or identity fault. Candidate v1 delivered the other
+three required answers, but searched the handbook then listed two directory pages
+before requesting another list on its fourth answer turn. It did not deliver the
+middle-route fact. Both v2 producers delivered the route/conflict facts and
+approval/date abstention, but omitted the required exact project path even after
+reading it. SDK error handling is corrected; model delivery is still incomplete.
+
+This repetition added USD 0.15246450 to the settled conservative estimate. Global
+accounting at its end was **USD 0.61595450 settled + USD 0.04409125 preserved
+unknown reservation = USD 0.66004575 accounted**. These remain estimates, not an
+invoice. No new reservation remained unresolved. Full private review:
+`semantic-run-005/result-review.md`.
+
+A subsequent bounded reader-guidance follow-up is separate from the Phase 2
+writer implementation. Offline guidance tests cannot convert these recorded
+failures into semantic passes or establish real compaction.
+
+## Semantic findings and compaction (runs 003/004)
 
 The frozen questions required `/api/source-255` to supersede `/api/old` for
 that endpoint only; `/api/source-128` with the old route applicable only before
@@ -126,7 +161,7 @@ no real post-compaction semantic-retention evidence.
 
 ## Spend and interpretation
 
-The final ledger reports **USD 0.46349000 settled conservative estimate** plus
+The run-004 final ledger reports **USD 0.46349000 settled conservative estimate** plus
 **USD 0.04409125 pending unknown exposure**, or **USD 0.50758125 accounted**.
 The pending amount is the original run-003 unknown request; run 004 added no
 unknown reservation. These guard estimates are not an invoice, do not resolve the
@@ -144,8 +179,9 @@ PR-ready declaration follow from this result.
 
 Private evidence is retained outside this repository under
 `/home/ubuntu/dev/spec-notes/consolidation-context-v0.2.0/`, including the
-run-002, run-003, and run-004 plans, ledgers, slot results and traces. The
-run-004 factual review is `semantic-run-004/result-review.md`; private synthetic
+run-002 through run-005 plans, ledgers, slot results and traces. The
+run-004 factual review is `semantic-run-004/result-review.md` and the run-005
+review is `semantic-run-005/result-review.md`; private synthetic
 source and generated bodies are not reproduced in this public report.
 
 The run-004 continuation used the isolated support checkout

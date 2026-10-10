@@ -453,6 +453,44 @@ generation or final output, and leave original questions and limits intact.
 Original Phase-2 policy and earlier failed results remain unchanged. No native
 foreground-host, fresh Writer, general reliability or Compactor proof is claimed.
 
+### Run 013: generic citation guidance did not produce a clean v2 result
+
+Runner `c0b949fb4a774aa4c4c35d69c0a6ac290838f92d` sealed the separately declared
+generic citation-provenance follow-up. Parent verification passed 38 focused
+tests and typecheck; independent review approved the bounded mechanism and
+frozen plan. The added host rule distinguishes summary from file evidence,
+requires matching labels/paths/source IDs, and calls for an observed basis for
+a limited abstention. It includes no fixture facts. Original `ANSWER_SYSTEM`,
+questions, published generation, policies, model and limits remain unchanged;
+previous consumer frames and failed outputs remain intact.
+
+Executed once: **12 requests and eight successful tool executions**. All four
+answers are genuine nonempty text-only STOPs and all four factual checks pass.
+**Only two citation checks pass**: source-128 and scope. Source-255 still links
+rollout line 7 for the old spelling that exists only in the pinned summary,
+without distinguishing those contributions. Deployment abstention still lacks
+an evidence-path/source-ID citation. The generic rule therefore did not resolve
+clean v2 acceptance; task #15 remains open. No answer is repaired or replaced.
+
+The actual fourth abstention wire disables tools and preserves three genuine
+prior call/result pairs. Other answers stop earlier. There are no retries,
+Writer/Compactor calls, runtime errors or new unknown usage. Exact publication,
+manifest, epoch and selection validate; all **5,335 original run-001 through
+run-012 files** stay unchanged. New copied run-013 SQLite sidecars from read-only
+verification are disclosed and retained, not claimed absent or used to alter
+original state. No execution process remains running.
+
+New settled estimate: **USD 0.00612825**. Global accounting:
+**USD 0.92052875 settled + USD 0.04743375 held = USD 0.96796250 accounted**
+against USD 20, not invoice amounts. Both unknown reservations remain held.
+Complete unmodified outputs and support matrices: `semantic-run-013/result-review.md`.
+
+Next work is offline inspection of actual wire rule delivery, instruction
+priority and the v2 summary/file citation interface before another protocol
+change. A rule not followed is not proof of a dropped-message bug, and a further
+text change is not a guaranteed remedy. No native foreground-host, fresh Writer,
+reliability or Compactor proof is claimed.
+
 ## Semantic findings and compaction (runs 003/004)
 
 The frozen questions required `/api/source-255` to supersede `/api/old` for

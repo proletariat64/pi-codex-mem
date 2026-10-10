@@ -18,6 +18,20 @@ The `UNAVAILABLE` label in `src/doctor.ts` is derived from `MemoryDiagnostics.se
 - [ ] The port retains enough operational Pi diagnostics to distinguish no publication, failed writer, stale source, blocked generation, incompatible host and missing model; diagnostic interfaces must not modify Codex memory behavior.
 - [ ] Run actual Pi TUI and noninteractive tests, not only mocked protocol tests.
 
+## Implementation checkpoint — P0 context accounting (2026-10-10)
+
+**Code landed on this branch; parity is NOT complete.**
+
+- `src/pipeline/codex-context.ts`: ported Codex's `ceil(UTF8_bytes / 4)` model-visible history heuristic with the strictly necessary Pi-to-Codex mapping (text, JSON tool-call arguments, tool response bodies, projected tool declarations). Transport metadata and duplicated tool-result `details` are excluded.
+- `src/pipeline/consolidate.ts`: replaced the byte-versus-token `JSON.stringify(context)` context check with provider-reported total tokens plus items appended after the last assistant response; before provider usage is known, use the initial model-visible estimate. Removed the arbitrary 70% capacity cap; the remaining interim hard-window gate is not Codex auto-compaction.
+- `tests/codex-context.test.ts`: added ~404 KB/272k-window regression, Unicode/escaping, Pi projected tools, provider usage delta and non-text handling.
+- `tests/consolidation-agent.test.ts`: replaced historical false-byte-overflow assertions with token-based continuation and real reported hard-overflow tests.
+- `/memory status`, `/memory doctor`, `src/diagnostics.ts` and their read-only diagnostics are unchanged.
+
+**Validation performed:** independent Node test of the UTF-8/4 arithmetic (404 KB -> 103,429 approximate tokens) in an isolated local prototype. **Not yet performed:** package typecheck, full repository tests, actual Pi foreground/Writer transport, new-generation publication, doctor READABLE acceptance. Do not present this as a working end-to-end memory port.
+
+**Known remaining upstream deviations (must be addressed next):** Codex mid-turn/pre-turn compaction, model-specific effective window/token accounting, Codex tool-output truncation, original consolidation tool workflow, byte-identical rendered prompts, custom 12-call/40-tool/300s/4k-output limits, custom publication policies. Keep necessary data-integrity/permission isolation and read-only diagnostics without introducing new memory policy.
+
 ## Source policy
 
 The canonical behavior is the implementation of `openai/codex` at a **single pinned commit**. Do not port from a moving `main` or from README descriptions alone. The current legacy vendored templates in `UPSTREAM.md` reference `1cc7e2361237ce7244430ee1d581c77f95c57ac8`. The upstream commit observed while starting this branch was `806d9732c974bc8a51b8317c1bd8985544fe627c`; it is **not yet an approved full-file implementation baseline**. Select and audit one baseline before replacing behavior.

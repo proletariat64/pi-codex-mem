@@ -412,6 +412,47 @@ This successful reader replication links to the genuine run-008 v1 publication;
 it is not a fresh writer, original baseline comparison, general reliability,
 native foreground-host equivalence, compactor proof or replacement of failures.
 
+### Run 012: v2 factual success, repeated citation gaps
+
+Independently reviewed runner `65a59712f8e2fcdec02ef76e44dea3b698a6a5a5`
+executed one reader-only v2 group against the genuine run-007 publication:
+`43fb0a3c-d049-4de9-9acb-1da8265c6355`, manifest
+`5e2f64fb39f5e0304d897d56fa4edde8268ee0e1b54a3c8134663756dc46eeeb`.
+The canonical run-007 evidence root, original v2 policy/configuration and
+extraction identity stayed unchanged. Usage state was copied separately. The
+numeric completion framing matches run 011, without a citation reminder, new
+fact, altered question or relaxed limit.
+
+Executed once: **13 requests, nine successful tool executions, 33.396 seconds**.
+All four final answers are genuine nonempty tool-free STOPs. All four factual
+criteria pass, but **only one citation check passes**. Source-255's old spelling
+and the additional supersession claim in the scope answer come from the pinned
+summary, yet their links credit only the rollout that does not spell `/api/old`.
+The deployment abstention is factually correct but contains no evidence path or
+source identifier. Source-128's actual read and citation are supported. These
+existing citation requirements are not waived, and task #15 remains open.
+
+The actual fourth abstention wire disables tools and retains all three preceding
+call/result pairs. The other answers end on request three. No retries, fifth
+requests, Writer/Compactor calls, errors or new unknown usage occurred. Every
+original run-001 through run-011 file hash remains unchanged. New copied run-012
+SQLite sidecars created by read-only verification are disclosed and retained;
+original state and existing result bytes were not altered.
+
+New settled estimate: **USD 0.00509650**. Global accounting:
+**USD 0.91440050 settled + USD 0.04743375 held = USD 0.96183425 accounted**
+against USD 20, not invoice amounts. Both unknown reservations remain held.
+Full actual answers and evidence qualifications: `semantic-run-012/result-review.md`.
+
+Because the citation defects repeat the earlier v2 result, the next preparation
+is a **separate changed-consumer follow-up**, not another blind unchanged rerun:
+generic guidance must distinguish summary evidence from file evidence, match
+labels/paths/source IDs, and cite an actually observed basis for a limited
+abstention. It must add no fixture facts, fabricate no path, modify no published
+generation or final output, and leave original questions and limits intact.
+Original Phase-2 policy and earlier failed results remain unchanged. No native
+foreground-host, fresh Writer, general reliability or Compactor proof is claimed.
+
 ## Semantic findings and compaction (runs 003/004)
 
 The frozen questions required `/api/source-255` to supersede `/api/old` for

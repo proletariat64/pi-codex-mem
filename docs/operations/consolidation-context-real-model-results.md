@@ -298,6 +298,27 @@ these are not invoice amounts. The ledger remains stopped on `unknown_usage`.
 Paid calls are paused; further investigation is offline only. Private review:
 `semantic-run-009/result-review.md`.
 
+Offline replay subsequently reproduced a concrete callback-contract defect:
+the worker passed `{body}` to a transcript helper that accepted only
+`{context, response}`. The installed SDK awaits this callback before network
+dispatch. The helper threw while accessing undefined `response.content`,
+producing an empty error response with zero usage and no wire artifact. This
+is the strongest supported explanation, **not proof of run-009's historical
+cause**: its original SDK error message was not retained. Neither reservation
+is released on the basis of the offline replay.
+
+Runner repair `37b971e9daba9476b29f06aae45f548ec3700a93` adds explicit sanitized
+wire snapshots and private redacted error/phase capture before settlement.
+Regression tests invoke the actual production callback through the installed
+ModelRuntime/Codex serializer, using synthetic credentials and intercepted
+transport. First-request capture and final-request tool deactivation preserve
+model input and historical tool calls/results; capture failures remain
+fail-closed. Parent verification passed 24 focused tests, typecheck and diff
+checks; independent review approved. Three historical run-006 frozen-identity
+tests remain failing identically on the preceding runner baseline; their plans
+were not rewritten. This is offline mechanism evidence only. No paid retry,
+new writer, real fourth-request delivery or completed answer is established.
+
 ## Semantic findings and compaction (runs 003/004)
 
 The frozen questions required `/api/source-255` to supersede `/api/old` for

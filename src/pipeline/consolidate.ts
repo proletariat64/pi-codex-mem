@@ -7,6 +7,7 @@ import type { MemoryConfig, MemoryVersion, ModelRef } from "../config.ts";
 import { truncateUtf8 } from "../snapshot.ts";
 import { redactSensitive } from "../sensitive.ts";
 import { normalizeModelUsage } from "../model-usage.ts";
+import { estimateModelVisibleTokens, estimatedTokensAfterLastAssistant } from "./codex-context.ts";
 import { reconcileModelCall, reserveModelCall } from "../store/jobs.ts";
 import { renewConsolidationLease, type ConsolidationLease } from "../store/consolidation.ts";
 import { createWorkspaceTools } from "./workspace-tools.ts";
@@ -106,6 +107,7 @@ export async function runConsolidation(input: ConsolidationRunInput): Promise<Co
   let calls = 0;
   let tools = 0;
   let repairs = 0;
+  let lastProviderTotalTokens: number | null = null;
   let agent: Agent | undefined;
   const pendingReservations = new Set<string>();
   const charge = (id: string, usage?: { input: number; output: number }) => {
@@ -156,16 +158,27 @@ export async function runConsolidation(input: ConsolidationRunInput): Promise<Co
       : input.canStartRequest?.() ?? "ready";
     if (readiness !== "ready") { halt({ status: "paused", reason: readiness }); return rejectRequest(); }
     if (calls >= MAX_CALLS) { halt({ status: "blocked", reason: "model_call_budget" }); return rejectRequest(); }
-    // Agent's normalized transcript includes the full accumulated messages and tool declarations.
-    const inputBytes = Buffer.byteLength(JSON.stringify(context), "utf8");
-    if (inputBytes > Math.floor((model.contextWindow - maxTokens - 1_024) * 0.7)) {
+    // Match Codex history accounting: provider-reported total usage plus newly
+    // appended items; fall back to UTF-8/4 model-visible history estimation.
+    // Never compare the byte size of JSON.stringify(context) with token limits.
+    let inputTokens: number;
+    try {
+      inputTokens = lastProviderTotalTokens === null
+        ? estimateModelVisibleTokens(context)
+        : lastProviderTotalTokens + estimatedTokensAfterLastAssistant(context);
+    } catch {
+      halt({ status: "blocked", reason: "context_accounting_unavailable" }); return rejectRequest();
+    }
+    // The native auto-compaction turn loop is not yet ported. Until it is,
+    // enforce only the model's declared hard capacity (not an invented 70% cap).
+    if (inputTokens + maxTokens > model.contextWindow) {
       halt({ status: "blocked", reason: "context_budget" }); return rejectRequest();
     }
     const id = randomUUID();
     let budget: ReturnType<typeof reserveModelCall>;
     try {
       budget = reserveModelCall(input.db, { id, now: clock(), timezone: input.config.timezone,
-        provider: model.provider, model: model.id, estimate: { input: inputBytes, output: maxTokens },
+        provider: model.provider, model: model.id, estimate: { input: inputTokens, output: maxTokens },
         limits: { input: input.config.limits.dailyInputTokens, output: input.config.limits.dailyOutputTokens,
           requests: input.config.limits.dailyRequests } });
     } catch {
@@ -196,7 +209,9 @@ export async function runConsolidation(input: ConsolidationRunInput): Promise<Co
           const event = item.value;
           if (event.type === "done" || event.type === "error") {
             const message = event.type === "done" ? event.message : event.error;
-            charge(id, usableUsage(message));
+            const usage = usableUsage(message);
+            charge(id, usage);
+            if (usage) lastProviderTotalTokens = usage.input + usage.output;
             if (!fence()) throw new Error("aborted");
             if (message.stopReason === "error") halt(providerFailure(message.errorMessage));
             else if (message.stopReason === "aborted") halt({ status: "cancelled", reason: "aborted" });

@@ -89,13 +89,26 @@ export function estimateModelVisibleTokens(context: unknown): number {
     visible += contentBytes(message.content);
     if (message.role === "toolResult") visible += bytes(message.toolCallId) + bytes(message.toolName);
   }
-  if (request.tools !== undefined) {
-    if (!Array.isArray(request.tools)) throw new Error("invalid_model_tools");
-    for (const rawTool of request.tools) {
+  // Pi's context_with_system carrier can embed tool declarations as
+  // system-message toolsAdded instead of supplying a top-level tools array.
+  // Deduplicate names when both representations are present in the projection.
+  const tools = new Map<string, Record<string, unknown>>();
+  const addTools = (source: unknown) => {
+    if (source === undefined) return;
+    if (!Array.isArray(source)) throw new Error("invalid_model_tools");
+    for (const rawTool of source) {
       const tool = record(rawTool);
-      if (!tool) throw new Error("invalid_model_tool");
-      visible += bytes(tool.name) + bytes(tool.description) + jsonBytes(tool.parameters);
+      if (!tool || typeof tool.name !== "string") throw new Error("invalid_model_tool");
+      tools.set(tool.name, tool);
     }
+  };
+  for (const rawMessage of request.messages) {
+    const message = record(rawMessage);
+    if (message?.role === "system") addTools(message.toolsAdded);
+  }
+  addTools(request.tools);
+  for (const tool of tools.values()) {
+    visible += bytes(tool.name) + bytes(tool.description) + jsonBytes(tool.parameters);
   }
   return Math.ceil(visible / BYTES_PER_TOKEN);
 }

@@ -3,6 +3,21 @@
 **Branch:** `refactor/strict-codex-memory-port` (forked from `main`; PR #58 is not included)
 **Status:** IN PROGRESS. This document is not a claim of runtime parity.
 
+## P0 regression: selected memory UNAVAILABLE
+
+The immediate user-visible failure motivating PR #58 was `/memory doctor` showing `selected memory UNAVAILABLE` after the consolidation writer failed to publish a readable generation. This must be a **primary acceptance case**, not an incidental diagnostic.
+
+Documented failure from `docs/spec/consolidation-context-spec-v0.2.0.md` §1.1: the original writer used `Buffer.byteLength(JSON.stringify(context))` (bytes) against a token-valued limit; for a 272k-token model with 4k output and 1,024 overhead it blocked at 186,883 bytes. An illustrative 404 KB English-heavy request is roughly 101k tokens under upstream Codex's bytes/4 estimation and must not be rejected simply because bytes were mistaken for tokens. The old writer also lacked Codex-like cumulative-history compaction. This is a proven code-level issue; it does **not** prove every instance of UNAVAILABLE has that single cause.
+
+The `UNAVAILABLE` label in `src/doctor.ts` is derived from `MemoryDiagnostics.selectedReadable`. `src/diagnostics.ts` sets that based on `getPublishedGeneration()`; the latter also checks blocked reading, published state, current control epoch, source validity/retention and extraction identity. Preserve all such distinctions so doctor explains *why* selected memory is unavailable and whether generation is pending, blocked, failed or invalidated.
+
+**Required parity/operational acceptance:**
+- [ ] With 256 selected synthetic sources, a fitting normalized context is not falsely rejected by byte-versus-token unit confusion. The memory writer uses the chosen pinned Codex's counting/context mechanism, not a new hand-written alternative.
+- [ ] Demonstrate a real completed consolidation publication and a subsequent `selected memory READABLE` status and working retrieval; retaining only extracted sources is insufficient.
+- [ ] With intentional writer failure, `/memory status` and `/memory doctor` remain available, read-only and clearly report the actual terminal reason; no false claim of readable memory.
+- [ ] The port retains enough operational Pi diagnostics to distinguish no publication, failed writer, stale source, blocked generation, incompatible host and missing model; diagnostic interfaces must not modify Codex memory behavior.
+- [ ] Run actual Pi TUI and noninteractive tests, not only mocked protocol tests.
+
 ## Source policy
 
 The canonical behavior is the implementation of `openai/codex` at a **single pinned commit**. Do not port from a moving `main` or from README descriptions alone. The current legacy vendored templates in `UPSTREAM.md` reference `1cc7e2361237ce7244430ee1d581c77f95c57ac8`. The upstream commit observed while starting this branch was `806d9732c974bc8a51b8317c1bd8985544fe627c`; it is **not yet an approved full-file implementation baseline**. Select and audit one baseline before replacing behavior.

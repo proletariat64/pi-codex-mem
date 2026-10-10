@@ -228,6 +228,42 @@ confirm zero actual compactions. Compaction acceptance remains pending, and no
 controlled-history permission is implied. Private review:
 `semantic-run-007/result-review.md`.
 
+### Run 008: explicitly authorized unchanged v1-only reproduction
+
+The user authorized one fresh v1-only trial, not a new fix or automatic retry.
+Runner `55b9a19a130cba0b1cbba2a36502f8f4f9414d2a` used detached candidate
+`32ed334557acd703d09f27bc419e65c79481b57d`, with the same policy, reader guidance,
+model, 256-source/one-note fixture, questions and limits as run 007. The new
+canonical root changed run-owned path provenance, not evidence bytes. All 602
+prior run-007 files remained unchanged; older frozen run-005/006 hashes also
+matched.
+
+This v1 writer genuinely published: 11 requests, 16 tool starts, 55.709 seconds,
+two successful required writes and a tool-free final stop through production
+validation/publication. Two recoverable missing-file reads remain in its history.
+This demonstrates one bounded completion, not a causal improvement or general
+reliability guarantee.
+
+| Answer | Result | Provider requests | Executed memory tools |
+|---|---|---:|---:|
+| Source-255 correction | Complete and supported | 2 | 1 |
+| Source-128 conflict | Complete and supported | 3 | 2 |
+| Exact scope | Four-call limit; no final text | 4 | 3 |
+| Deployment approver/date | Four-call limit; no final text | 4 | 3 |
+
+Both failed answer sessions requested a search on their fourth response; those
+searches were not executed and no fifth request was sent. Neither is a successful
+abstention. **Writer-and-answer acceptance remains unresolved.** Run 007's v2
+pass remains separate, and its v1 failure is not replaced. No actual compaction
+occurred.
+
+The 24 provider requests newly settled USD 0.07984875 in conservative estimates.
+Global accounting is **USD 0.89505950 settled + USD 0.04409125 preserved unknown
+reservation = USD 0.93915075 accounted** against the USD 20 estimated cap,
+not an invoice guarantee. Paid calls stopped after the single assigned trial;
+no additional experiment followed. Private review:
+`semantic-run-008/result-review.md`.
+
 ## Semantic findings and compaction (runs 003/004)
 
 The frozen questions required `/api/source-255` to supersede `/api/old` for
@@ -286,11 +322,12 @@ PR-ready declaration follow from this result.
 
 Private evidence is retained outside this repository under
 `/home/ubuntu/dev/spec-notes/consolidation-context-v0.2.0/`, including the
-run-002 through run-007 plans, ledgers, slot results and traces. The
+run-002 through run-008 plans, ledgers, slot results and traces. The
 run-004 factual review is `semantic-run-004/result-review.md` and the run-005
 review is `semantic-run-005/result-review.md`. Run 006 is reviewed in
 `semantic-run-006/result-review.md` and run 007 in
-`semantic-run-007/result-review.md`; private synthetic
+`semantic-run-007/result-review.md`; run 008 is reviewed in
+`semantic-run-008/result-review.md`. Private synthetic
 source and generated bodies are not reproduced in this public report.
 
 The run-004 continuation used the isolated support checkout
@@ -301,5 +338,6 @@ scripts reference local frozen checkout paths. The original comparison evaluated
 `f087c670df4c609439de627990661d30792d28c1`. The separately identified run-006
 follow-up evaluated `38ce511b003e96566d71eaa7817c2159ffee2f9e` with new reader
 guidance. Run 007 evaluated `32ed334557acd703d09f27bc419e65c79481b57d` with live
-writer-budget framing. Neither replaces the original comparison or its failed
-slots.
+writer-budget framing. The explicitly authorized run-008 v1 reproduction used
+that same detached candidate and policy. These follow-ups do not replace the
+original comparison or its failed slots.

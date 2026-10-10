@@ -50,6 +50,29 @@ for (const version of ["v1", "v2"] as const) {
   });
 }
 
+// This tests delivery of guidance across representations, not whether a model follows it.
+for (const version of ["v1", "v2"] as const) {
+  test(`${version}: bounded lookup and scope guidance survive clipping or cause whole-carrier omission`, () => {
+    const recorded = "Record batch-heron-73 applies only to /projects/amber/backend; approval is unknown.";
+    const view = makeView(`${recorded}\n\n${"x".repeat(3_000)}`, version);
+    const carrier = renderMemoryCarrier(view, cwd, { capacity: 10_000 });
+    assert.equal(carrier.representation, "clipped");
+    assert.equal(evidence(carrier), recorded);
+    const guidance = renderMemorySection(view, cwd).split("<historical_memory_evidence>")[0]!;
+    assert.ok(carrier.text!.startsWith(guidance), "whole same-version guidance precedes quoted evidence");
+    assert.ok(!guidance.includes("batch-heron-73"));
+    assert.ok(carrier.text!.includes("not a new human request"));
+    const minimal = renderMemoryCarrier({ ...view, summary: "x".repeat(3_000) }, cwd, { capacity: 10_000 });
+    assert.equal(minimal.representation, "minimal");
+    assert.ok(minimal.text!.startsWith(guidance));
+    assert.equal(evidence(minimal), "");
+    const omitted = renderMemoryCarrier(view, cwd, { capacity: minimal.units - 1 });
+    assert.equal(omitted.representation, "omitted");
+    assert.equal(omitted.reason, "carrier_overhead_exceeds_capacity");
+    assert.equal(omitted.text, null, "never issue partial read/safety guidance");
+  });
+}
+
 test("summary policy clips only at complete boundaries without changing the artifact", () => {
   const paragraphs = Array.from({ length: 8 }, (_, i) => `Paragraph ${i}: ${"a".repeat(560)} exact_identifier_${i}.`);
   const summary = `${prefix}${paragraphs.join("\n\n")}\n\n${index}${route}`;
@@ -74,10 +97,12 @@ test("2500 limits summary, not total carrier, and capacity includes framing/guid
   assert.ok(Buffer.byteLength(evidence(full), "utf8") < 2_500);
   assert.ok(full.units > 2_500, "total carrier is allowed above summary policy");
   assert.equal(renderMemoryCarrier(view, cwd, { capacity: full.units }).representation, "full");
-  const clipped = renderMemoryCarrier(view, cwd, { capacity: 2_500 });
+  // Leave room for whole guidance and some, but not all, complete evidence paragraphs.
+  const capacity = full.units - 500;
+  const clipped = renderMemoryCarrier(view, cwd, { capacity });
   assert.equal(clipped.representation, "clipped");
   assert.equal(clipped.reason, "capacity_clipped");
-  assert.ok(clipped.units <= 2_500);
+  assert.ok(clipped.units <= capacity);
   assert.ok(evidence(clipped).length < view.summary.length);
 });
 

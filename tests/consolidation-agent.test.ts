@@ -133,7 +133,8 @@ test("writer reserves each accumulated context, defers before an over-budget req
   assert.equal(calls.length, 1);
   const budget = setup.db.prepare("SELECT actual_input, actual_output, call_count FROM budget_usage").get() as
     { actual_input: number; actual_output: number; call_count: number };
-  assert.ok(budget.actual_input > 30_000, "the entire pinned writer and tool definitions are reserved");
+  assert.ok(budget.actual_input > 0, "reserve the model-visible writer instructions and tools in token units");
+  assert.ok(budget.actual_input < 30_000, "do not reserve raw JSON-envelope bytes as tokens");
   assert.equal(budget.actual_output, 4_000);
   assert.equal(budget.call_count, 1);
 });
@@ -187,10 +188,22 @@ test("cancellation settles when provider ignores abort, retains its reservation 
   assert.deepEqual({ ...charge }, { status: "charged", actual_output: 4_000 });
 });
 
-test("accumulated UTF-8 messages exceed context before a second call without dropping earlier evidence", async (t) => {
+test("P0: previously overcounted UTF-8 text no longer blocks a fitting continuation", async (t) => {
   const setup = fixture(t);
-  const { port, calls } = fakePort([reply([{ type: "text", text: "界".repeat(30_000) },
-    tool("workspace_list", {})], "toolUse")]);
+  const { port, calls } = fakePort([
+    reply([{ type: "text", text: "界".repeat(30_000) }, tool("workspace_list", {})], "toolUse", 95_000, 500),
+    reply([{ type: "text", text: "Consolidation complete." }], "stop", 95_000, 500),
+  ]);
+  port.resolve = () => ({ ...model, contextWindow: 120_000 });
+  assert.deepEqual(await run(setup, port), { status: "succeeded" });
+  assert.equal(calls.length, 2, "the second request must reach the provider");
+});
+
+test("provider-reported usage still blocks genuine hard-window overflow", async (t) => {
+  const setup = fixture(t);
+  const { port, calls } = fakePort([
+    reply([tool("workspace_list", {})], "toolUse", 116_000, 1_000),
+  ]);
   port.resolve = () => ({ ...model, contextWindow: 120_000 });
   assert.deepEqual(await run(setup, port), { status: "blocked", reason: "context_budget" });
   assert.equal(calls.length, 1);

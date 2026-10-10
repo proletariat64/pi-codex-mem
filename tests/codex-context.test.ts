@@ -33,6 +33,18 @@ test("Only provider-visible contents count; JSON envelopes and transport metadat
   assert.ok(Buffer.byteLength(JSON.stringify(noisy)) > 4_000_000);
 });
 
+test("Pi system-projected toolsAdded are counted once, equivalent to top-level tools", () => {
+  const tool = { name: "workspace_read", description: "Read staged evidence",
+    parameters: { type: "object", properties: { path: { type: "string" } } } };
+  const system = { role: "system", content: [{ type: "text", text: "Instructions" }] };
+  const request = { messages: [system] };
+  const projected = { messages: [{ ...system, toolsAdded: [tool] }] };
+  const duplicated = { ...projected, tools: [tool] };
+  assert.equal(estimateModelVisibleTokens({ ...request, tools: [tool] }),
+    estimateModelVisibleTokens(projected));
+  assert.equal(estimateModelVisibleTokens(projected), estimateModelVisibleTokens(duplicated));
+});
+
 test("Codex-style provider accounting adds only messages after last assistant", () => {
   const context = { systemPrompt: "upstream", tools: [
     { name: "read", description: "staged memory", parameters: { type: "object" } },

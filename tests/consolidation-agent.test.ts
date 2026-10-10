@@ -12,6 +12,8 @@ import { claimConsolidation } from "../src/store/consolidation.ts";
 import { consolidationPromptHash, runConsolidation } from "../src/pipeline/consolidate.ts";
 import { validateSummaryFormat } from "../src/pipeline/artifacts.ts";
 import type { ConsolidationModelPort } from "../src/pipeline/model-port.ts";
+import { createContextCalibrationStore, DEFAULT_CONTEXT_COUNTING_POLICY,
+  type NormalizedRequest } from "../src/pipeline/context-controller.ts";
 
 const NOW = Date.UTC(2026, 8, 1, 12);
 const model: Model<Api> = { id: "writer", name: "Writer", api: "openai-completions", provider: "mock",
@@ -80,7 +82,7 @@ test("T26 v2: writer tools deny handbook, skill and deletion attempts", async (t
     reply([{ type: "text", text: "Summary complete." }]),
   ]);
   assert.deepEqual(await run(setup, port), { status: "succeeded" });
-  const system = calls[0]!.context.messages[0];
+  const system = calls[0]!.context.messages[1];
   assert.equal(system?.role, "system");
   if (system?.role !== "system") throw new Error("missing system");
   assert.deepEqual(system.toolsAdded?.map(tool => tool.name),
@@ -109,7 +111,7 @@ for (const version of ["v1", "v2"] as const) test(`T18 ${version}: hostile write
   else assert.throws(() => readFileSync(join(setup.directory, "MEMORY.md")), /ENOENT/);
   assert.equal(readFileSync(join(setup.directory, "memory_summary.md"), "utf8"), summary);
   assert.equal(calls.length, 3);
-  const system = calls[0]?.context.messages[0]; assert.equal(system?.role, "system");
+  const system = calls[0]?.context.messages[1]; assert.equal(system?.role, "system");
   if (system?.role !== "system") throw new Error("missing system");
   assert.deepEqual(system.toolsAdded?.map(x => x.name), version === "v1" ?
     ["workspace_list", "workspace_read", "workspace_search", "workspace_write", "workspace_delete"] :
@@ -149,6 +151,80 @@ test("writer charges cached inputs to the shared daily token ledger exactly once
   const { port } = fakePort([message]);
   assert.deepEqual(await run(setup, port), { status: "succeeded" });
   assert.equal(setup.db.prepare("SELECT actual_input FROM budget_usage").get()!.actual_input, 10_000);
+});
+
+for (const version of ["v1", "v2"] as const) test(`${version}: each writer request receives fresh host budget guidance without changing evidence`, async (t) => {
+  const setup = fixture(t, version);
+  let now = NOW + 1;
+  const { port, calls } = fakePort(Array.from({ length: 12 }, (_, index) =>
+    reply([index < 10 ? tool("workspace_list", {}, `list-${index}`) : tool("workspace_write", {
+      path: index === 10 && version === "v1" ? "MEMORY.md" : "memory_summary.md",
+      content: index === 10 && version === "v1" ? handbook : summary,
+    }, `write-${index}`)], "toolUse")));
+  const stream = port.stream;
+  port.stream = (...args) => { const response = stream(...args); now += 1_000; return response; };
+  let validations = 0;
+  assert.deepEqual(await run(setup, port, { clock: () => now, validateOutputs: () => { validations++; } }),
+    { status: "blocked", reason: "model_call_budget" });
+  assert.equal(validations, 0, "tool-use replies never stand in for a genuine final stop");
+  assert.equal(readFileSync(join(setup.directory, "memory_summary.md"), "utf8"), summary,
+    "existing genuine outputs still cannot rescue a request-budget failure");
+  assert.equal(calls.length, 12);
+  for (const [index, call] of calls.entries()) {
+    const budget = call.context.messages[0];
+    assert.equal(budget?.role, "system");
+    if (budget?.role !== "system") throw new Error("missing budget framing");
+    assert.match(String(budget.content), /Host writer budget/);
+    assert.match(String(budget.content), new RegExp(`Current request: ${index + 1} of 12`));
+    assert.match(String(budget.content), new RegExp(`Requests remaining after this request: ${11 - index}`));
+    assert.match(String(budget.content), new RegExp(`Workspace tool calls remaining: ${40 - index} of 40`));
+    assert.match(String(budget.content), new RegExp(`Time remaining: ${300_000 - index * 1_000} ms`));
+    assert.match(String(budget.content), /including compactor requests/);
+    assert.match(String(budget.content), /Tool execution starts count/);
+    assert.match(String(budget.content), /upper bounds/);
+    assert.match(String(budget.content), /do not guarantee dispatch/);
+    assert.match(String(budget.content), /tool-free final response/);
+    assert.match(String(budget.content), /memory_summary\.md/);
+    assert.equal(budget.toolsAdded, undefined);
+    assert.equal(call.context.messages.filter(message => message.role === "system" &&
+      String(message.content).includes("Host writer budget")).length, 1);
+    assert.deepEqual(call.context.messages[1], calls[0]!.context.messages[1], "native instructions and tool schemas are unchanged");
+    assert.deepEqual(call.context.messages[2], calls[0]!.context.messages[2], "original task survives verbatim");
+    if (index > 0) assert.deepEqual(call.context.messages.slice(1, -2), calls[index - 1]!.context.messages.slice(1),
+      "real history stays intact; previous budget frames do not accumulate");
+  }
+});
+
+for (const version of ["v1", "v2"] as const) test(`${version}: the frozen admitted writer request is sent unchanged and a genuine final stop validates`, async (t) => {
+  const setup = fixture(t, version);
+  const { port, calls } = fakePort([
+    reply([...(version === "v1" ? [tool("workspace_write", { path: "MEMORY.md", content: handbook })] : []),
+      tool("workspace_write", { path: "memory_summary.md", content: summary })], "toolUse"),
+    reply([{ type: "text", text: "Finished." }]),
+  ]);
+  let counted: NormalizedRequest | undefined;
+  port.countTokens = (_model, request) => {
+    counted = request;
+    return { tokens: 10_000, counterIdentity: { provider: model.provider, modelId: model.id,
+      api: model.api, policyVersion: DEFAULT_CONTEXT_COUNTING_POLICY.version } };
+  };
+  const stream = port.stream;
+  port.stream = (model, context, options) => {
+    assert.equal(context, counted, "exact same normalized request object reaches count and transport");
+    assert.ok(Object.isFrozen(context));
+    assert.ok(Object.isFrozen(context.messages));
+    assert.ok(Object.isFrozen(context.messages[0]));
+    return stream(model, context, options);
+  };
+  let validations = 0;
+  assert.deepEqual(await run(setup, port, { contextCalibration: createContextCalibrationStore(), validateOutputs: () => {
+    validations++;
+    validateSummaryFormat(readFileSync(join(setup.directory, "memory_summary.md"), "utf8"), version);
+  } }), { status: "succeeded" });
+  assert.equal(validations, 1);
+  assert.equal(calls.length, 2);
+  assert.match(String(calls[1]!.context.messages[0]!.content), new RegExp(`Workspace tool calls remaining: ${version === "v1" ? 38 : 39} of 40`));
+  assert.deepEqual(setup.db.prepare("SELECT estimate_input FROM budget_reservations ORDER BY rowid").all().map(row => row.estimate_input), [10_000, 10_000]);
 });
 
 test("writer stops before the thirteenth model call and forty-first workspace operation", async (t) => {
@@ -203,7 +279,7 @@ test("accumulated UTF-8 messages cross the soft limit and compact before any fur
   if (compaction?.role !== "system") throw new Error("missing compaction framing");
   assert.equal(compaction.toolsAdded?.length, undefined, "compaction requests carry no tool declarations");
   const replaced = calls[2]?.context.messages.map((message: { role: string }) => message.role);
-  assert.deepEqual(replaced, ["system", "assistant", "user"], "framing plus labeled summary plus host continuation");
+  assert.deepEqual(replaced, ["system", "system", "assistant", "user"], "fresh budget plus native framing plus labeled summary plus host continuation");
   assert.doesNotMatch(JSON.stringify(calls[2]?.context), /界/, "superseded tool payloads are excluded, not silently dropped");
   assert.equal((setup.db.prepare("SELECT COUNT(*) AS n FROM budget_reservations").get() as { n: number }).n, 3,
     "the compaction transport consumes an ordinary reservation");

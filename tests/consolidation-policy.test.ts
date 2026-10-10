@@ -11,7 +11,27 @@ import { claimConsolidation, finishConsolidation, renewConsolidationLease } from
 // Captured from e6dbad4, before the coherent Phase 2 identity bump.
 const legacy = { v1: "8d116ea8078aa2831a609b3188051d0bb7ce86de7cc54747c772150da20283ee",
   v2: "4ffeae99c14b461fecf471efef544ad1d4a3c1e746d6a586d1574f60c37c3436" };
+// Captured from 38ce511, before host-owned per-request writer budget framing.
+const unframed = { v1: "672779f1be3e0378f585d0fc6e59c9d58a11bfc3e633f662ac5ddaaebf794a81",
+  v2: "f40bffecae3e9f8ca198ad1a79b84d1440a5e6bc427d4527bb29cd9fe9a27a0c" };
 for (const version of ["v1", "v2"] as const) {
+  test(`${version}: writer budget framing invalidates an unframed writer lease before transport`, async (t) => {
+    const root = mkdtempSync(join(tmpdir(), "pi-budget-policy-"));
+    const db = openStateDb(root);
+    t.after(() => { db.close(); rmSync(root, { recursive: true, force: true }); });
+    const config = defaultConfig("UTC");
+    const old = claimConsolidation(db, { memoryVersion: version, owner: "unframed", promptHash: unframed[version], now: 100 });
+    assert.ok(old);
+    assert.deepEqual(await runConsolidation({ db, config, directory: root, lease: old,
+      modelRef: { provider: "mock", modelId: "unused" },
+      port: { resolve: () => { throw new Error("must not resolve stale writer"); }, stream: () => { throw new Error("no transport"); } },
+      signal: new AbortController().signal }), { status: "blocked", reason: "prompt_changed" });
+    assert.equal(finishConsolidation(db, old, "blocked", "model_call_budget", 101), true);
+    assert.equal(claimConsolidation(db, { memoryVersion: version, owner: "same", promptHash: unframed[version], now: 102 }), null);
+    const next = claimConsolidation(db, { memoryVersion: version, owner: "framed", promptHash: consolidationPromptHash(config, version), now: 103 });
+    assert.ok(next);
+    assert.notEqual(next.jobId, old.jobId, "new framing starts a fresh writer, not old-output resumption");
+  });
   test(`CT13 ${version}: new context policy retries blocked byte-budget work without mutating configuration or resuming old writers`, async (t) => {
     const root = mkdtempSync(join(tmpdir(), "pi-policy-"));
     const db = openStateDb(root);

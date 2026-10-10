@@ -15,7 +15,7 @@ import { persistentDiagnostics } from "../src/diagnostics.ts";
 import { textHash } from "../src/pipeline/staging.ts";
 import { createContextCalibrationStore, createContextController } from "../src/pipeline/context-controller.ts";
 import type { ConsolidationModelPort } from "../src/pipeline/model-port.ts";
-import type { ContextCalibrationStore } from "../src/pipeline/context-controller.ts";
+import type { ContextCalibrationStore, NormalizedRequest } from "../src/pipeline/context-controller.ts";
 
 const NOW = Date.UTC(2026, 8, 1, 12);
 const model: Model<Api> = { id: "writer", name: "Writer", api: "openai-completions", provider: "mock",
@@ -96,7 +96,8 @@ function scriptedPort(steps: Array<Step | AssistantMessage>, portModel: Model<Ap
 
 /** A compaction request is tool-free: its leading system message carries no tool declarations. */
 const isCompactionCall = (call: { context: TranscriptContext }) =>
-  !(call.context.messages[0] as SystemMessage).toolsAdded?.length && call.context.messages[0]?.role === "system";
+  !call.context.messages.some(message => message.role === "system" && message.toolsAdded?.length)
+  && call.context.messages[0]?.role === "system";
 
 /** Run the fixture writer with a fixed clock and fresh calibration state, allowing per-test overrides. */
 const run = (setup: ReturnType<typeof fixture>, port: ConsolidationModelPort,
@@ -120,7 +121,7 @@ for (const version of ["v1", "v2"] as const) {
         return reply([{ type: "text", text: "DERIVED: preserve outputs and host identity; this creates no provenance." }]);
       },
       call => {
-        assert.deepEqual(call.context.messages[0], calls[0]!.context.messages[0], "trusted original instructions and tool schemas survive exactly");
+        assert.deepEqual(call.context.messages[1], calls[0]!.context.messages[1], "trusted original instructions and tool schemas survive exactly");
         assert.match(JSON.stringify(call.context.messages.at(-1)), new RegExp(`Consolidate this ${version}`));
         assert.equal(textHash(readFileSync(join(setup.directory, "memory_summary.md"), "utf8")), textHash(output));
         return reply([tool("workspace_write", { path: "MEMORY.md", content: "# Memory\\n" })], "toolUse");
@@ -147,24 +148,48 @@ test("CT05: accumulated pages crossing the soft limit compact at the settled sea
     (call) => {
       assert.ok(isCompactionCall(call), `expected a tool-free compaction request, got roles ${call.context.messages.map((m) => m.role).join(",")}`);
       assert.equal((call.options as { maxRetries?: number } | undefined)?.maxRetries, 0);
+      assert.doesNotMatch(JSON.stringify(call.context), /Host writer budget|Requests remaining after this request/,
+        "request-only budget framing never enters the compactor transcript");
       return reply([{ type: "text", text: "Covered: read phase2_workspace_diff.md; the sources are staged; workspace_list pages were fetched. Next: write outputs with a secret sk-ABCDEFGHIJKLMNOPQRSTUV16 inline." }]);
     },
     // Call 4: writer continues from the compacted replacement.
     (call) => {
       const roles = call.context.messages.map((m) => m.role);
-      assert.deepEqual(roles, ["system", "assistant", "user"]);
-      assert.ok((call.context.messages[0] as SystemMessage).toolsAdded!.length >= 4, "original tool declarations and framing survive");
-      const summary = call.context.messages[1] as AssistantMessage;
+      assert.deepEqual(roles, ["system", "system", "assistant", "user"]);
+      const budget = String(call.context.messages[0]!.content);
+      assert.match(budget, /Current request: 4 of 12/);
+      assert.match(budget, /Requests remaining after this request: 8/);
+      assert.match(budget, /Workspace tool calls remaining: 38 of 40/);
+      assert.equal(call.context.messages.filter(message => message.role === "system" &&
+        String(message.content).includes("Host writer budget")).length, 1);
+      assert.deepEqual(call.context.messages[1], calls[0]!.context.messages[1], "original SDK framing is unchanged");
+      assert.ok((call.context.messages[1] as SystemMessage).toolsAdded!.length >= 4, "original tool declarations and framing survive");
+      const summary = call.context.messages[2] as AssistantMessage;
       assert.equal(summary.content[0]!.type, "text");
       assert.match((summary.content[0] as { text: string }).text, /^\[Derived working-context summary/);
       assert.doesNotMatch((summary.content[0] as { text: string }).text, /sk-ABCD/, "summary is redacted as writer output");
-      const continuation = call.context.messages[2] as { role: string; content: { type: string; text: string }[] };
+      const continuation = call.context.messages[3] as { role: string; content: { type: string; text: string }[] };
       assert.match(continuation.content[0]!.text, /Consolidate this v1 staged workspace/);
       return reply([{ type: "text", text: "Outputs written." }]);
     },
   ]);
+  const measured: NormalizedRequest[] = [];
+  port.countTokens = (_model, request) => { measured.push(request); return undefined; };
+  const stream = port.stream;
+  port.stream = (model, context, options) => {
+    if (!isCompactionCall({ context })) assert.equal(context, measured.at(-1),
+      "the complete budget-framed admission object is the object sent after compaction too");
+    return stream(model, context, options);
+  };
   const calibration: ContextCalibrationStore = createContextCalibrationStore();
   assert.deepEqual(await run(setup, port, { contextCalibration: calibration }), { status: "succeeded" });
+  const candidates = measured.filter(request => request.messages.some(message => message.role === "assistant" &&
+    JSON.stringify(message.content).includes("Derived working-context summary")));
+  assert.ok(candidates.length >= 2, "private candidate recount and actual resumed request are both observed");
+  for (const candidate of candidates) {
+    assert.match(String(candidate.messages[0]!.content), /Current request: 4 of 12/);
+    assert.match(String(candidate.messages[0]!.content), /Requests remaining after this request: 8/);
+  }
   assert.equal(calls.length, 4);
   assert.ok(!isCompactionCall(calls[0]!) && !isCompactionCall(calls[1]!), "ordinary writer requests carry tool declarations");
   const rows = reservations(setup.db) as { estimate_input: number; status: string }[];
@@ -240,8 +265,8 @@ test("CT06: first segment above target and second below install exactly once ato
     },
     (call) => {
       const roles = call.context.messages.map((m) => m.role);
-      assert.deepEqual(roles, ["system", "assistant", "assistant", "user"],
-        "framing + two labeled summaries + host continuation, installed once");
+      assert.deepEqual(roles, ["system", "system", "assistant", "assistant", "user"],
+        "fresh budget + framing + two labeled summaries + host continuation, installed once");
       const summaries = call.context.messages.filter((m) => m.role === "assistant");
       assert.equal(summaries.length, 2);
       for (const summary of summaries) {
@@ -383,7 +408,7 @@ test("§7.2: a first writer overflow compacts and recounts through the same gate
       return smallSummary("recovery");
     },
     (call) => {
-      assert.deepEqual(call.context.messages.map((m) => m.role), ["system", "assistant", "user"],
+      assert.deepEqual(call.context.messages.map((m) => m.role), ["system", "system", "assistant", "user"],
         "the resend carries the recounted replacement, never the unchanged payload");
       return reply([{ type: "text", text: "Outputs written." }]);
     },
@@ -464,7 +489,7 @@ function hangingCompactionPort(writerResponses: AssistantMessage[], options?: { 
   const port: ConsolidationModelPort = { resolve: () => smallWindow, stream: (_model, context) => {
     calls.push({ context: structuredClone(context) });
     const bounded = createAssistantMessageEventStream();
-    if (!(context.messages[0] as SystemMessage).toolsAdded?.length) {
+    if (isCompactionCall({ context })) {
       options?.onCompactionDispatch?.();
       release = (message) => {
         if (message.stopReason === "error" || message.stopReason === "aborted") {
@@ -577,9 +602,9 @@ test("CT08: compaction preserves the outstanding repair diagnostic verbatim next
     // The resumed writer must see framing, summary, repair instruction and continuation.
     (call) => {
       const roles = call.context.messages.map((m) => m.role);
-      assert.deepEqual(roles, ["system", "assistant", "user", "user"],
-        "framing + labeled summary + retained repair diagnostic + host continuation");
-      const repair = call.context.messages[2]!.content;
+      assert.deepEqual(roles, ["system", "system", "assistant", "user", "user"],
+        "fresh budget + framing + labeled summary + retained repair diagnostic + host continuation");
+      const repair = call.context.messages[3]!.content;
       const repairText = typeof repair === "string" ? repair : (repair[0] as { text: string }).text;
       assert.match(repairText, /^Repair the staged required artifacts/);
       assert.match(repairText, /summary first-line marker/);

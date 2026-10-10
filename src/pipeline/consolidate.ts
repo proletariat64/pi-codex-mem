@@ -55,6 +55,18 @@ const MAX_COMPACTIONS = 2;
 /** §5: summary representation limit, a byte cap separate from token limits. */
 const COMPACTION_SUMMARY_BYTES = 16_384;
 const COMPACTION_POLICY_VERSION = 1;
+const WRITER_BUDGET_POLICY_VERSION = 1;
+/** Stable host guidance; live counters are request framing, never working history. */
+const writerBudgetGuidance = (version: MemoryVersion) =>
+  `Provider attempts count against the request limit, including compactor requests, not only successful completions. ` +
+  `Tool execution starts count against the tool limit. Remaining run slots are upper bounds, subject to ` +
+  `daily-budget, readiness and integrity checks; they do not guarantee dispatch. ` +
+  `Plan evidence reads and required writes within these limits. Independent workspace reads or writes ` +
+  `may be batched in one response; tools execute sequentially. Write ${version === "v1" ?
+    "MEMORY.md and memory_summary.md, plus any needed permitted skills" : "memory_summary.md"} ` +
+  `using workspace tools. Leave at least one request after the writes for a genuine tool-free final response ` +
+  `and host validation; tool acknowledgements or existing files do not complete the task. ` +
+  `Never claim unread evidence was read. These are run limits, not remaining daily token or request allowances.`;
 /** Label identifying a host-derived summary inside working history (§5.1: derived
  * assistant context, never authoritative user or tool data). */
 const COMPACTION_SUMMARY_LABEL = "[Derived working-context summary]";
@@ -77,7 +89,9 @@ const adaptation = (version: MemoryVersion) => readFileSync(new URL(`../../promp
 /** All writer instructions and boundary semantics participate in the dirty check. */
 export function consolidationPromptHash(config: MemoryConfig, version: MemoryVersion = "v1"): string {
   return createHash("sha256").update(writerTemplate(version)).update("\n").update(adaptation(version)).update(JSON.stringify({
-    schemaVersion: 1, rendererVersion: 3, memoryVersion: version, summaryBytes: Math.min(9999, config.limits.summaryBytes),
+    schemaVersion: 1, rendererVersion: 4, memoryVersion: version, summaryBytes: Math.min(9999, config.limits.summaryBytes),
+    writerBudgetPolicy: { version: WRITER_BUDGET_POLICY_VERSION, guidance: writerBudgetGuidance(version),
+      framing: "fresh-leading-system-per-writer-request", counters: "shared-calls-tools-elapsed" },
     toolResponseBytes: config.limits.toolResponseBytes, maxCalls: MAX_CALLS, maxTools: MAX_TOOLS,
     timeoutMs: TOTAL_TIMEOUT_MS, outputTokens: OUTPUT_TOKENS,
     outputAllowlist: version === "v1" ? ["MEMORY.md", "memory_summary.md", "skills/<slug>/SKILL.md"] : ["memory_summary.md"],
@@ -293,10 +307,26 @@ export async function runConsolidation(input: ConsolidationRunInput): Promise<Co
     if (readiness !== "ready") { halt({ status: "paused", reason: readiness }); return false; }
     return true;
   };
+  /** Derive one fresh system frame at the normalized transport boundary. Preserve the
+   * SDK's native instructions/tool declarations and real history verbatim. This frame
+   * is counted and sent, but never installed in Agent history or compacted as evidence. */
+  const writerRequest = (messages: readonly Message[]) => {
+    const now = clock();
+    const budget: SystemMessage = { role: "system", timestamp: now, content:
+      `Host writer budget\nCurrent request: ${calls + 1} of ${MAX_CALLS}\n` +
+      `Requests remaining after this request: ${Math.max(0, MAX_CALLS - calls - 1)}\n` +
+      `Workspace tool calls remaining: ${Math.max(0, MAX_TOOLS - tools)} of ${MAX_TOOLS}\n` +
+      `Time remaining: ${Math.max(0, Math.min(TOTAL_TIMEOUT_MS, TOTAL_TIMEOUT_MS - (now - startedAt)))} ms\n` +
+      writerBudgetGuidance(version) };
+    Object.freeze(budget);
+    const request = normalizeContext({ messages: [budget, ...messages] });
+    Object.freeze(request.messages);
+    return Object.freeze(request);
+  };
   /** Recount the complete writer request this transcript would send (§3.3).
    * Returns undefined only when the transcript carries countable content failure. */
   const measureWriterRequest = (messages: readonly Message[]): number | undefined => {
-    const decision = contextController.admission({ messages: [...messages] }, { mode: "ordinary" });
+    const decision = contextController.admission(writerRequest(messages), { mode: "ordinary" });
     if (decision.action === "blocked") {
       halt({ status: "blocked", reason: decision.reason === "unsupported_content" ? "unsupported_content" : "context_capacity_unavailable" });
       return undefined;
@@ -541,7 +571,8 @@ export async function runConsolidation(input: ConsolidationRunInput): Promise<Co
     // repair diagnostics included) immediately before transport; a prior success never
     // proves the next request fits. Figures are tokens or explicitly labeled estimated
     // token units, never the old serial byte count.
-    const decision = contextController.admission({ messages: context.messages }, { mode: "ordinary" });
+    const request = writerRequest(context.messages);
+    const decision = contextController.admission(request, { mode: "ordinary" });
     observe();
     if (decision.action === "blocked") {
       halt({ status: "blocked",
@@ -582,7 +613,7 @@ export async function runConsolidation(input: ConsolidationRunInput): Promise<Co
       try {
         if (signal.aborted) throw new Error("aborted");
         input.onRequestStarted?.();
-        const provider = await Promise.race([input.port.stream(model, context, { ...options, signal,
+        const provider = await Promise.race([input.port.stream(model, request, { ...options, signal,
           maxTokens, timeoutMs: Math.max(1, TOTAL_TIMEOUT_MS - (clock() - startedAt)), maxRetries: 0 }), interrupted]);
         const iterator = provider[Symbol.asyncIterator]();
         while (true) {

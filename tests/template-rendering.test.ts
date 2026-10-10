@@ -15,7 +15,9 @@ for (const version of ["v1", "v2"] as const) test(`${version} reader guides boun
   const guidance = section.split("<historical_memory_evidence>")[0]!;
   assert.match(guidance, /pi_memory_search[\s\S]*rollout_summaries[\s\S]*exact source ID or identifier/);
   assert.match(guidance, /targeted search over directory paging/);
-  assert.match(guidance, /one targeted search[\s\S]*no hits[\s\S]*abstain/);
+  assert.match(guidance, /one distinct targeted query/);
+  assert.match(guidance, /Follow returned cursors for that same query[\s\S]*remaining tool\/request budget/);
+  assert.match(guidance, /valid known references[\s\S]*before abstaining/);
   assert.match(guidance, /Do not traverse unrelated paths/);
   if (version === "v1") {
     assert.match(guidance, /bounded handbook search[\s\S]*before declaring the fact unavailable/);
@@ -26,7 +28,8 @@ for (const version of ["v1", "v2"] as const) test(`${version} reader guides boun
     assert.match(guidance, /exact path is unknown/);
   }
   assert.match(guidance, /relative to the pinned generation/);
-  assert.match(guidance, /omit path or use `\.`[\s\S]*allowed root/);
+  assert.match(guidance, /For pi_memory_list and pi_memory_search, omit path or use `\.`[\s\S]*allowed root/);
+  assert.match(guidance, /pi_memory_read requires an explicit allowed file path/);
   assert.match(guidance, /empty string[\s\S]*current workspace's absolute path[\s\S]*not the root/);
   assert.match(guidance, /state the precise recorded project\/workspace path and scope supported by backing evidence/);
   assert.match(guidance, /not generic labels/);

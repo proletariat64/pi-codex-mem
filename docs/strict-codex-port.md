@@ -18,6 +18,28 @@ The `UNAVAILABLE` label in `src/doctor.ts` is derived from `MemoryDiagnostics.se
 - [ ] The port retains enough operational Pi diagnostics to distinguish no publication, failed writer, stale source, blocked generation, incompatible host and missing model; diagnostic interfaces must not modify Codex memory behavior.
 - [ ] Run actual Pi TUI and noninteractive tests, not only mocked protocol tests.
 
+## Pi native compaction — verified host integration (2026-10-10)
+
+**Architectural correction:** Do **not** port Codex's full auto-compaction engine or introduce a second Pi-memory compactor. The actual Pi fork at `earendil-works/pi` already supplies compaction, overflow recovery, and retry inside **`AgentSession`**, backed by `SessionManager`.
+
+Verified upstream Pi source:
+- `packages/coding-agent/src/core/agent-session.ts`: `_installAgentNextTurnRefresh`, `_compactBeforeNextAssistantResponse`, `_checkCompaction`, and `_runAutoCompaction`. Compaction occurs at the projected-context threshold after tools and can recover overflow.
+- `packages/coding-agent/src/core/compaction/compaction.ts`: native `prepareCompaction` / `compact`.
+- `packages/coding-agent/src/core/sdk.ts`: `createAgentSession`, with an in-memory session manager and isolated resource loader supported.
+- `packages/agent/src/agent.ts`: **bare `new Agent()` does not install an automatic compactor**. It exposes optional `prepareNextTurnWithContext`; `AgentSession` installs the integration.
+- Official Pi docs: `packages/coding-agent/docs/compaction.md` and `docs/sdk.md`.
+
+**Current discrepancy:** `src/pipeline/consolidate.ts` constructs `new Agent({ ... })` directly, without `AgentSession` or `SessionManager`. Consequently, the foreground Pi CLI's native compaction does not automatically apply to this background Writer. The P0 token-counter patch on this branch is **interim**, not a replacement for Pi's canonical projected-context accounting.
+
+**Implementation direction:**
+1. Run background consolidation inside Pi `AgentSession` instead of a bare `Agent`, reusing Pi's *built-in* compaction, overflow recovery and continuation. Do not copy Pi's internals.
+2. Use an **isolated in-memory `SessionManager`** and an isolated `DefaultResourceLoader` with `noExtensions: true` and explicit system prompt, so the Writer does not recursively load the memory or permission extensions. Do not modify Pi core/permission code.
+3. Preserve the current minimum sandboxed workspace tool permissions; adapt tool registrations to the SDK's `customTools` contract without enabling unnecessary shell/network tools. Run background work with the owning model/auth runtime.
+4. Use exact pinned Codex extraction/consolidation prompts and artifact behavior. Pi handles only the host agent runtime and context mechanics; retain `/memory doctor` and `/memory status` as read-only observability.
+5. Verify agent/session behavior under provider usage, tool continuations, actual compaction and post-overflow retry; verify publication then selected memory `READABLE`. Keep the exact failure reason on nonpublication.
+
+**Validation status:** Pi documentation/source and bare-agent mismatch inspected, but **the AgentSession migration is not implemented or tested yet**. No claim of working auto-compaction in the background Writer.
+
 ## Implementation checkpoint — P0 context accounting (2026-10-10)
 
 **Code landed on this branch; parity is NOT complete.**
@@ -30,7 +52,7 @@ The `UNAVAILABLE` label in `src/doctor.ts` is derived from `MemoryDiagnostics.se
 
 **Validation performed:** independent Node test of the UTF-8/4 arithmetic (404 KB -> 103,429 approximate tokens) in an isolated local prototype. **Not yet performed:** package typecheck, full repository tests, actual Pi foreground/Writer transport, new-generation publication, doctor READABLE acceptance. Do not present this as a working end-to-end memory port.
 
-**Known remaining upstream deviations (must be addressed next):** Codex mid-turn/pre-turn compaction, model-specific effective window/token accounting, Codex tool-output truncation, original consolidation tool workflow, byte-identical rendered prompts, custom 12-call/40-tool/300s/4k-output limits, custom publication policies. Keep necessary data-integrity/permission isolation and read-only diagnostics without introducing new memory policy.
+**Known remaining upstream deviations (must be addressed next):** Pi AgentSession migration (native auto-compaction and overflow recovery), model-specific effective window/token accounting, Pi native tool-output handling, original consolidation tool workflow, byte-identical rendered prompts, custom 12-call/40-tool/300s/4k-output limits, custom publication policies. Keep necessary data-integrity/permission isolation and read-only diagnostics without introducing new memory policy.
 
 ## Source policy
 
@@ -64,6 +86,7 @@ The executable `npm run audit:codex-parity` deliberately fails while known devia
 
 - [ ] Freeze and record current Codex upstream SHA; compare source and existing vendored prompt hashes.
 - [ ] Produce function-by-function upstream ↔ Pi mapping and classify each difference as exact/host-adapter/deviation/missing.
+- [ ] Migrate the background consolidation Writer from bare Agent to isolated Pi AgentSession, using Pi native compaction rather than a custom compactor.
 - [ ] Replace extraction and consolidation with upstream-equivalent execution and verbatim prompts.
 - [ ] Replace memory read/injection with upstream-equivalent semantics via a minimal Pi host adapter.
 - [ ] Remove custom runtime limits, validation, and heuristics that are absent upstream, retaining necessary safety and data integrity.

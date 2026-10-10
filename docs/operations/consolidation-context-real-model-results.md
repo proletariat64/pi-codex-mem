@@ -363,6 +363,55 @@ combined writer run, baseline comparison, general reliability claim, native
 foreground-host equivalence or replacement of failed runs. Compactor acceptance
 and controlled-writer-history permission remain separate and pending.
 
+### Run 011: unchanged reader replication, clean factual and citation result
+
+Under the user's continued-testing authorization, independently reviewed runner
+`a188f0309b5949c8d83c6154ef1f7e69e0f6a75e` sealed one unchanged replication.
+Questions, `ANSWER_SYSTEM`, reader template, numeric budget framing, tools,
+evidence, policy, model and limits match run 010. No citation reminder, new fact
+or acceptance criterion was added. It reused the genuine run-008 publication
+at its original canonical root, with separate copied SQLite usage state.
+
+Executed once: **14 requests, 11 successful tool executions, 39.066 seconds**.
+All four outputs are genuine, nonempty, tool-free STOPs. Offline manual review
+finds **four factual passes and four citation passes**: exact endpoint-specific
+source-255 correction, source-128 chronology, stored fixture-only applicability,
+and evidence-not-established deployment approver/date abstention. The deployment
+answer now cites the actually read `MEMORY.md` with its matching task-reference
+group, rather than mislabeling the source-000 rollout. Run 010's defective
+citation remains unchanged. Source-255's old spelling is still supported by the
+combined summary/note-backed handbook evidence, not the rollout alone.
+
+Actual request-four wires for source-255 and abstention show `tool_choice: none`,
+no active tools or `additional_tools`, and three genuine preceding call/result
+pairs preserved. Source-128 and scope finish on request three; no fourth-request
+mechanism is asserted for them. All limits held, with no fifth requests, runtime
+errors, retries, new unknown usage, writer or compactor calls. All **5,240 frozen
+run-001 through run-010 files** remain unchanged and the exact publication,
+manifest, epoch, 256 sources and one note validate.
+
+Read-only post-run verification created SHM and empty WAL sidecars in the **new
+copied run-011 state only**. These additions are explicitly retained and reported,
+not described as an unchanged entire run-011 tree. Original files and existing
+run-011 artifacts remain byte-identical; only expected usage/source-statistics
+tables differ from the original state. No worker remains running.
+
+New settled estimate: **USD 0.00768650**. Global accounting:
+**USD 0.909304 settled + USD 0.04743375 held = USD 0.95673775 accounted**
+against USD 20, with both unknown reservations retained in full. Estimates are
+not invoices. Complete unmodified outputs and supporting tool/wire histories:
+`semantic-run-011/result-review.md`. Independent review confirmed all four
+factual and citation passes, with no actionable defect in these answers.
+This supports the linked **v1** Writer-and-Reader proof only. The same review
+found that earlier run-007 v2 abstention omitted required citations, while its
+source-255 rollout citation alone did not support the old spelling. Thus both
+versions' clean citation compliance is not yet established; task #15 remains
+open, and a fresh reader-only v2 check is being prepared without altering the
+original outputs or factual criteria.
+This successful reader replication links to the genuine run-008 v1 publication;
+it is not a fresh writer, original baseline comparison, general reliability,
+native foreground-host equivalence, compactor proof or replacement of failures.
+
 ## Semantic findings and compaction (runs 003/004)
 
 The frozen questions required `/api/source-255` to supersede `/api/old` for

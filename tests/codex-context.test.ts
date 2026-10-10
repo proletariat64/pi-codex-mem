@@ -24,7 +24,7 @@ test("P0: ~404 KB text fits a 272k-token context; old byte-token gate falsely re
 
 test("Only provider-visible contents count; JSON envelopes and transport metadata do not", () => {
   const original = { systemPrompt: "a", messages: [
-    { role: "user", content: [{ type: "text", text: "\\\\\\\\\".repeat(128) }] },
+    { role: "user", content: [{ type: "text", text: "\\\\".repeat(128) }] },
   ] };
   const noisy = { ...original, transportId: "q".repeat(2_000_000), messages: [
     { ...original.messages[0], transportId: "q".repeat(2_000_000), metadata: { foo: "bar" } },

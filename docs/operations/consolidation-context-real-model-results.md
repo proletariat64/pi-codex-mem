@@ -264,6 +264,40 @@ not an invoice guarantee. Paid calls stopped after the single assigned trial;
 no additional experiment followed. Private review:
 `semantic-run-008/result-review.md`.
 
+### Run 009: approved reader-only protocol, stopped on unknown usage
+
+After offline isolation/serializer tests and independent review, the user
+approved one four-question v1 reader group, at most 16 calls. Runner
+`6400c4efd114b10856e8bdbdadb486394efa0124` used unchanged candidate `32ed334`
+and the genuine run-008 publication. Only SQLite usage state was copied;
+publication paths and evidence stayed at their original canonical root. The
+changed consumer protocol exposes the four-request budget and disables further
+tools on request four. It adds no fixture facts or writer history and preserves
+all original questions and semantic criteria.
+
+The first runtime stream attempt returned empty content, `stopReason: error`
+and zero-valued usage. The guard correctly stopped on **`unknown_usage`**.
+No complete answer or tool read occurred, and the other three questions were
+not attempted. Missing output is not abstention. The request-four protocol was
+never reached; its actual-wire deactivation remains unobserved. No wire
+transcript exists for the first attempt, so actual provider delivery is not
+established by the retained evidence. Zero usage on this error is not proof of
+zero charge. No timeout, live worker, restart or further provider attempt remains.
+
+Final guards verified the exact original generation, manifest, epoch, 256
+sources and one note, and every original run-001 through run-008 file hash.
+Writer/generation/compactor calls were zero. The reader-only result does not
+replace earlier successes or failures, establish native foreground equivalence,
+or satisfy writer-and-answer or compaction acceptance.
+
+New settled estimate was USD 0. The new **USD 0.00334250 unknown reservation**
+remains beside the historical USD 0.04409125 reservation. Global accounting is
+**USD 0.89505950 settled + USD 0.04743375 pending = USD 0.94249325 accounted**
+against the USD 20 estimated cap. Neither unknown charge is resolved or refunded;
+these are not invoice amounts. The ledger remains stopped on `unknown_usage`.
+Paid calls are paused; further investigation is offline only. Private review:
+`semantic-run-009/result-review.md`.
+
 ## Semantic findings and compaction (runs 003/004)
 
 The frozen questions required `/api/source-255` to supersede `/api/old` for
@@ -322,12 +356,13 @@ PR-ready declaration follow from this result.
 
 Private evidence is retained outside this repository under
 `/home/ubuntu/dev/spec-notes/consolidation-context-v0.2.0/`, including the
-run-002 through run-008 plans, ledgers, slot results and traces. The
+run-002 through run-009 plans, ledgers, slot results and traces. The
 run-004 factual review is `semantic-run-004/result-review.md` and the run-005
 review is `semantic-run-005/result-review.md`. Run 006 is reviewed in
 `semantic-run-006/result-review.md` and run 007 in
 `semantic-run-007/result-review.md`; run 008 is reviewed in
-`semantic-run-008/result-review.md`. Private synthetic
+`semantic-run-008/result-review.md`. Run 009 is reviewed in
+`semantic-run-009/result-review.md`. Private synthetic
 source and generated bodies are not reproduced in this public report.
 
 The run-004 continuation used the isolated support checkout
@@ -339,5 +374,7 @@ scripts reference local frozen checkout paths. The original comparison evaluated
 follow-up evaluated `38ce511b003e96566d71eaa7817c2159ffee2f9e` with new reader
 guidance. Run 007 evaluated `32ed334557acd703d09f27bc419e65c79481b57d` with live
 writer-budget framing. The explicitly authorized run-008 v1 reproduction used
-that same detached candidate and policy. These follow-ups do not replace the
-original comparison or its failed slots.
+that same detached candidate and policy. The separately approved run-009
+reader-only protocol reused its genuine publication without changing original
+files. These follow-ups do not replace the original comparison or its failed
+slots.

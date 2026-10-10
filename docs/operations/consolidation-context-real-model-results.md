@@ -188,6 +188,46 @@ validation/publication gates, and needs separate real-model verification. It
 must not salvage the failed run or replace its evidence. Private diagnosis:
 `semantic-run-006/v1-completion-diagnosis.md`.
 
+### Run 007: genuine confirmation with live writer-budget framing
+
+Runner `ed8af45000b4bae9a89f2b3439523b33bac115f7` executed one new
+candidate-only confirmation at `32ed334557acd703d09f27bc419e65c79481b57d`.
+This candidate adds host-owned per-request budget framing and a new writer policy
+identity. It preserves the actual Agent/tool history, source set, questions,
+model, limits, genuine completion and validation/publication requirements.
+The framing is counted and sent as the same normalized request object; it is not
+controlled writer history or a replacement for the failed prior attempts.
+
+| Version | Real writer | Final answers | Real compactions |
+|---|---|---|---:|
+| v1 | No publication; `model_call_budget`, 12 requests, 15 tool starts | All four unavailable | 0 |
+| v2 | Published; 8 requests, 9 tool starts | All four original fact criteria pass; 13 answer requests | 0 |
+
+The v1 writer used every response for tools and requested no writes. The
+normalized request traces contain one fresh budget frame per request, including
+request 12 with zero future slots. This proves framing observability at the
+owning port, not guaranteed model compliance. The v2 writer wrote the summary at
+request 7, received its acknowledgement, and returned a genuine tool-free stop
+at request 8 before production validation and publication. Its reader delivered
+both routes/conflicts, exact backed workspace scope and approver/date abstention.
+The superseded route spelling again has combined pinned-summary and rollout
+support, rather than support from the cited rollout alone.
+
+There were 33 provider requests, all newly settled, with no new infrastructure,
+identity or unknown-usage fault. All 1,414 prior run-006 files remained unchanged.
+New settled estimate: USD 0.09246200. Global accounting is **USD 0.81521075
+settled + USD 0.04409125 preserved unknown reservation = USD 0.85930200
+accounted** against the USD 20 estimated cap, not an invoice guarantee.
+
+**Writer-and-answer acceptance remains unresolved.** v2 does not substitute for
+v1. Paid calls stopped after the assigned slots; no automatic retry followed.
+All actual writer requests retain workspace tool declarations in their native
+system frame: the new first budget frame's lack of tools does not identify a
+compactor. Both native observations and inspection across all system frames
+confirm zero actual compactions. Compaction acceptance remains pending, and no
+controlled-history permission is implied. Private review:
+`semantic-run-007/result-review.md`.
+
 ## Semantic findings and compaction (runs 003/004)
 
 The frozen questions required `/api/source-255` to supersede `/api/old` for
@@ -246,10 +286,11 @@ PR-ready declaration follow from this result.
 
 Private evidence is retained outside this repository under
 `/home/ubuntu/dev/spec-notes/consolidation-context-v0.2.0/`, including the
-run-002 through run-006 plans, ledgers, slot results and traces. The
+run-002 through run-007 plans, ledgers, slot results and traces. The
 run-004 factual review is `semantic-run-004/result-review.md` and the run-005
 review is `semantic-run-005/result-review.md`. Run 006 is reviewed in
-`semantic-run-006/result-review.md`; private synthetic
+`semantic-run-006/result-review.md` and run 007 in
+`semantic-run-007/result-review.md`; private synthetic
 source and generated bodies are not reproduced in this public report.
 
 The run-004 continuation used the isolated support checkout
@@ -259,4 +300,6 @@ commits preserve guarded plans/traces, are not product candidates, and their
 scripts reference local frozen checkout paths. The original comparison evaluated
 `f087c670df4c609439de627990661d30792d28c1`. The separately identified run-006
 follow-up evaluated `38ce511b003e96566d71eaa7817c2159ffee2f9e` with new reader
-guidance; it does not replace the original comparison or its failed slots.
+guidance. Run 007 evaluated `32ed334557acd703d09f27bc419e65c79481b57d` with live
+writer-budget framing. Neither replaces the original comparison or its failed
+slots.

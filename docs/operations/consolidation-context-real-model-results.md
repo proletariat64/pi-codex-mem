@@ -319,6 +319,50 @@ tests remain failing identically on the preceding runner baseline; their plans
 were not rewritten. This is offline mechanism evidence only. No paid retry,
 new writer, real fourth-request delivery or completed answer is established.
 
+### Run 010: complete factual answers; citation defect retained
+
+The user authorized continued testing within the existing USD 20 cap while
+retaining both unknown reservations. Independently reviewed runner
+`50a77bfa5e8c7cd05fe4169ed419ffc525e2c798` sealed a new four-question reader-only
+plan. It reused the exact genuine run-008 v1 publication, original canonical
+evidence and copied SQLite usage state. Run 009 was neither changed nor rerun.
+Original questions, facts, model, policies, source selection and per-answer
+limits remained unchanged; no writer or compactor was dispatched.
+
+Executed once: **15 reader requests, 11 successful tool executions, 39.947
+seconds**. All four final responses were genuine, nonempty, tool-free STOPs.
+The route-255 and route-128 answers state their exact routes and correction
+scope/chronology. The scope answer uses stored `MEMORY.md` applicability metadata
+for `/synthetic/context-fixture` and rejects unrelated reuse. The deployment
+answer correctly says the evidence does not establish an approver or date.
+These are four factual successes, not missing-output abstentions.
+
+The deployment answer nevertheless contains a citation defect: its label is
+`MEMORY.md`, but its target is the source-000 rollout, with grouped source IDs
+that do not match that rollout. The actual output is preserved unchanged. A
+factual pass is not a clean citation/instruction-compliance pass; full acceptance
+is not claimed. Route-255's old spelling is backed by the pinned summary/note
+and actual handbook line 20, not by the rollout alone. The scope evidence is
+stored task metadata, not merely the current-workspace header.
+
+Actual serialized request-four bodies for both route questions and deployment
+show `tool_choice: none`, no active tools or `additional_tools`, and all three
+preceding genuine calls/results preserved. Scope completed on request three;
+its final-tool-deactivation mechanism was not reached. No fifth requests,
+stranded last calls, invented STOPs, retries or runtime faults occurred. Final
+guards confirmed the exact publication/epoch/selection and every original
+run-001 through run-009 file hash. No worker remains running.
+
+New settled estimate: **USD 0.006558**. Global accounting:
+**USD 0.90161750 settled + USD 0.04743375 held = USD 0.94905125 accounted**
+against USD 20. Both historical unknown reservations remain held in full; there
+is no new unknown reservation. These are conservative estimates, not invoices.
+Private complete-answer/tool/wire review: `semantic-run-010/result-review.md`.
+This links fresh reader evidence to the genuine run-008 writer; it is not a fresh
+combined writer run, baseline comparison, general reliability claim, native
+foreground-host equivalence or replacement of failed runs. Compactor acceptance
+and controlled-writer-history permission remain separate and pending.
+
 ## Semantic findings and compaction (runs 003/004)
 
 The frozen questions required `/api/source-255` to supersede `/api/old` for

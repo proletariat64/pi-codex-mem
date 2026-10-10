@@ -1,5 +1,7 @@
 # v2 consolidation and publication
 
+Both writers now use [Phase 2 context management](consolidation-context.md), including token-valued admission, bounded compaction and local incremental diffs. Its acceptance report distinguishes measured mock protocol evidence from the pending real-model semantic gate.
+
 Issue #8 adds the v2 writer to the existing consolidation pipeline. V1 and v2 keep
 independent source selection, prompt hashes, input revisions, base generations and
 publication pointers. Dual writing starts with the selected version, then rotates

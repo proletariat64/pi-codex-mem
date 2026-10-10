@@ -165,6 +165,9 @@ async function runScenario(t: test.TestContext, memoryVersion: "v1" | "v2", scen
   });
 
   const now = Date.UTC(2026, 8, 29);
+  // The extension uses Date.now for source eligibility. Keep these fixed-date
+  // sessions fresh and settled without relaxing the production age limit.
+  t.mock.method(Date, "now", () => now + 60_000);
   const header = { type: "session", version: 3, id: `${scenario.id.toLowerCase()}-session`, cwd, timestamp: new Date(now).toISOString() };
   const branch = scenario.messages.map((message, index) => ({
     type: message.role === "memory" ? "custom_message" : "message",

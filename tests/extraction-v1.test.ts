@@ -7,43 +7,42 @@ import { parseV1Output, renderV1Request, v1PromptHash } from "../src/extraction/
 
 const payload = { raw_memory: "Accepted choice: TypeScript", rollout_summary: "User chose TypeScript over Rust after comparing tooling.", rollout_slug: "typescript-choice" };
 
-test("v1 parser accepts exactly one enclosing JSON fence and returns sanitized provenance", () => {
-  const response = parseV1Output(`\`\`\`json\n${JSON.stringify({ ...payload, raw_memory: "sk-ABCDEFGHIJKLMNOPQRSTUVWX" })}\n\`\`\``, 49_152);
-  assert.equal(response.ok, true);
-  if (!response.ok) return;
-  assert.equal(response.output.raw_memory, "[REDACTED]");
-  assert.equal(response.output.rollout_slug, "typescript-choice");
-  assert.equal(response.outcome, "succeeded");
-  assert.match(response.outputHash, /^[a-f0-9]{64}$/);
-});
-
-test("strict v1 parser rejects unknown/missing/non-string fields and extra prose", () => {
-  for (const text of [
-    JSON.stringify({ ...payload, added: "do not accept" }),
-    JSON.stringify({ raw_memory: "", rollout_summary: "" }),
-    JSON.stringify({ ...payload, rollout_slug: null }),
-    `before ${JSON.stringify(payload)}`,
-    `\`\`\`json\n${JSON.stringify(payload)}\n\`\`\`\n\`\`\`json\n${JSON.stringify(payload)}\n\`\`\``,
-  ]) {
-    const result = parseV1Output(text, 49_152);
-    assert.equal(result.ok, false, `should reject ${text.slice(0, 70)}`);
+test("v1 parser uses pinned nullable slug contract and preserves redacted output", () => {
+  for (const slug of [null, undefined, "Unsafe ../ NAME 🎯"]) {
+    const response = parseV1Output(JSON.stringify({ ...payload, raw_memory: "sk-ABCDEFGHIJKLMNOPQRSTUVWX", rollout_slug: slug }), 1);
+    assert.equal(response.ok, true);
+    if (!response.ok) continue;
+    assert.equal(response.output.raw_memory, "[REDACTED]");
+    assert.equal(response.output.rollout_slug, slug ?? "");
+    assert.equal(response.outcome, "succeeded");
+    assert.match(response.outputHash, /^[a-f0-9]{64}$/);
   }
 });
 
-test("v1 parser enforces UTF-8 combined field bytes, sanitizes bounded slug, and differentiates no-output", () => {
-  const tooLarge = parseV1Output(JSON.stringify({ ...payload, raw_memory: "界".repeat(100) }), 128);
-  assert.equal(tooLarge.ok, false);
-  const noOutput = parseV1Output('{"raw_memory":"","rollout_summary":"","rollout_slug":""}', 128);
-  assert.equal(noOutput.ok, true);
-  if (noOutput.ok) assert.equal(noOutput.outcome, "no_output");
-  const summaryOnly = parseV1Output(JSON.stringify({ raw_memory: "", rollout_summary: "Only context", rollout_slug: "" }), 128);
-  assert.equal(summaryOnly.ok, true);
-  if (summaryOnly.ok) assert.equal(summaryOnly.outcome, "succeeded");
-  const slugOnly = parseV1Output(JSON.stringify({ raw_memory: "", rollout_summary: "", rollout_slug: "name" }), 128);
-  assert.equal(slugOnly.ok, false);
-  const slug = parseV1Output(JSON.stringify({ ...payload, rollout_slug: "  Unsafe ../ NAME 🎯 " + "X".repeat(100) }), 49_152);
-  assert.equal(slug.ok, true);
-  if (slug.ok) assert.match(slug.output.rollout_slug, /^[a-z0-9_-]{1,80}$/);
+test("v1 parser rejects unknown fields, invalid required fields and non-JSON wrappers", () => {
+  for (const text of [
+    JSON.stringify({ ...payload, added: "extra" }),
+    JSON.stringify({ rollout_summary: "summary" }),
+    JSON.stringify({ ...payload, raw_memory: null }),
+    JSON.stringify({ ...payload, rollout_slug: 42 }),
+    `before ${JSON.stringify(payload)}`,
+    `\`\`\`json\n${JSON.stringify(payload)}\n\`\`\``,
+  ]) assert.equal(parseV1Output(text, 49_152).ok, false);
+});
+
+test("v1 requires both nonempty fields for useful output, without whitespace or slug heuristics", () => {
+  for (const output of [
+    { raw_memory: "", rollout_summary: "summary", rollout_slug: "slug" },
+    { raw_memory: "memory", rollout_summary: "", rollout_slug: null },
+    { raw_memory: "", rollout_summary: "" },
+  ]) {
+    const result = parseV1Output(JSON.stringify(output), 1);
+    assert.equal(result.ok, true);
+    if (result.ok) assert.equal(result.outcome, "no_output");
+  }
+  const whitespace = parseV1Output(JSON.stringify({ ...payload, raw_memory: " ", rollout_summary: " " }), 1);
+  assert.equal(whitespace.ok, true);
+  if (whitespace.ok) assert.equal(whitespace.outcome, "succeeded");
 });
 
 test("v1 request uses pinned upstream prompt and only normalized, origin-labeled evidence", () => {

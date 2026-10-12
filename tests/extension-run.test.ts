@@ -14,7 +14,7 @@ for (const scenario of ["selected", "explicit", "late-valid", "late-invalid", "q
   selected: "/memory run --now follows selected v2 and reports its independent extraction",
   explicit: "/memory run --version v2 grants one bounded pass without changing the selected v1 reader",
   "late-valid": "a cancelled version grant accepts an in-flight valid result only in its original namespace",
-  "late-invalid": "a cancelled version grant cannot repair after switching away and back",
+  "late-invalid": "a cancelled version grant cannot replay malformed output after switching away and back",
   queued: "/memory run --version v2 waits for idle and shutdown cancels only its owned grant",
   "queued-default": "/memory run queues the configured target without skipping idle",
   "queued-force-busy": "forced explicit passes report the busy boundary without imposing the ordinary idle window",
@@ -105,7 +105,7 @@ for (const scenario of ["selected", "explicit", "late-valid", "late-invalid", "q
     { memory_version: string; raw_memory: string | null; rollout_summary: string } | undefined;
   if (scenario === "late-invalid") {
     assert.equal(row, undefined);
-    assert.equal(db.prepare("SELECT error_code FROM jobs WHERE memory_version = 'v2' AND kind = 'extract'").get()!.error_code, "configuration_changed");
+    assert.equal(db.prepare("SELECT error_code FROM jobs WHERE memory_version = 'v2' AND kind = 'extract'").get()!.error_code, "invalid_schema");
   } else {
     assert.equal(row?.memory_version, "v2");
     assert.equal(row?.raw_memory, null);
@@ -124,7 +124,7 @@ for (const scenario of ["selected", "explicit", "late-valid", "late-invalid", "q
   }
   db.close();
   await mock.commands.get("memory")!.handler("status", ctx);
-  assert.match(notifications.at(-1) ?? "", scenario === "late-invalid" ? /v2 extraction: retry_wait/ : /v2 extraction: extracted/);
+  assert.match(notifications.at(-1) ?? "", scenario === "late-invalid" ? /v2 extraction: blocked — invalid_schema/ : /v2 extraction: extracted/);
   await mock.fire("session_shutdown", { type: "session_shutdown" }, ctx);
 });
 

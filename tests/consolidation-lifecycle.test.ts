@@ -8,10 +8,11 @@ import { DatabaseSync } from "node:sqlite";
 import { createAssistantMessageEventStream, type AssistantMessage, type TranscriptContext, type Model, type Api } from "@earendil-works/pi-ai";
 import extension from "../src/extension.ts";
 import { makeMockPi, projectRequest } from "./mock-pi.ts";
+import { persistentDiagnostics } from "../src/diagnostics.ts";
 import { defaultConfig } from "../src/config.ts";
 
 for (const memoryVersion of ["v1", "v2"] as const) {
-test(`${memoryVersion === "v2" ? "T27 v2: " : ""}${memoryVersion} extraction publishes through the confined Agent and the next session injects its summary without a request`, async (t) => {
+test(`${memoryVersion === "v2" ? "T27 v2: " : ""}${memoryVersion} extraction publishes through the isolated AgentSession and the next session injects its summary without a request`, async (t) => {
   const temporary = mkdtempSync(join(tmpdir(), "pi-memory-consolidation-lifecycle-"));
   t.after(() => rmSync(temporary, { recursive: true, force: true }));
   const cwd = join(temporary, "repo"); mkdirSync(cwd);
@@ -87,6 +88,7 @@ test(`${memoryVersion === "v2" ? "T27 v2: " : ""}${memoryVersion} extraction pub
   const published = db.prepare("SELECT g.directory FROM generations g JOIN pipeline_state p ON p.active_generation_id = g.generation_id WHERE p.memory_version = ?")
     .get(memoryVersion) as { directory: string };
   assert.ok(published, JSON.stringify(db.prepare("SELECT kind, status, error_code FROM jobs").all()));
+  assert.equal(persistentDiagnostics(db, { ...defaultConfig("UTC"), version: memoryVersion }, Date.now()).selectedReadable, true);
   db.close();
   if (memoryVersion === "v1") assert.match(readFileSync(join(published.directory, "MEMORY.md"), "utf8"), /typed interfaces/);
   else {

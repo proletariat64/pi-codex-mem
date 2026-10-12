@@ -164,7 +164,7 @@ test("v2 accepts prose references without treating them as file access, but prot
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-for (const version of ["v1", "v2"] as const) test(`${version}: recent topics require project and valid calendar date; older topics require project`, () => {
+for (const version of ["v1", "v2"] as const) test(`${version}: upstream format permits ungrouped topics and arbitrary prose dates`, () => {
   const root = mkdtempSync(join(tmpdir(), `memory-${version}-groups-`));
   try {
     const snap = version === "v1" ? snapshot() : snapshotV2();
@@ -189,7 +189,7 @@ for (const version of ["v1", "v2"] as const) test(`${version}: recent topics req
       `${index}### Older Memory Topics\n####   \n- Empty older project\n`,
     ]) {
       writeFileSync(join(stage.directory, "memory_summary.md"), invalid);
-      assert.throws(validate, ArtifactFormatError, invalid);
+      assert.equal(validate().summary, invalid, "no custom grouping policy");
     }
     writeFileSync(join(stage.directory, "memory_summary.md"), index);
     assert.equal(validate().summary, index, "empty index is valid");

@@ -15,8 +15,8 @@ import { createMemoryTools } from "../src/read/tools.ts";
 const NOW = Date.UTC(2026, 8, 29);
 function renderedSummary(pin: MemoryReadPin, cwd: string): string {
   const section = pin.renderSection(cwd);
-  const open = "<historical_memory_evidence>\n";
-  const close = "\n</historical_memory_evidence>";
+  const open = "========= MEMORY_SUMMARY BEGINS =========\n";
+  const close = "\n========= MEMORY_SUMMARY ENDS =========";
   const start = section.indexOf(open); const end = section.lastIndexOf(close);
   assert.ok(start >= 0 && end >= start + open.length, "rendered section includes its evidence boundary");
   return section.slice(start + open.length, end);
@@ -71,16 +71,43 @@ function fixture(t: test.TestContext) {
   return { root, db, publish };
 }
 
+for (const version of ["v1", "v2"] as const) test(`${version} reader accepts guidance paths only within its pinned generation`, async (t) => {
+  const { root, db, publish } = fixture(t);
+  const { directory, path, call } = publish(version);
+  const relativeList = await call("list", {});
+  for (const scope of ["", directory, `${directory}/`]) {
+    assert.deepEqual((await call("list", { path: scope })).details, relativeList.details);
+  }
+  const absolute = join(directory, path);
+  assert.deepEqual((await call("search", { path: absolute, queries: ["TypeScript"] })).details,
+    (await call("search", { path, queries: ["TypeScript"] })).details);
+  const read = await call("read", { path: absolute });
+  assert.deepEqual(read.details, (await call("read", { path })).details);
+  assert.equal(read.details.items[0]!.path, path, "tool results retain relative citation paths");
+  for (const rejected of [root, `${directory}-sibling/${path}`, join(root, "versions", version, "generations", "other", path),
+    join(root, "versions", version === "v1" ? "v2" : "v1", "generations", "other", path),
+    join(directory, "notes/private.md"), `${directory}/../${path}`, `../${path}`]) {
+    assert.equal((await call("read", { path: rejected })).details.error, "path_not_available_for_version", rejected);
+  }
+  assert.equal((await call("list", { path: root })).details.error, "path_not_available_for_version");
+  db.exec("UPDATE store_state SET control_epoch = control_epoch + 1 WHERE singleton = 1");
+  assert.equal((await call("read", { path: absolute })).details.error, "memory_unavailable",
+    "absolute paths cannot bypass pin revocation");
+});
+
 test("reader accepts revision 3 format independently of lower writer targets", (t) => {
   const { root, db, publish } = fixture(t);
   const v1 = `v1\n${"x".repeat(12_000)}`;
   publish("v1", undefined, undefined, "", v1);
   const pinnedV1 = acquireEvidencePin({ root, db, memoryVersion: "v1", now: NOW + 4, summaryBytes: 1024 });
-  assert.ok(pinnedV1); assert.equal(renderedSummary(pinnedV1, root), v1);
+  assert.ok(pinnedV1);
+  assert.equal(renderedSummary(pinnedV1, root), v1.slice(0, 5000) + "…501 tokens truncated…" + v1.slice(-5000));
+  assert.equal(readFileSync(join(root, "versions/v1/generations/generation-v1/memory_summary.md"), "utf8"), v1,
+    "native injection clipping never changes the published summary");
   const v2 = `v1\n## What's in Memory\n### Prototype\n#### 2026-09-27\n- Choice\n  - desc: no repeated citation\n## General Tips\n${"x".repeat(1500)}\n## User preferences\n## User Profile\n`;
   publish("v2", undefined, undefined, undefined, v2);
   const pinnedV2 = acquireEvidencePin({ root, db, memoryVersion: "v2", now: NOW + 4, summaryBytes: 1024 });
-  assert.ok(pinnedV2); assert.equal(renderedSummary(pinnedV2, root), v2);
+  assert.ok(pinnedV2); assert.equal(renderedSummary(pinnedV2, root), v2.trim());
 });
 
 test("opaque read pins expose only lifecycle identity and scoped evidence access closes after completion", (t) => {
@@ -178,7 +205,8 @@ test("missing original transcripts keep extracted memory readable with an unavai
 test("v2 reads rollout evidence only and successful detail reads deduplicate versioned usage", async (t) => {
   const { db, publish } = fixture(t); const v1 = publish("v1"); const v2 = publish("v2");
   const listed = await v2.call("list", {});
-  assert.deepEqual(listed.details.items.map(item => item.path), [v2.path]);
+  assert.deepEqual(listed.details.items.map(item => [item.path, item.entryType]), [["rollout_summaries", "directory"]]);
+  assert.deepEqual((await v2.call("list", { path: "rollout_summaries" })).details.items.map(item => [item.path, item.entryType]), [[v2.path, "file"]]);
   for (const path of ["MEMORY.md", "memory_summary.md", "skills/types/SKILL.md", "manifest.json", "notes/private.md",
     "raw_memories.md", "phase2_workspace_diff.md", "../v1/MEMORY.md", "/etc/passwd", "versions/v1/MEMORY.md"]) {
     for (const name of ["read", "list", "search"]) {
@@ -373,4 +401,120 @@ test("a 128-source task keeps metadata bounded and records complete validated de
     assert.ok(Buffer.byteLength(JSON.stringify(output)) <= 16_384);
   }
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM memory_usage").get()!.n, 128);
+});
+
+
+test("native list enumerates immediate children and pages directories into allowed files", async t => {
+  const { publish } = fixture(t); const { call, path } = publish("v1");
+  const root = await call("list", {});
+  assert.deepEqual(root.details.items.map(item => [item.path, item.entryType]),
+    [["MEMORY.md", "file"], ["rollout_summaries", "directory"], ["skills", "directory"]]);
+  assert.deepEqual((await call("list", { path: "skills" })).details.items.map(item => [item.path, item.entryType]), [["skills/types", "directory"]]);
+  assert.deepEqual((await call("list", { path: "skills/types" })).details.items.map(item => item.path), ["skills/types/SKILL.md"]);
+  assert.deepEqual((await call("list", { path })).details.items.map(item => item.path), [path]);
+  assert.equal((await call("list", { limit: 2000 })).details.error, undefined);
+});
+
+test("normalized search trims queries and emits minimal windows with context and matched queries", async t => {
+  const { publish } = fixture(t);
+  const { call, path } = publish("v2", "windows", "before\nAL-PHA\nalpha\nbeta\nafter\n");
+  const result = await call("search", { path, queries: [" alpha ", "beta"], match: "all_within_lines",
+    normalized: true, caseSensitive: false, lineCount: 3, contextLines: 1, maxResults: 200 });
+  assert.equal(result.details.error, undefined);
+  assert.deepEqual(result.details.items.map(item => [item.matchLineNumber, item.startLine, item.endLine, item.content, item.matchedQueries]),
+    [[3, 2, 5, "AL-PHA\nalpha\nbeta\nafter", ["alpha", "beta"]]]);
+  assert.equal((await call("search", { path, queries: [" --- "], match: "any", normalized: true })).details.error, "invalid_arguments");
+  assert.equal((await call("search", { path, queries: ["beta"], match: "all_on_same_line" })).details.items[0]!.matchLineNumber, 4);
+  assert.equal((await call("search", { path, queries: ["alpha", "beta"], match: "all_within_lines", lineCount: 0 })).details.error, "invalid_arguments");
+});
+
+test("native read supports line-offset aliases, uncapped line ranges, default token policy and middle truncation", async t => {
+  const { publish } = fixture(t);
+  const { call, path } = publish("v2", "read-policy", "prefix" + "x".repeat(200) + "suffix\nsecond\n");
+  const native = await call("read", { path, lineOffset: 1, maxLines: 1, maxTokens: 3 });
+  assert.equal(native.details.error, undefined);
+  assert.equal(native.details.items[0]!.content, "prefix…51 tokens truncated…uffix\n");
+  assert.equal(native.details.truncated, true);
+  assert.equal(native.details.nextStartLine, 1, "the partly omitted first line remains retrievable");
+  assert.equal((await call("read", { path, lineOffset: 2, maxLines: 1000, maxTokens: 0 })).details.items[0]!.content, "second");
+  assert.equal((await call("read", { path, lineOffset: 999 })).details.error, "line_offset_exceeds_file_length");
+  assert.equal((await call("read", { path, lineOffset: 1, startLine: 2 })).details.error, "invalid_arguments");
+});
+
+
+test("native head/tail read preserves suffix and credits only retained task evidence", async t => {
+  const { db, publish } = fixture(t);
+  const path = evidencePath("source", "decision");
+  const handbook = `# Task Group: Read scope
+scope: project
+applies_to: repo
+## Task 1: Note only
+### rollout_summary_files
+- notes/private.md
+### learnings
+- PREFIX ${"a".repeat(4000)}
+## Task 2: Omitted source
+### rollout_summary_files
+- ${path}
+### learnings
+- MIDDLE ${"b".repeat(6000)}
+## Task 3: Note only
+### rollout_summary_files
+- notes/private.md
+### learnings
+- ${"c".repeat(4000)} SUFFIX
+`;
+  const { call } = publish("v1", "head-tail-attribution", "source decision", handbook);
+  const read = await call("read", { path: "MEMORY.md", maxTokens: 1000 });
+  assert.equal(read.details.error, undefined);
+  assert.equal(read.details.items.length, 1);
+  const item = read.details.items[0]!;
+  assert.ok(item.content!.includes("PREFIX"));
+  assert.ok(item.content!.includes("SUFFIX"), "host admission must preserve native suffix");
+  assert.match(item.content!, /tokens truncated/);
+  assert.ok(!item.content!.includes("MIDDLE"));
+  assert.equal(item.retainedRanges!.length, 2);
+  assert.deepEqual(item.sourceIds, [], "omitted source task cannot acquire source attribution");
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM memory_usage").get()!.n, 0);
+  assert.ok(read.details.nextStartLine! < item.endLine, "continuation identifies omitted content, rather than EOF");
+  assert.ok(Buffer.byteLength(JSON.stringify(read)) <= 16384);
+  const hostBounded = await call("read", { path: "MEMORY.md", maxTokens: 3000 });
+  assert.equal(hostBounded.details.error, undefined);
+  assert.ok(hostBounded.details.items[0]!.content!.includes("SUFFIX"));
+  assert.ok(hostBounded.details.items[0]!.content!.includes("PREFIX"));
+  assert.ok(Buffer.byteLength(JSON.stringify(hostBounded)) <= 16384);
+  assert.deepEqual(hostBounded.details.items[0]!.sourceIds, []);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM memory_usage").get()!.n, 0);
+  const middleLine = handbook.split("\n").findIndex(line => line.includes("MIDDLE")) + 1;
+  const retrieved = await call("read", { path: "MEMORY.md", lineOffset: middleLine, maxLines: 1 });
+  assert.equal(retrieved.details.error, undefined);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM memory_usage").get()!.n, 1,
+    "an explicit read of omitted task detail independently credits its source");
+});
+
+
+test("dense repeated search remains ordered and paginates after minimal-window pruning", async t => {
+  const { publish } = fixture(t);
+  const { call, path } = publish("v1", "dense-search", "match\n".repeat(20_000));
+  const first = await call("search", { path, queries: ["match"], match: "any", maxResults: 1 });
+  assert.equal(first.details.error, undefined);
+  assert.equal(first.details.items[0]!.matchLineNumber, 1);
+  assert.ok(first.details.cursor);
+  const next = await call("search", { path, queries: ["match"], match: "any", maxResults: 1, cursor: first.details.cursor });
+  assert.equal(next.details.error, undefined);
+  assert.equal(next.details.items[0]!.matchLineNumber, 2);
+  const all = await call("search", { path, queries: ["match"], match: "all_within_lines", lineCount: 1000, maxResults: 3 });
+  assert.deepEqual(all.details.items.map(item => item.matchLineNumber), [1, 2, 3]);
+});
+
+
+test("large all-within-lines search returns no results when a required query is absent", async t => {
+  const { publish } = fixture(t);
+  const { call, path } = publish("v1", "missing-window-query", "present\n".repeat(20_000));
+  const result = await call("search", { path, queries: ["present", "absent"], match: "all_within_lines",
+    lineCount: Number.MAX_SAFE_INTEGER, maxResults: 1 });
+  assert.equal(result.details.error, undefined);
+  assert.deepEqual(result.details.items, []);
+  assert.equal(result.details.cursor, null);
+  assert.equal(result.details.truncated, false);
 });

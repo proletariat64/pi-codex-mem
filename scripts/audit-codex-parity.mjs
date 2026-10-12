@@ -59,10 +59,29 @@ const checks = [
   },
   {
     id: "P008",
-    path: "UPSTREAM.md",
-    pattern: /Adaptations never touch `prompts\/upstream\/`; adapted copies live under `prompts\/pi\//,
-    message: "Adapted prompt copies remain; review and retire all nonessential prompt modifications.",
+    path: "src/read/inject.ts",
+    pattern: /prompts\/pi\//,
+    message: "Reader loads an adapted prompt rather than the pinned upstream template.",
   },
+  {
+    id: "P009",
+    path: "src/pipeline/consolidate.ts",
+    pattern: /new Agent\(/,
+    message: "Writer bypasses Pi AgentSession's native compaction/retry lifecycle.",
+  },
+  {
+    id: "P010",
+    path: "src/extraction/runner.ts",
+    pattern: /repairPrompt|repairContext|repairAttempt|for \(let attempt = 0; attempt < 2/,
+    message: "Extraction has a custom model-feedback repair loop.",
+  },
+  {
+    id: "P011",
+    path: "src/pipeline/artifacts.ts",
+    pattern: /validateProjectDateGrouping/,
+    message: "Artifact publication adds a project/date grouping gate absent from the pinned validator.",
+  },
+
 ];
 
 const findings = [];
@@ -75,5 +94,5 @@ for (const check of checks) {
 for (const item of findings) {
   console.error(`${item.id} ${item.path}: ${item.message}`);
 }
-console.log(`Codex port audit: ${findings.length} known deviations remain (${checks.length} checks).`);
+console.log(`Codex port audit: ${findings.length} known policy deviations found (${checks.length} static checks). Host adaptations are documented in docs/strict-codex-port.md; this audit does not prove complete runtime equivalence.`);
 if (findings.length) process.exitCode = 1;

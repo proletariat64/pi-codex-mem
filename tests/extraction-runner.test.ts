@@ -84,60 +84,36 @@ test("v2 runner uses the pinned prompt, stores NULL raw learning and bounded sum
       truncated: number; original_bytes: number; accepted_bytes: number };
   assert.equal(row.memory_version, "v2");
   assert.equal(row.raw_memory, null);
-  assert.equal(row.rollout_summary, `${line}\n[... remainder omitted ...]`);
+  assert.ok(row.rollout_summary.startsWith(line));
+  assert.match(row.rollout_summary, /…\d+ chars truncated…/);
+  assert.ok(row.rollout_summary.endsWith("URL https://example.com/important/identifier-must-stay-whole"));
   assert.equal(row.truncated, 1);
   assert.equal(row.accepted_bytes, Buffer.byteLength(row.rollout_summary, "utf8"));
   assert.ok(row.original_bytes > 9_000);
 });
 
-test("T23 v2: strict summary-and-slug schema rejects raw_memory before writing NULL raw memory", async (t) => {
+test("T23 v2: invalid schema fails after one sample without a repair or stored output", async (t) => {
   const { db, job, root } = setup(t, undefined, "v2");
   const { port, calls } = fakePort([
     response('{"raw_memory":"v1 leak","rollout_summary":"history","rollout_slug":"history"}'),
-    response('{"rollout_summary":"User chose TypeScript over Rust","rollout_slug":"typescript"}'),
+    response('{"rollout_summary":"corrected","rollout_slug":"corrected"}'),
   ]);
   assert.deepEqual(await runV2Extraction({ db, root, job, modelRef, port, now: NOW + 1,
-    timezone: "UTC", limits: { ...limits, v2RolloutSummaryBytes: 9_000 },
-    signal: new AbortController().signal }), { status: "succeeded" });
-  assert.equal(calls.length, 2);
-  assert.match(calls[1]?.text ?? "", /two required v2 string fields/);
-  assert.deepEqual(db.prepare("SELECT raw_memory, rollout_summary FROM extractions").all().map(row => ({ ...row })),
-    [{ raw_memory: null, rollout_summary: "User chose TypeScript over Rust" }]);
-  assert.throws(() => db.prepare("UPDATE extractions SET raw_memory = 'v1 leak'").run(), /CHECK constraint failed/);
+    timezone: "UTC", limits: { ...limits, v2RolloutSummaryBytes: 9_000 }, signal: new AbortController().signal }), { status: "blocked" });
+  assert.equal(calls.length, 1);
+  assert.equal(db.prepare("SELECT error_code FROM jobs").get()!.error_code, "invalid_schema");
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM extractions").get()!.n, 0);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM budget_reservations").get()!.n, 1);
 });
 
-test("v2 rejects raw_memory and repairs once within the shared attempt and request budgets", async (t) => {
+test("v2 stores native no-output without a repair when only a slug is returned", async (t) => {
   const { db, job, root } = setup(t, undefined, "v2");
-  const { port, calls } = fakePort([
-    response('{"raw_memory":"v1 leak","rollout_summary":"history","rollout_slug":"history"}'),
-    response('{"rollout_summary":"","rollout_slug":""}'),
-  ]);
-  const result = await runV2Extraction({ db, root, job, modelRef, port, now: NOW + 1,
-    timezone: "UTC", limits: { ...limits, v2RolloutSummaryBytes: 9_000 },
-    signal: new AbortController().signal });
-  assert.deepEqual(result, { status: "no_output" });
-  assert.equal(calls.length, 2);
-  assert.match(calls[1]?.text ?? "", /two required v2 string fields/);
-  assert.equal((db.prepare("SELECT attempt_count FROM jobs").get() as { attempt_count: number }).attempt_count, 2);
-  assert.equal((db.prepare("SELECT COUNT(*) AS n FROM budget_reservations").get() as { n: number }).n, 2);
-  const row = db.prepare("SELECT raw_memory, outcome, truncated, original_bytes, accepted_bytes FROM extractions").get() as
-    { raw_memory: string | null; outcome: string; truncated: number; original_bytes: number; accepted_bytes: number };
-  assert.deepEqual({ ...row }, { raw_memory: null, outcome: "no_output", truncated: 0,
-    original_bytes: 0, accepted_bytes: 0 });
-});
-
-test("v2 repairs a slug without substantive summary instead of storing it", async (t) => {
-  const { db, job, root } = setup(t, undefined, "v2");
-  const { port, calls } = fakePort([
-    response('{"rollout_summary":"","rollout_slug":"hallucinated-slug"}'),
-    response('{"rollout_summary":"Material decision and scope","rollout_slug":"scope"}'),
-  ]);
+  const { port, calls } = fakePort([response('{"rollout_summary":"","rollout_slug":"unused-slug"}')]);
   assert.deepEqual(await runV2Extraction({ db, root, job, modelRef, port, now: NOW + 1,
     timezone: "UTC", limits: { ...limits, v2RolloutSummaryBytes: 9_000 },
-    signal: new AbortController().signal }), { status: "succeeded" });
-  assert.equal(calls.length, 2);
-  assert.equal((db.prepare("SELECT rollout_summary FROM extractions").get() as { rollout_summary: string }).rollout_summary,
-    "Material decision and scope");
+    signal: new AbortController().signal }), { status: "no_output" });
+  assert.equal(calls.length, 1);
+  assert.equal((db.prepare("SELECT rollout_summary FROM extractions").get() as { rollout_summary: string }).rollout_summary, "");
 });
 
 test("v1 runner refuses a v2 job without a model call or version-mismatched commit", async (t) => {
@@ -170,24 +146,26 @@ test("run --now stores a sanitized v1 extraction with model, prompt, usage, and 
   assert.match(String(row.output_hash), /^[a-f0-9]{64}$/);
 });
 
-test("rendered input fits a conservative 70% context budget and prioritizes user rationale", async (t) => {
+test("400KB normalized v1 evidence fits a 272k-token model without a byte/token false rejection", async (t) => {
   const { db, job, root } = setup(t, [
-    { entryId: "u1", role: "user", origin: "unknown", text: "User decided TypeScript for reproducibility", timestamp: NOW - 30_000 },
-    { entryId: "tool1", role: "tool", origin: null, text: "verbose tool log: " + "X".repeat(50_000), timestamp: NOW - 20_000 },
+    { entryId: "u1", role: "user", origin: "unknown", text: "START " + "X".repeat(404000) + " END", timestamp: NOW - 30000 },
   ]);
-  const { port, calls } = fakePort([response('{"raw_memory":"TypeScript chosen","rollout_summary":"TypeScript chosen","rollout_slug":"typescript"}')]);
-  port.resolve = () => ({ provider: "mock", modelId: "extract", contextWindow: 60_000, maxTokens: 8_000 });
-
+  const { port, calls } = fakePort([response('{"raw_memory":"decision","rollout_summary":"summary","rollout_slug":"choice"}')]);
+  port.resolve = () => ({ provider: "mock", modelId: "extract", contextWindow: 272000, maxTokens: 32000 });
   assert.deepEqual(await runV1Extraction({ db, root, job, modelRef, port, now: NOW + 1,
-    timezone: "UTC", limits, signal: new AbortController().signal }), { status: "succeeded" });
+    timezone: "UTC", limits: { ...limits, dailyInputTokens: 200000, dailyOutputTokens: 100000 },
+    signal: new AbortController().signal }), { status: "succeeded" });
   assert.equal(calls.length, 1);
-  assert.match(calls[0]?.text ?? "", /User decided TypeScript for reproducibility/);
-  assert.doesNotMatch(calls[0]?.text ?? "", /verbose tool log/);
-  assert.match(calls[0]?.text ?? "", /omitted for model context budget/);
+  assert.match(calls[0]!.text, /START/);
+  assert.match(calls[0]!.text, / END/);
+  assert.doesNotMatch(calls[0]!.text, /tokens truncated/);
+  const reservation = db.prepare("SELECT estimate_input, estimate_output FROM budget_reservations").get()!;
+  assert.ok(Number(reservation.estimate_input) > 100000 && Number(reservation.estimate_input) < 110000);
+  assert.equal(reservation.estimate_output, 32000);
 });
 
 for (const version of ["v1", "v2"] as const) test(`${version} final context never separates a short choice from its question`, async (t) => {
-  const question = `QUESTION_UNIQUE options: 1 keep old database; 2 migrate database. ${"context ".repeat(6_000)} Which option?`;
+  const question = `QUESTION_UNIQUE options: 1 keep old database; 2 migrate database. ${"context ".repeat(30_000)} Which option?`;
   const answer = "USE_OPTION_1_UNIQUE";
   const { db, job, root } = setup(t, [
     { entryId: "a1", role: "assistant", origin: null, text: question, timestamp: NOW - 20_000 },
@@ -203,7 +181,8 @@ for (const version of ["v1", "v2"] as const) test(`${version} final context neve
   assert.equal(calls.length, 1);
   const sent = calls[0]!.text;
   assert.equal(sent.includes("QUESTION_UNIQUE"), sent.includes(answer), "answer must not be shown without its question");
-  assert.match(sent, /evidence items omitted for model context budget/);
+  if (version === "v1") assert.match(sent, /tokens truncated/);
+  else assert.match(sent, /evidence items omitted for model context budget/);
 });
 
 for (const version of ["v1", "v2"] as const) test(`${version} model-fit retains a short choice with its fitting question before verbose tool evidence`, async (t) => {
@@ -212,7 +191,7 @@ for (const version of ["v1", "v2"] as const) test(`${version} model-fit retains 
   const { db, job, root } = setup(t, [
     { entryId: "a1", role: "assistant", origin: null, text: question, timestamp: NOW - 30_000 },
     { entryId: "u1", role: "user", origin: "unknown", text: answer, timestamp: NOW - 20_000 },
-    { entryId: "tool1", role: "tool", origin: null, text: "verbose tool log " + "X".repeat(50_000), timestamp: NOW - 10_000 },
+    { entryId: "tool1", role: "tool", origin: null, text: "verbose tool log " + "X".repeat(250_000), timestamp: NOW - 10_000 },
   ], version);
   const { port, calls } = fakePort([response(version === "v1" ?
     '{"raw_memory":"","rollout_summary":"","rollout_slug":""}' : '{"rollout_summary":"","rollout_slug":""}')]);
@@ -223,13 +202,40 @@ for (const version of ["v1", "v2"] as const) test(`${version} model-fit retains 
   assert.equal(result.status, "no_output");
   assert.match(calls[0]!.text, /QUESTION_UNIQUE/);
   assert.match(calls[0]!.text, /USE_OPTION_1_UNIQUE/);
-  assert.doesNotMatch(calls[0]!.text, /verbose tool log/);
+  if (version === "v1") assert.match(calls[0]!.text, /tokens truncated/);
+  else assert.doesNotMatch(calls[0]!.text, /verbose tool log/);
+});
+
+for (const version of ["v1", "v2"] as const) test(`${version} transport clamps a large output maximum to remaining context`, async t => {
+  const { db, job, root } = setup(t, [{ entryId: "u1", role: "user", origin: "unknown",
+    text: "context ".repeat(500), timestamp: NOW - 10000 }], version);
+  let sentInput = 0;
+  let sentOutput = 0;
+  const port: MemoryModelPort = {
+    resolve: () => ({ provider: "mock", modelId: "extract", contextWindow: 16384, maxTokens: 16384 }),
+    request: async (_model, context, options) => {
+      const user = context.messages[0]!;
+      const text = typeof user.content === "string" ? user.content : JSON.stringify(user.content);
+      sentInput = Math.ceil(Buffer.byteLength(context.systemPrompt + text, "utf8") / 4);
+      sentOutput = options.maxTokens;
+      assert.ok(sentInput + sentOutput <= 16384, "provider request must respect the resolved context window");
+      return response(version === "v1" ? '{"raw_memory":"memory","rollout_summary":"summary","rollout_slug":"scope"}' :
+        '{"rollout_summary":"summary","rollout_slug":"scope"}');
+    },
+  };
+  assert.deepEqual(await (version === "v1" ? runV1Extraction : runV2Extraction)({ db, root, job, modelRef, port,
+    now: NOW + 1, timezone: "UTC", limits: { ...limits, v2RolloutSummaryBytes: 9000 },
+    signal: new AbortController().signal }), { status: "succeeded" });
+  assert.ok(sentInput > 0 && sentOutput > 0 && sentOutput < 16384);
+  const reservation = db.prepare("SELECT estimate_input, estimate_output FROM budget_reservations").get()!;
+  assert.equal(reservation.estimate_input, sentInput);
+  assert.equal(reservation.estimate_output, sentOutput);
 });
 
 test("a model with insufficient context blocks before spending budget", async (t) => {
   const { db, job, root } = setup(t);
   const { port, calls } = fakePort([]);
-  port.resolve = () => ({ provider: "mock", modelId: "extract", contextWindow: 8_000, maxTokens: 8_000 });
+  port.resolve = () => ({ provider: "mock", modelId: "extract", contextWindow: 100, maxTokens: 8_000 });
   const result = await runV1Extraction({ db, root, job, modelRef, port, now: NOW + 1,
     timezone: "UTC", limits, signal: new AbortController().signal });
   assert.deepEqual(result, { status: "blocked" });
@@ -237,33 +243,18 @@ test("a model with insufficient context blocks before spending budget", async (t
   assert.equal((db.prepare("SELECT error_code FROM jobs").get() as { error_code: string }).error_code, "context_too_small");
 });
 
-test("one invalid JSON reply gets exactly one budgeted repair; no-output records once", async (t) => {
-  const { db, job, root } = setup(t);
-  const { port, calls } = fakePort([response("not JSON"), response('{"raw_memory":"","rollout_summary":"","rollout_slug":""}')]);
-
-  const result = await runV1Extraction({ db, root, job, modelRef, port, now: NOW + 1,
-    timezone: "UTC", limits, signal: new AbortController().signal });
-
-  assert.deepEqual(result, { status: "no_output" });
-  assert.equal(calls.length, 2);
-  assert.match(calls[1]?.text ?? "", /not JSON/);
-  assert.equal((db.prepare("SELECT COUNT(*) AS n FROM budget_reservations").get() as { n: number }).n, 2);
-  assert.equal((db.prepare("SELECT outcome FROM extractions").get() as { outcome: string }).outcome, "no_output");
-  assert.equal((db.prepare("SELECT attempt_count FROM jobs").get() as { attempt_count: number }).attempt_count, 2);
-});
-
-test("malformed JSON repair explicitly rejects a trailing brace without relaxing schema", async (t) => {
-  const { db, job, root } = setup(t);
-  const extraBrace = '{"raw_memory":"decision","rollout_summary":"summary","rollout_slug":"choice"}}';
-  const valid = extraBrace.slice(0, -1);
-  const { port, calls } = fakePort([response(extraBrace), response(valid)]);
-  const result = await runV1Extraction({ db, root, job, modelRef, port, now: NOW + 1,
-    timezone: "UTC", limits, signal: new AbortController().signal });
-  assert.deepEqual(result, { status: "succeeded" });
-  assert.equal(calls.length, 2);
-  assert.match(calls[1]?.text ?? "", /Prior response/);
-  assert.equal(calls[1]?.version, "v1");
-  assert.equal((db.prepare("SELECT raw_memory FROM extractions").get() as { raw_memory: string }).raw_memory, "decision");
+test("v1 malformed JSON fails once without replaying provider output as a repair prompt", async (t) => {
+  for (const malformed of ["not JSON", '{"raw_memory":"decision","rollout_summary":"summary","rollout_slug":"choice"}}']) {
+    const { db, job, root } = setup(t);
+    const { port, calls } = fakePort([response(malformed), response('{"raw_memory":"valid","rollout_summary":"valid","rollout_slug":"valid"}')]);
+    assert.deepEqual(await runV1Extraction({ db, root, job, modelRef, port, now: NOW + 1,
+      timezone: "UTC", limits, signal: new AbortController().signal }), { status: "blocked" });
+    assert.equal(calls.length, 1);
+    assert.equal(db.prepare("SELECT attempt_count FROM jobs").get()!.attempt_count, 1);
+    assert.equal(db.prepare("SELECT error_code FROM jobs").get()!.error_code, "invalid_schema");
+    assert.equal(db.prepare("SELECT COUNT(*) AS n FROM budget_reservations").get()!.n, 1);
+    assert.equal(db.prepare("SELECT COUNT(*) AS n FROM extractions").get()!.n, 0);
+  }
 });
 
 test("a late provider response cannot commit after its source revision is superseded", async (t) => {
@@ -283,50 +274,23 @@ test("a late provider response cannot commit after its source revision is supers
   assert.equal((db.prepare("SELECT COUNT(*) AS n FROM extractions").get() as { n: number }).n, 0);
 });
 
-test("two invalid model replies block without a third request", async (t) => {
+test("external transient retries retain reservation accounting before a terminal schema failure", async (t) => {
   const { db, job, root } = setup(t);
-  const { port, calls } = fakePort([response("not JSON"), response("still not JSON")]);
-
-  const result = await runV1Extraction({ db, root, job, modelRef, port, now: NOW + 1,
-    timezone: "UTC", limits, signal: new AbortController().signal });
-
-  assert.deepEqual(result, { status: "blocked" });
-  assert.equal(calls.length, 2);
-  assert.equal((db.prepare("SELECT status FROM jobs").get() as { status: string }).status, "blocked");
-  assert.equal((db.prepare("SELECT COUNT(*) AS n FROM extractions").get() as { n: number }).n, 0);
-});
-
-test("budget deferral after a spent invalid call retains its attempt and resumes next local day", async (t) => {
-  const { db, job, root } = setup(t);
-  const first = fakePort([response("not JSON")]);
-  const deferred = await runV1Extraction({ db, root, job, modelRef, port: first.port, now: NOW + 1,
-    timezone: "UTC", limits: { ...limits, dailyRequests: 1 }, signal: new AbortController().signal });
-  assert.deepEqual(deferred, { status: "budget_deferred", reason: "request_budget" });
-  assert.equal(first.calls.length, 1);
-  assert.equal((db.prepare("SELECT attempt_count FROM jobs").get() as { attempt_count: number }).attempt_count, 1);
-  const tomorrow = Date.UTC(2024, 0, 3, 0);
-  const [next] = claimDueExtractions(db, { owner: "tomorrow", now: tomorrow, limit: 1 });
-  assert.ok(next);
-  const second = fakePort([response('{"raw_memory":"decision","rollout_summary":"summary","rollout_slug":"decision"}')]);
-  assert.deepEqual(await runV1Extraction({ db, root, job: next, modelRef, port: second.port, now: tomorrow + 1,
-    timezone: "UTC", limits: { ...limits, dailyRequests: 1 }, signal: new AbortController().signal }),
-  { status: "succeeded" });
-  assert.equal((db.prepare("SELECT attempt_count FROM jobs").get() as { attempt_count: number }).attempt_count, 2);
-});
-
-test("after three spent network calls invalid JSON blocks without stranding lease or reserving a fourth", async (t) => {
-  const { db, job, root } = setup(t);
-  const first = fakePort([response("not JSON"), { stopReason: "error", text: "", errorMessage: "503 temporary" }]);
-  assert.deepEqual(await runV1Extraction({ db, root, job, modelRef, port: first.port, now: NOW + 1,
-    timezone: "UTC", limits, signal: new AbortController().signal }), { status: "retry_wait" });
-  const [last] = claimDueExtractions(db, { owner: "last", now: NOW + 300_002, limit: 1 });
-  assert.ok(last);
-  const final = fakePort([response("still not JSON")]);
-  assert.deepEqual(await runV1Extraction({ db, root, job: last, modelRef, port: final.port, now: NOW + 300_003,
-    timezone: "UTC", limits, signal: new AbortController().signal }), { status: "blocked" });
+  let current = job;
+  for (let index = 0; index < 2; index++) {
+    const now = NOW + index * 300_001 + 1;
+    const retry = fakePort([{ stopReason: "error", text: "", errorMessage: "503 temporary" }]);
+    assert.deepEqual(await runV1Extraction({ db, root, job: current, modelRef, port: retry.port, now,
+      timezone: "UTC", limits: { ...limits, dailyOutputTokens: 100000 }, signal: new AbortController().signal }), { status: "retry_wait" });
+    const [next] = claimDueExtractions(db, { owner: `retry-${index}`, now: now + 300_000, limit: 1 });
+    assert.ok(next);
+    current = next;
+  }
+  const final = fakePort([response("invalid JSON")]);
+  assert.deepEqual(await runV1Extraction({ db, root, job: current, modelRef, port: final.port,
+    now: NOW + 600_003, timezone: "UTC", limits: { ...limits, dailyOutputTokens: 100000 }, signal: new AbortController().signal }), { status: "blocked" });
   assert.equal(final.calls.length, 1);
-  assert.equal((db.prepare("SELECT status FROM jobs").get() as { status: string }).status, "blocked");
-  assert.equal((db.prepare("SELECT COUNT(*) AS n FROM budget_reservations").get() as { n: number }).n, 3);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM budget_reservations").get()!.n, 3);
 });
 
 test("provider-error or aborted result never enters JSON repair", async (t) => {
@@ -383,7 +347,7 @@ test("provider error with zero reported usage conservatively charges the reserva
   const row = db.prepare("SELECT actual_input, actual_output, call_count FROM budget_usage")
     .get() as { actual_input: number; actual_output: number; call_count: number };
   assert.ok(row.actual_input > 0);
-  assert.equal(row.actual_output, 6_000);
+  assert.equal(row.actual_output, 8_000);
   assert.equal(row.call_count, 1);
 });
 

@@ -1,96 +1,80 @@
 # Strict Codex Memory Port — Work Ledger
 
-**Branch:** `refactor/strict-codex-memory-port` (forked from `main`; PR #58 is not included)
-**Status:** IN PROGRESS. This document is not a claim of runtime parity.
+**Branch:** `refactor/strict-codex-memory-port` (PR #58 is not included)
+**Checkpoint:** 2026-10-12, implementation and local repository gates completed. Isolated TUI UAT passed 6/6; real-provider D01 pilot completed with a v2 provenance defect. Primary acceptance is Codex workflow and prompt parity; recall quality is secondary. The read-path failure is fixed; actual CLI/TUI + real Luna 6 v1/v2 reruns passed extraction, consolidation, publication, READABLE and memory detail read, with captured prompt checks.
 
-## P0 regression: selected memory UNAVAILABLE
+## Baseline and scope
 
-The immediate user-visible failure motivating PR #58 was `/memory doctor` showing `selected memory UNAVAILABLE` after the consolidation writer failed to publish a readable generation. This must be a **primary acceptance case**, not an incidental diagnostic.
+The memory behavior baseline is **`openai/codex@1cc7e2361237ce7244430ee1d581c77f95c57ac8`**. It matches all nine vendored files in `UPSTREAM.md`. The previously observed moving-main SHA `806d9732c974bc8a51b8317c1bd8985544fe627c` is not a second implementation baseline.
 
-Documented failure from `docs/spec/consolidation-context-spec-v0.2.0.md` §1.1: the original writer used `Buffer.byteLength(JSON.stringify(context))` (bytes) against a token-valued limit; for a 272k-token model with 4k output and 1,024 overhead it blocked at 186,883 bytes. An illustrative 404 KB English-heavy request is roughly 101k tokens under upstream Codex's bytes/4 estimation and must not be rejected simply because bytes were mistaken for tokens. The old writer also lacked Codex-like cumulative-history compaction. This is a proven code-level issue; it does **not** prove every instance of UNAVAILABLE has that single cause.
+Memory prompts and selected write/read policies are ported from that baseline. Pi owns agent execution, compaction and overflow recovery. Filesystem isolation, immutable generations, revocation, SQLite leases/budgets and diagnostics remain Pi host adapters. This is not a claim of identical Codex runtime, source serialization or provider behavior.
 
-The `UNAVAILABLE` label in `src/doctor.ts` is derived from `MemoryDiagnostics.selectedReadable`. `src/diagnostics.ts` sets that based on `getPublishedGeneration()`; the latter also checks blocked reading, published state, current control epoch, source validity/retention and extraction identity. Preserve all such distinctions so doctor explains *why* selected memory is unavailable and whether generation is pending, blocked, failed or invalidated.
+## Implemented changes
 
-**Required parity/operational acceptance:**
-- [ ] With 256 selected synthetic sources, a fitting normalized context is not falsely rejected by byte-versus-token unit confusion. The memory writer uses the chosen pinned Codex's counting/context mechanism, not a new hand-written alternative.
-- [ ] Demonstrate a real completed consolidation publication and a subsequent `selected memory READABLE` status and working retrieval; retaining only extracted sources is insufficient.
-- [ ] With intentional writer failure, `/memory status` and `/memory doctor` remain available, read-only and clearly report the actual terminal reason; no false claim of readable memory.
-- [ ] The port retains enough operational Pi diagnostics to distinguish no publication, failed writer, stale source, blocked generation, incompatible host and missing model; diagnostic interfaces must not modify Codex memory behavior.
-- [ ] Run actual Pi TUI and noninteractive tests, not only mocked protocol tests.
+- Consolidation now runs through `createAgentSession()`, `SessionManager.inMemory()` and an isolated `DefaultResourceLoader`. Resource discovery, extensions, skills, context files, themes and prompt templates are disabled. Only confined custom workspace tools are enabled. No second compactor or context controller is maintained.
+- The rendered upstream consolidation template is the user prompt. Identifier rewriting, appended consolidation boundaries and summary-length instructions are removed. Medium reasoning matches pinned phase 2. Workspace/diff paths and extension-input placeholders are host substitutions; the latter describe staged read-only notes.
+- Writer limits of 12 model calls, 40 tools, 300 seconds and 4000 output tokens are removed. Pi's native threshold compaction, overflow recovery and retry use the same gated accounting transport as ordinary writer turns. There is no local artifact-repair prompt or extra repair turn.
+- Extraction parses one sampled response. v1 accepts an absent/null slug and classifies either empty required field as no output. v2 preserves the native 9000-byte middle-truncation algorithm, including its character-count marker outside the retained-byte budget. JSON fences and custom output-size/slug/whitespace policies are removed.
+- Extraction estimates request tokens with `ceil(UTF8 bytes / 4)` and uses the resolved model output maximum clamped to remaining estimated context at the Pi transport boundary. v1 applies native head/tail truncation at 70% of the resolved Pi window; v2 retains normalized Pi role/dependency tiers with corrected token units. Raw path/cwd/branch placeholders match upstream rendering.
+- Consolidated v1 validation requires a regular `MEMORY.md`, UTF-8 summary and literal `v1` marker. v2 additionally requires the native four headings and `<10000` summary bytes. Custom project/date grouping checks are removed. Filesystem, redaction and publication-integrity checks remain.
+- Read guidance now uses the vendored upstream templates and native approximate 2500-token summary truncation. Retrieval supports native immediate-child listing, normalized/same-line/window search modes and token/line read limits. The revocable quoted carrier and response envelopes remain host adaptations.
+- Schema 14 allows native v2 truncation metadata where the marker makes accepted output exceed 9000 bytes or even the original size. Existing rows and schema-upgrade privacy handling are retained.
 
-## Pi native compaction — verified host integration (2026-10-10)
+## Function mapping
 
-**Architectural correction:** Do **not** port Codex's full auto-compaction engine or introduce a second Pi-memory compactor. The actual Pi fork at `earendil-works/pi` already supplies compaction, overflow recovery, and retry inside **`AgentSession`**, backed by `SessionManager`.
+All upstream paths below are relative to `codex-rs/` at the pinned SHA. **Exact policy** means the named policy is ported, not that its surrounding runtime is identical.
 
-Verified upstream Pi source:
-- `packages/coding-agent/src/core/agent-session.ts`: `_installAgentNextTurnRefresh`, `_compactBeforeNextAssistantResponse`, `_checkCompaction`, and `_runAutoCompaction`. Compaction occurs at the projected-context threshold after tools and can recover overflow.
-- `packages/coding-agent/src/core/compaction/compaction.ts`: native `prepareCompaction` / `compact`.
-- `packages/coding-agent/src/core/sdk.ts`: `createAgentSession`, with an in-memory session manager and isolated resource loader supported.
-- `packages/agent/src/agent.ts`: **bare `new Agent()` does not install an automatic compactor**. It exposes optional `prepareNextTurnWithContext`; `AgentSession` installs the integration.
-- Official Pi docs: `packages/coding-agent/docs/compaction.md` and `docs/sdk.md`.
-
-**Current discrepancy:** `src/pipeline/consolidate.ts` constructs `new Agent({ ... })` directly, without `AgentSession` or `SessionManager`. Consequently, the foreground Pi CLI's native compaction does not automatically apply to this background Writer. The P0 token-counter patch on this branch is **interim**, not a replacement for Pi's canonical projected-context accounting.
-
-**Implementation direction:**
-1. Run background consolidation inside Pi `AgentSession` instead of a bare `Agent`, reusing Pi's *built-in* compaction, overflow recovery and continuation. Do not copy Pi's internals.
-2. Use an **isolated in-memory `SessionManager`** and an isolated `DefaultResourceLoader` with `noExtensions: true` and explicit system prompt, so the Writer does not recursively load the memory or permission extensions. Do not modify Pi core/permission code.
-3. Preserve the current minimum sandboxed workspace tool permissions; adapt tool registrations to the SDK's `customTools` contract without enabling unnecessary shell/network tools. Run background work with the owning model/auth runtime.
-4. Use exact pinned Codex extraction/consolidation prompts and artifact behavior. Pi handles only the host agent runtime and context mechanics; retain `/memory doctor` and `/memory status` as read-only observability.
-5. Verify agent/session behavior under provider usage, tool continuations, actual compaction and post-overflow retry; verify publication then selected memory `READABLE`. Keep the exact failure reason on nonpublication.
-
-**Validation status:** Pi documentation/source and bare-agent mismatch inspected, but **the AgentSession migration is not implemented or tested yet**. No claim of working auto-compaction in the background Writer.
-
-## Implementation checkpoint — P0 context accounting (2026-10-10)
-
-**Code landed on this branch; parity is NOT complete.**
-
-- `src/pipeline/codex-context.ts`: ported Codex's `ceil(UTF8_bytes / 4)` model-visible history heuristic with the strictly necessary Pi-to-Codex mapping (text, JSON tool-call arguments, tool response bodies, projected tool declarations). Transport metadata and duplicated tool-result `details` are excluded.
-- `src/pipeline/consolidate.ts`: replaced the byte-versus-token `JSON.stringify(context)` context check with provider-reported total tokens plus items appended after the last assistant response; before provider usage is known, use the initial model-visible estimate. Removed the arbitrary 70% capacity cap; the remaining interim hard-window gate is not Codex auto-compaction.
-- `tests/codex-context.test.ts`: added ~404 KB/272k-window regression, Unicode/escaping, Pi projected tools, provider usage delta and non-text handling.
-- `tests/consolidation-agent.test.ts`: replaced historical false-byte-overflow assertions with token-based continuation and real reported hard-overflow tests.
-- `/memory status`, `/memory doctor`, `src/diagnostics.ts` and their read-only diagnostics are unchanged.
-
-**Validation performed:** independent Node test of the UTF-8/4 arithmetic (404 KB -> 103,429 approximate tokens) in an isolated local prototype. **Not yet performed:** package typecheck, full repository tests, actual Pi foreground/Writer transport, new-generation publication, doctor READABLE acceptance. Do not present this as a working end-to-end memory port.
-
-**Known remaining upstream deviations (must be addressed next):** Pi AgentSession migration (native auto-compaction and overflow recovery), model-specific effective window/token accounting, Pi native tool-output handling, original consolidation tool workflow, byte-identical rendered prompts, custom 12-call/40-tool/300s/4k-output limits, custom publication policies. Keep necessary data-integrity/permission isolation and read-only diagnostics without introducing new memory policy.
-
-## Source policy
-
-The canonical behavior is the implementation of `openai/codex` at a **single pinned commit**. Do not port from a moving `main` or from README descriptions alone. The current legacy vendored templates in `UPSTREAM.md` reference `1cc7e2361237ce7244430ee1d581c77f95c57ac8`. The upstream commit observed while starting this branch was `806d9732c974bc8a51b8317c1bd8985544fe627c`; it is **not yet an approved full-file implementation baseline**. Select and audit one baseline before replacing behavior.
-
-Source directories: `codex-rs/memories/write/`, `codex-rs/memories/read/`, and the corresponding `codex-rs/core/` runtime orchestration. Record each upstream file/path/function and its Pi counterpart.
-
-## Allowed deviation rule
-
-1. Preserve upstream prompt templates byte-for-byte; no added policy sections, advice, or user-task assumptions.
-2. Permit changes only at host boundaries: Pi session representation, SDK/model transport, lifecycle, tool-dispatch interfaces, filesystem paths, and necessary safety/permission integration.
-3. Native Codex limits, retries, scheduling, compaction, extraction, consolidation, validation and read semantics belong to the port; never retain different local choices without an upstream reference.
-4. If a native Codex operation cannot be provided by Pi, document the exact API mismatch and narrowly scoped adapter before implementing it.
-5. Do not merge PR #58 or carry over its custom context controller as a shortcut.
-6. Validate generated prompt bytes, requests, files, reader/tool flow and termination, not only mock results. Never equate one real-model success with parity.
-
-## Initial verified deviations on `main`
-
-The executable `npm run audit:codex-parity` deliberately fails while known deviations exist.
-
-| Finding | File | Observed deviation |
+| Upstream path / function | Pi implementation | Classification |
 | --- | --- | --- |
-| P001/P007 | `src/pipeline/consolidate.ts` | Appends Pi consolidation boundaries and custom summary instructions to upstream Writer template |
-| P002-P005 | `src/pipeline/consolidate.ts` | Local fixed writer budgets of 12 requests, 40 tools, 300 seconds and 4K output tokens |
-| P006 | `src/pipeline/consolidate.ts` | Rewrites upstream prompt identifier text |
-| P008 | `prompts/pi/` and `UPSTREAM.md` | Additional adapted prompt family |
+| `memories/write/src/prompts.rs::build_consolidation_prompt_for_version` | `pipeline/consolidate.ts::renderConsolidationPrompt` | Original template; host workspace/diff/notes substitutions |
+| `memories/write/src/phase2.rs::agent::get_prompt` | `runConsolidation` / `session.prompt` | Rendered template as user prompt |
+| `phase2.rs::agent::get_config` | isolated SDK settings/resource loader, `SessionManager.inMemory`, workspace tools | Host adapter; medium reasoning preserved |
+| `phase2.rs::agent::loop_agent`, `handle` | SDK session lifecycle plus lease/readiness gates, scheduler/publication | Pi native execution; SQLite/CAS publication adapter |
+| Codex core context/compaction lifecycle | Pi `AgentSession` native compaction/overflow/retry | Host runtime substitution, not a copied Codex compactor |
+| `memories/write/src/phase1.rs::job::sample` | `extraction/runner.ts::runExtraction` | One sample/parse; provider and scheduling adapters |
+| `memories/write/src/phase1_output.rs::StageOneOutput::parse`, `output_schema` | `extraction/v1.ts`, `v2.ts`, `format.ts` | Exact output policies; missing v1 slug mapped to empty storage string |
+| `memories/write/src/prompts.rs::rollout_token_limit`, `build_stage_one_input_message` | extraction `fitContext`, v1 `rolloutContents` seam | Native 70% and head/tail policy; Pi window lacks effective-percent metadata; output headroom is a host admission adapter |
+| `memories/write/src/rollout_input.rs` / phase1 rollout serialization | captured normalized Pi snapshot, v2 role/dependency tiers | Host representation adapter; source-serialization equivalence unsupported |
+| `memories/write/src/workspace.rs::validate_consolidation_artifacts_for_version`, `is_valid_v2_summary` | `pipeline/artifacts.ts` and publication validation | Exact required artifacts/marker/v2 headings and size; extra integrity checks |
+| `memories/write/src/storage.rs` input synchronization | `pipeline/staging.ts` | Host paths, selected evidence, notes and diff adapter |
+| `ext/memories/src/prompts.rs::build_memory_tool_developer_instructions` | `read/inject.ts::renderMemorySection`, `renderMemoryCarrier` | Original template/native summary truncation; carrier envelope differs |
+| `ext/memories/src/extension.rs::contribute_thread_context` | `read/projection.ts` and foreground hooks | Revocable quoted user-role carrier; native `developer_policy` priority unsupported |
+| `ext/memories/src/local/list.rs::list` | `read/tools.ts` list | Immediate children/default 2000; pin cursor and response-byte adapter |
+| `ext/memories/src/local/search.rs::search` | `read/tools.ts` search | Matching/window/context/default 200; pin attribution/pagination adapter |
+| `ext/memories/src/local/read.rs::read` | `read/tools.ts` read | 1-based offset/line limits/default 20000 tokens; response-byte adapter |
+| `utils/string/src/truncate.rs` | `codex-truncation.ts`, extraction truncation helper | Native UTF-8 middle truncation and marker semantics |
 
-**These are candidates for removal, not proof that every item lacks a Codex equivalent.** Establish the exact upstream implementation before modifying a policy.
+## Host boundaries and unsupported equivalence
 
-## Next code checkpoints
+`ExtensionContext` exposes the owning `ModelRegistry`, not its private concrete `ModelRuntime`. `pipeline/model-port.ts::createWriterRuntime` supplies the fixed physical-model public facade required by the SDK and delegates requests to the existing registry closure. Authentication remains at request time; no credentials are copied or persisted. This facade is tested against the real SDK but does not implement virtual model routing. Virtual models fail explicitly with `unsupported_virtual_model`.
 
-- [ ] Freeze and record current Codex upstream SHA; compare source and existing vendored prompt hashes.
-- [ ] Produce function-by-function upstream ↔ Pi mapping and classify each difference as exact/host-adapter/deviation/missing.
-- [ ] Migrate the background consolidation Writer from bare Agent to isolated Pi AgentSession, using Pi native compaction rather than a custom compactor.
-- [ ] Replace extraction and consolidation with upstream-equivalent execution and verbatim prompts.
-- [ ] Replace memory read/injection with upstream-equivalent semantics via a minimal Pi host adapter.
-- [ ] Remove custom runtime limits, validation, and heuristics that are absent upstream, retaining necessary safety and data integrity.
-- [ ] Add parity fixtures and evaluate v1 and v2 separately with identical inputs.
-- [ ] Run `npm run typecheck`, `npm test`, behavioral tests, and the parity audit; document unsupported equivalence explicitly.
+Workspace tools replace Codex shell/original-rollout access and keep sequential execution, confined writes and bounded responses. Staging/diff generation uses immutable host selections rather than the native mutable git-baseline memory root. Shared notes replace native memory-extension resources at the template-placeholder boundary. SQLite generations, CAS, control epochs, source retention, leases, daily admission and diagnostics remain host operations. Their scheduling and publication rules are not asserted to equal upstream state storage.
 
-No production memory behavior has been changed by the initial audit commits.
+Foreground memory is a quoted, bounded and removable custom message projected as user content. Native Codex contributes developer-policy instructions. Pin identity, revocation, capacity omission and the 16KiB retrieval-response ceiling can change the content visible to the model. Retrieval uses host names/aliases, source attribution and generation-bound cursors rather than upstream tool namespaces and decimal cursors. These differences are explicit adapters, not evidence of complete read parity.
+
+## P0 acceptance and evidence
+
+The historical writer compared serialized UTF-8 **bytes** with token-valued capacity and had no background automatic compaction. A fitting ~404KB request on a 272k-token model could be falsely rejected. That failure is corrected; it does not explain every `selected memory UNAVAILABLE` result.
+
+Focused synthetic checks now exercise:
+
+- Native Pi session tool continuation, threshold compaction, overflow recovery/retry, shared transport accounting, cancellation and isolation.
+- Publication from a 256-source selected workspace, subsequent `selected memory READABLE` diagnostics and successful retrieval; failure retains an unavailable status and read-only diagnostics.
+- Native extraction outcomes, malformed-output single sampling, UTF-8 truncation, 404KB/272k-window accounting and fencing.
+- Schema 14 upgrade preservation and rollback behavior, plus legacy privacy cleanup.
+
+The integrated full suite passed **545/545**, followed by **23/23** retrieval checks after the final search efficiency change. Extraction/jobs checks passed **58/58** after output-headroom correction. Typecheck, all **9/9** upstream hashes, **11** static policy checks and `git diff --check` passed. The behavioral matrix passed **60/60**, with zero missing or failed/skipped rows and no unrelated failures. The audit checks declared policy facts and adapters, not full cross-runtime semantic equivalence.
+
+Standards/spec review found and resolved missing extraction output headroom, read truncation attribution/suffix loss and quadratic search pruning. The final multi-line search uses a sliding-count host efficiency adaptation while preserving native minimal-window results. Omitted middle evidence does not gain detail-use credit.
+
+The installed Pi **0.99.2** foreground host probe passed with every provider transport intercepted. It verifies HTTP abort fencing and documents the pre-existing unsupported cached Codex WebSocket abort fence; it does not make network calls or establish provider UAT.
+
+## Remaining acceptance
+
+- [x] Final local repository gates passed on the integrated worktree.
+- [x] Run isolated actual Pi TUI workflow: 6/6 passed publication, READABLE, injection and detail retrieval, including synthetic-threshold native compaction.
+- [x] Close actual CLI/TUI + real Luna 6 path-contract failure: both versions completed extraction, consolidation, publication, READABLE, list and detail read after the fix. Captured extraction system/input and rendered consolidation prompts were checked for both. See [UAT evidence](operations/strict-port-uat.md).
+- [ ] Resolve or explicitly accept the documented host differences before claiming exact Codex parity. Template hashes and static policy checks alone do not prove full execution equivalence.
+- Secondary observation: D01 v2 emitted an unsupported rollout UUID. Recall-quality benchmarking is not the primary integration gate.
+
+UAT used isolated temporary profiles and stores; no production memory store was modified.

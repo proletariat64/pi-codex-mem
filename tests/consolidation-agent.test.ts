@@ -9,7 +9,7 @@ import { createAssistantMessageEventStream, type Api, type AssistantMessage, typ
 import { defaultConfig, type MemoryVersion } from "../src/config.ts";
 import { openStateDb } from "../src/store/db.ts";
 import { claimConsolidation } from "../src/store/consolidation.ts";
-import { consolidationPromptHash, runConsolidation } from "../src/pipeline/consolidate.ts";
+import { consolidationPromptHash, renderConsolidationPrompt, runConsolidation } from "../src/pipeline/consolidate.ts";
 import { validateSummaryFormat } from "../src/pipeline/artifacts.ts";
 import type { ConsolidationModelPort } from "../src/pipeline/model-port.ts";
 
@@ -85,8 +85,10 @@ test("T26 v2: writer tools deny handbook, skill and deletion attempts", async (t
   if (system?.role !== "system") throw new Error("missing system");
   assert.deepEqual(system.toolsAdded?.map(tool => tool.name),
     ["workspace_list", "workspace_read", "workspace_search", "workspace_write"]);
-  assert.match(JSON.stringify(system), /session_key/);
-  assert.doesNotMatch(JSON.stringify(system), /thread_id=/);
+  const user = calls[0]!.context.messages.find(message => message.role === "user");
+  const content = user && Array.isArray(user.content) ? user.content[0] : undefined;
+  assert.equal(content?.type, "text");
+  assert.equal(content?.type === "text" ? content.text : "", renderConsolidationPrompt("v2"));
   assert.equal(readFileSync(join(setup.directory, "memory_summary.md"), "utf8"), summary);
   assert.throws(() => readFileSync(join(setup.directory, "MEMORY.md")), /ENOENT/);
   assert.throws(() => readFileSync(join(setup.directory, "skills/escape/SKILL.md")), /ENOENT/);
@@ -119,7 +121,7 @@ for (const version of ["v1", "v2"] as const) test(`T18 ${version}: hostile write
   const results = calls[2]?.context.messages.filter(x => x.role === "toolResult");
   assert.ok(results?.some(x => x.role === "toolResult" && x.toolName === "bash" && x.isError));
   assert.ok(results?.some(x => x.role === "toolResult" && x.toolName === "workspace_read" && x.isError));
-  assert.ok(calls.every(x => x.maxTokens === 4_000 && x.maxRetries === 0));
+  assert.ok(calls.every(x => x.maxTokens === model.maxTokens && x.maxRetries === 0));
   assert.equal((setup.db.prepare("SELECT status FROM jobs WHERE job_id = ?").get(setup.lease.jobId) as { status: string }).status,
     "leased", "success is only committed during publication");
   assert.equal((setup.db.prepare("SELECT SUM(call_count) AS n FROM budget_usage").get() as { n: number }).n, 3);
@@ -135,7 +137,7 @@ test("writer reserves each accumulated context, defers before an over-budget req
     { actual_input: number; actual_output: number; call_count: number };
   assert.ok(budget.actual_input > 0, "reserve the model-visible writer instructions and tools in token units");
   assert.ok(budget.actual_input < 30_000, "do not reserve raw JSON-envelope bytes as tokens");
-  assert.equal(budget.actual_output, 4_000);
+  assert.equal(budget.actual_output, model.maxTokens);
   assert.equal(budget.call_count, 1);
 });
 
@@ -151,18 +153,15 @@ test("writer charges cached inputs to the shared daily token ledger exactly once
   assert.equal(setup.db.prepare("SELECT actual_input FROM budget_usage").get()!.actual_input, 10_000);
 });
 
-test("writer stops before the thirteenth model call and forty-first workspace operation", async (t) => {
-  for (const kind of ["calls", "tools"] as const) {
-    const setup = fixture(t);
-    const replies = kind === "calls" ? Array.from({ length: 12 }, (_x, index) =>
-      reply([tool("workspace_list", {}, `list-${index}`)], "toolUse")) :
-      [reply(Array.from({ length: 41 }, (_x, index) => tool("workspace_write",
-        { path: "MEMORY.md", content: `write-${index}` }, `write-${index}`)), "toolUse")];
-    const { port, calls } = fakePort(replies);
-    assert.deepEqual(await run(setup, port), { status: "blocked", reason: kind === "calls" ? "model_call_budget" : "tool_budget" });
-    assert.equal(calls.length, kind === "calls" ? 12 : 1);
-    if (kind === "tools") assert.equal(readFileSync(join(setup.directory, "MEMORY.md"), "utf8"), "write-39");
-  }
+test("native writer completion is not stopped at twelve calls or forty tools", async (t) => {
+  const setup = fixture(t);
+  const responses = Array.from({ length: 13 }, (_x, index) => reply([tool("workspace_list", {}, `list-${index}`)], "toolUse"));
+  responses.push(reply(Array.from({ length: 41 }, (_x, index) => tool("workspace_write", { path: "MEMORY.md", content: `write-${index}` }, `write-${index}`)), "toolUse"));
+  responses.push(reply([{ type: "text", text: "Done." }]));
+  const { port, calls } = fakePort(responses);
+  assert.deepEqual(await run(setup, port), { status: "succeeded" });
+  assert.equal(calls.length, 15);
+  assert.equal(readFileSync(join(setup.directory, "MEMORY.md"), "utf8"), "write-40");
 });
 
 test("cancellation settles when provider ignores abort, retains its reservation and rejects late tool writes", { timeout: 10_000 }, async (t) => {
@@ -185,7 +184,7 @@ test("cancellation settles when provider ignores abort, retains its reservation 
   assert.throws(() => readFileSync(join(setup.directory, "MEMORY.md")), /ENOENT/);
   const charge = setup.db.prepare("SELECT status, actual_output FROM budget_reservations").get() as
     { status: string; actual_output: number };
-  assert.deepEqual({ ...charge }, { status: "charged", actual_output: 4_000 });
+  assert.deepEqual({ ...charge }, { status: "charged", actual_output: model.maxTokens });
 });
 
 test("P0: previously overcounted UTF-8 text no longer blocks a fitting continuation", async (t) => {
@@ -199,15 +198,19 @@ test("P0: previously overcounted UTF-8 text no longer blocks a fitting continuat
   assert.equal(calls.length, 2, "the second request must reach the provider");
 });
 
-test("provider-reported usage still blocks genuine hard-window overflow", async (t) => {
+test("Pi threshold compaction summarizes accumulated tools and resumes the writer", async (t) => {
   const setup = fixture(t);
   const { port, calls } = fakePort([
-    reply([tool("workspace_list", {})], "toolUse", 116_000, 1_000),
+    reply([{ type: "text", text: "settled decisions ".repeat(8_000) }, tool("workspace_list", {})], "toolUse", 116_000, 1_000),
+    reply([{ type: "text", text: "## Goal\nConsolidate memory.\n## Progress\nRead selected workspace.\n## Next Steps\nWrite summary." }]),
+    reply([{ type: "text", text: "Done." }]),
   ]);
   port.resolve = () => ({ ...model, contextWindow: 120_000 });
-  assert.deepEqual(await run(setup, port), { status: "blocked", reason: "context_budget" });
-  assert.equal(calls.length, 1);
-  assert.equal((setup.db.prepare("SELECT COUNT(*) AS n FROM budget_reservations").get() as { n: number }).n, 1);
+  assert.deepEqual(await run(setup, port), { status: "succeeded" });
+  assert.equal(calls.length, 3);
+  assert.match(JSON.stringify(calls[1]?.context), /summar/i);
+  assert.match(JSON.stringify(calls[2]?.context), /conversation history before this point was compacted/);
+  assert.equal(setup.db.prepare("SELECT SUM(call_count) AS n FROM budget_usage").get()!.n, 3);
 });
 
 test("foreground work pauses subsequent requests while allowing a budgeted in-flight write to finish", async (t) => {
@@ -240,21 +243,23 @@ test("a 30-second lease heartbeat aborts a fenced-out request before any provide
   assert.throws(() => readFileSync(join(setup.directory, "MEMORY.md")), /ENOENT/);
 });
 
-test("the five-minute total timeout bounds a provider that never finishes", { timeout: 2_000 }, async (t) => {
+test("the old five-minute limit no longer cuts off a live writer", { timeout: 5_000 }, async (t) => {
   const setup = fixture(t);
   t.mock.timers.enable({ apis: ["setTimeout"] });
-  const port: ConsolidationModelPort = { resolve: () => model, stream: () => createAssistantMessageEventStream() };
+  const stream = createAssistantMessageEventStream();
+  const port: ConsolidationModelPort = { resolve: () => model, stream: () => stream };
   const pending = run(setup, port);
   await new Promise<void>(resolve => setImmediate(resolve));
   t.mock.timers.tick(300_000);
-  assert.deepEqual(await pending, { status: "blocked", reason: "total_timeout" });
-  assert.equal((setup.db.prepare("SELECT actual_output FROM budget_reservations").get() as { actual_output: number }).actual_output, 4_000);
+  const message = reply([{ type: "text", text: "Done." }]);
+  stream.push({ type: "done", reason: "stop", message });
+  assert.deepEqual(await pending, { status: "succeeded" });
 });
 
 test("provider errors, abort and output limits never produce successful consolidation or repair requests", async (t) => {
   for (const [stopReason, errorMessage, expected] of [
     ["error", "401 unauthorized", { status: "blocked", reason: "auth_or_model" }],
-    ["error", "503 unavailable", { status: "retry_wait", reason: "provider_error" }],
+    ["error", "invalid request", { status: "retry_wait", reason: "provider_error" }],
     ["aborted", "aborted", { status: "cancelled", reason: "aborted" }],
     ["length", "", { status: "blocked", reason: "output_budget" }],
   ] as const) {
@@ -269,7 +274,7 @@ test("provider errors, abort and output limits never produce successful consolid
 test("transport observers count spent requests and transient Retry-After hints stay metadata-only", async (t) => {
   const setup = fixture(t);
   let started = 0;
-  const response = { ...reply([], "error"), errorMessage: "429 Retry-After: 600 temporary-secret-text" };
+  const response = { ...reply([], "error"), errorMessage: "invalid request Retry-After: 600 temporary-secret-text" };
   const { port } = fakePort([response]);
   assert.deepEqual(await run(setup, port, { onRequestStarted: () => { started++; } }),
     { status: "retry_wait", reason: "provider_error", retryAfterMs: 600_000 });
@@ -283,48 +288,21 @@ test("transport observers count spent requests and transient Retry-After hints s
   assert.equal(started, 1);
 });
 
-test("v2 oversized UTF-8 summary gets one bounded repair in the same Agent context", async (t) => {
+for (const defect of ["size", "heading"] as const) test(`v2 ${defect} violation fails validation without a custom repair prompt`, async (t) => {
   const setup = fixture(t, "v2");
-  const oversized = summary.replace("## User Profile", "## User Profile\n" + "界".repeat(3_400));
-  const { port, calls } = fakePort([
-    reply([tool("workspace_write", { path: "memory_summary.md", content: oversized })], "toolUse"),
-    reply([{ type: "text", text: "Written." }]),
-    reply([tool("workspace_write", { path: "memory_summary.md", content: summary })], "toolUse"),
-    reply([{ type: "text", text: "Repaired." }]),
-  ]);
-  let validations = 0;
-  assert.deepEqual(await run(setup, port, { validateOutputs: () => {
-    validations++;
-    validateSummaryFormat(readFileSync(join(setup.directory, "memory_summary.md"), "utf8"), "v2");
-  } }), { status: "succeeded" });
-  assert.equal(validations, 2);
-  assert.equal(calls.length, 4);
-  assert.equal(readFileSync(join(setup.directory, "memory_summary.md"), "utf8"), summary);
-  assert.match(JSON.stringify(calls[2]?.context), /summary exceeds UTF-8 byte cap/);
-  assert.match(JSON.stringify(calls[2]?.context), /界/);
-  assert.equal((setup.db.prepare("SELECT SUM(call_count) AS n FROM budget_usage").get() as { n: number }).n, 4);
-});
-
-test("missing v2 heading gets one general diagnostic repair without citation instructions", async (t) => {
-  const setup = fixture(t, "v2");
-  const bad = summary.replace("## General Tips\n", "");
+  const bad = defect === "size" ? summary + "界".repeat(3_400) : summary.replace("## General Tips\n", "");
   const { port, calls } = fakePort([
     reply([tool("workspace_write", { path: "memory_summary.md", content: bad })], "toolUse"),
     reply([{ type: "text", text: "Written." }]),
-    reply([tool("workspace_write", { path: "memory_summary.md", content: summary })], "toolUse"),
-    reply([{ type: "text", text: "Repaired." }]),
   ]);
   let validations = 0;
   assert.deepEqual(await run(setup, port, { validateOutputs: () => {
-    validations++;
-    validateSummaryFormat(readFileSync(join(setup.directory, "memory_summary.md"), "utf8"), "v2");
-  } }), { status: "succeeded" });
-  assert.equal(validations, 2);
-  const diagnostic = JSON.stringify(calls[2]?.context);
-  assert.match(diagnostic, /summary missing required heading: ## General Tips/);
-  assert.match(diagnostic, /sole validation repair opportunity/);
-  assert.doesNotMatch(diagnostic, /Check EVERY bullet|exact selected source path or note ID/);
-  assert.equal(readFileSync(join(setup.directory, "memory_summary.md"), "utf8"), summary);
+    validations++; validateSummaryFormat(readFileSync(join(setup.directory, "memory_summary.md"), "utf8"), "v2");
+  } }), { status: "blocked", reason: "validation_failed" });
+  assert.equal(validations, 1);
+  assert.equal(calls.length, 2);
+  assert.equal(readFileSync(join(setup.directory, "memory_summary.md"), "utf8"), bad);
+  assert.doesNotMatch(JSON.stringify(calls), /Host validation diagnostic|sole validation repair/);
 });
 
 test("host input integrity failure blocks without repair or exposing evidence to model", async (t) => {
@@ -345,22 +323,28 @@ test("host input integrity failure blocks without repair or exposing evidence to
   assert.equal((setup.db.prepare("SELECT status FROM jobs WHERE job_id = ?").get(setup.lease.jobId) as { status: string }).status, "leased");
 });
 
-test("a second invalid artifact response blocks without another repair or marking the leased job successful", async (t) => {
+test("Pi retries a transient provider failure through the same budget ledger", async t => {
   const setup = fixture(t);
-  const invalid = "v2\n" + summary.slice(3);
   const { port, calls } = fakePort([
-    reply([tool("workspace_write", { path: "memory_summary.md", content: invalid })], "toolUse"),
-    reply([{ type: "text", text: "Written." }]),
-    reply([tool("workspace_write", { path: "memory_summary.md", content: invalid })], "toolUse"),
-    reply([{ type: "text", text: "Still written." }]),
+    { ...reply([], "error"), errorMessage: "503 unavailable" },
+    reply([{ type: "text", text: "Recovered." }]),
   ]);
-  let validations = 0;
-  assert.deepEqual(await run(setup, port, { validateOutputs: () => {
-    validations++;
-    validateSummaryFormat(readFileSync(join(setup.directory, "memory_summary.md"), "utf8"), "v1");
-  } }), { status: "blocked", reason: "validation_failed" });
-  assert.equal(validations, 2);
-  assert.equal(calls.length, 4, "one repair only; no fifth model request after second rejection");
-  assert.equal((setup.db.prepare("SELECT SUM(call_count) AS n FROM budget_usage").get() as { n: number }).n, 4);
-  assert.equal((setup.db.prepare("SELECT status FROM jobs WHERE job_id = ?").get(setup.lease.jobId) as { status: string }).status, "leased");
+  assert.deepEqual(await run(setup, port), { status: "succeeded" });
+  assert.equal(calls.length, 2);
+  assert.equal(setup.db.prepare("SELECT SUM(call_count) AS n FROM budget_usage").get()!.n, 2);
+});
+
+ test("Pi recovers explicit context overflow by compacting and retrying", async t => {
+  const setup = fixture(t);
+  const { port, calls } = fakePort([
+    reply([{ type: "text", text: "Settled history. ".repeat(6_000) }, tool("workspace_list", {})], "toolUse"),
+    { ...reply([], "error"), errorMessage: "maximum context length exceeded" },
+    reply([{ type: "text", text: "## Goal\nWrite memory.\n## Progress\nWorkspace listed." }]),
+    reply([{ type: "text", text: "Recovered." }]),
+  ]);
+  assert.deepEqual(await run(setup, port), { status: "succeeded" });
+  assert.equal(calls.length, 4);
+  assert.match(JSON.stringify(calls[2]?.context), /summar/i);
+  assert.match(JSON.stringify(calls[3]?.context), /conversation history before this point was compacted/);
+  assert.equal(setup.db.prepare("SELECT SUM(call_count) AS n FROM budget_usage").get()!.n, 4);
 });

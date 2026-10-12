@@ -260,7 +260,7 @@ test("schema 5 jobs upgrade to configuration epochs without losing durable work"
   t.after(() => upgraded.close());
   assert.deepEqual({ ...upgraded.prepare("SELECT status, config_epoch FROM jobs").get() },
     { status: "queued", config_epoch: "" });
-  assert.equal((upgraded.prepare("SELECT MAX(version) AS v FROM schema_migrations").get() as { v: number }).v, 13);
+  assert.equal((upgraded.prepare("SELECT MAX(version) AS v FROM schema_migrations").get() as { v: number }).v, 14);
 });
 
 test("schema 7 migration preserves existing v1 output while adding v2 truncation metadata", (t) => {
@@ -281,7 +281,7 @@ test("schema 7 migration preserves existing v1 output while adding v2 truncation
   const row = migrated.prepare("SELECT raw_memory, truncated, original_bytes, accepted_bytes FROM extractions")
     .get() as { raw_memory: string; truncated: number; original_bytes: number; accepted_bytes: number };
   assert.deepEqual({ ...row }, { raw_memory: "decision", truncated: 0, original_bytes: 0, accepted_bytes: 0 });
-  assert.equal((migrated.prepare("SELECT MAX(version) AS v FROM schema_migrations").get() as { v: number }).v, 13);
+  assert.equal((migrated.prepare("SELECT MAX(version) AS v FROM schema_migrations").get() as { v: number }).v, 14);
 });
 
 test("a conflicting extraction is never reported as a successful commit", (t) => {
@@ -444,4 +444,24 @@ test("budget reservations are shared across models and missing usage keeps the c
   const rows = db.prepare("SELECT SUM(actual_input) AS input, SUM(actual_output) AS output, SUM(call_count) AS calls FROM budget_usage")
     .get() as { input: number; output: number; calls: number };
   assert.deepEqual({ ...rows }, { input: 70, output: 25, calls: 2 });
+});
+
+test("native v1 no-output accepts one empty required field and preserves slug", (t) => {
+  for (const field of ["rawMemory", "rolloutSummary"]) {
+    const { db } = fixture(t);
+    enqueueExtraction(db, { sourceId: SOURCE_ID, memoryVersion: "v1", promptHash: PROMPT_HASH, now: NOW });
+    const [job] = claimDueExtractions(db, { owner: "native", now: NOW, limit: 1 });
+    assert.ok(job);
+    assert.equal(commitExtraction(db, job, { ...accepted(), [field]: "", outcome: "no_output" }, NOW + 1), true);
+  }
+});
+
+test("native v2 near-cutoff truncation stores a marker larger than removed content", (t) => {
+  const { db } = fixture(t);
+  enqueueExtraction(db, { sourceId: SOURCE_ID, memoryVersion: "v2", promptHash: PROMPT_HASH, now: NOW });
+  const [job] = claimDueExtractions(db, { owner: "native", now: NOW, limit: 1 });
+  assert.ok(job);
+  const summary = "x".repeat(4500) + "…1 chars truncated…" + "x".repeat(4500);
+  assert.equal(commitExtraction(db, job, { ...accepted("v2"), rolloutSummary: summary,
+    truncation: { truncated: true, originalBytes: 9001, acceptedBytes: Buffer.byteLength(summary) } }, NOW + 1), true);
 });

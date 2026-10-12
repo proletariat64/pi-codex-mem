@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { lstatSync, readFileSync, existsSync } from "node:fs";
-import { join, relative, resolve, sep } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { performance } from "node:perf_hooks";
 import type { DatabaseSync } from "node:sqlite";
 import type { MemoryVersion } from "../config.ts";
@@ -29,7 +29,8 @@ export interface EvidenceAccessContext {
   root: string; db: () => DatabaseSync | null; now?: () => number; maxUnusedDays?: () => number;
 }
 export interface EvidenceConsumer { consumerSession: string; runId: string }
-export interface DetailUse { path: string; startLine: number; endLine: number }
+export interface DetailUse { path: string; startLine: number; endLine: number;
+  ranges?: readonly { startLine: number; endLine: number }[] }
 export interface EvidenceOperation<T> {
   /** Complete response formatting/budget admission after the post-read validity check. */
   complete(): T;
@@ -40,6 +41,7 @@ export interface AttributedEvidence {
   readonly attribution: readonly (readonly string[])[];
 }
 export interface EvidenceAccess {
+  normalizePath(path: unknown): string;
   isReadablePath(path: string): boolean;
   paths(prefix?: unknown): string[];
   read(path: string): string;
@@ -278,6 +280,19 @@ class StoredReadPin implements MemoryReadPin {
     const attributed = new Map<string, AttributedEvidence>();
     const unavailableSources = new Map<string, boolean>();
     const access: EvidenceAccess = {
+      normalizePath: path => {
+        assertOpen();
+        if (typeof path !== "string" || path.includes("\0") || path.includes("\\") || path.split("/").includes("..")) {
+          throw new Error("path_not_available_for_version");
+        }
+        // Read guidance names this pinned directory. Convert only its paths;
+        // the existing version allowlist still decides which files are readable.
+        const scoped = isAbsolute(path) ? relative(view.directory, path) : path;
+        if (isAbsolute(scoped) || scoped === ".." || scoped.startsWith(`..${sep}`)) {
+          throw new Error("path_not_available_for_version");
+        }
+        return scoped.replace(/^(?:\.\/)+/, "").replace(/\/+$/, "") || ".";
+      },
       isReadablePath: path => { assertOpen(); return allowed(path, view.memoryVersion); },
       paths: (prefix = ".") => {
         assertOpen();
@@ -320,12 +335,17 @@ class StoredReadPin implements MemoryReadPin {
       valid();
       const output = pending.complete();
       if (pending.detailUse) {
-        const { path, startLine, endLine } = pending.detailUse;
+        const { path, startLine, endLine, ranges } = pending.detailUse;
         const evidence = attributed.get(path);
-        if (!evidence || !Number.isSafeInteger(startLine) || !Number.isSafeInteger(endLine) ||
-            startLine < 1 || endLine < startLine || endLine > evidence.lines.length) throw new Error("memory_unavailable");
+        const retained = ranges ?? [{ startLine, endLine }];
+        if (!evidence || !retained.length || retained.some(range =>
+          !Number.isSafeInteger(range.startLine) || !Number.isSafeInteger(range.endLine) ||
+          range.startLine < 1 || range.endLine < range.startLine || range.endLine > evidence.lines.length)) {
+          throw new Error("memory_unavailable");
+        }
         const actor = consumer?.();
-        if (actor) for (const sourceId of new Set(evidence.attribution.slice(startLine - 1, endLine).flat())) {
+        const sources = new Set(retained.flatMap(range => evidence.attribution.slice(range.startLine - 1, range.endLine).flat()));
+        if (actor) for (const sourceId of sources) {
           recordSourceUsage(db, { memoryVersion: view.memoryVersion, sourceId, ...actor, now });
         }
         valid();

@@ -1,17 +1,21 @@
 #!/usr/bin/env node
 /**
- * Strict Codex Memory port audit.
+ * Regression guard for known legacy Codex Memory port deviations.
  *
- * A failing result is intentional until all deviations are resolved.
- * Every finding must be removed or documented as a necessary Pi host adapter.
+ * A clean result is expected. Known patterns are scanned across production src
+ * files so moving legacy code does not bypass the guard. Renamed/reformulated
+ * policies can evade this blocklist; a pass is not proof of runtime parity.
  * Run: node scripts/audit-codex-parity.mjs
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const read = (path) => readFileSync(resolve(root, path), "utf8");
+const sources = readdirSync(resolve(root, "src"), { recursive: true })
+  .filter(path => /\.(?:ts|js|mjs)$/.test(path))
+  .map(path => ({ path: `src/${path}`, text: read(`src/${path}`) }));
 
 const checks = [
   {
@@ -86,9 +90,10 @@ const checks = [
 
 const findings = [];
 for (const check of checks) {
-  const source = read(check.path);
-  if (check.pattern.test(source) || (check.fallback && check.fallback.test(source))) {
-    findings.push(check);
+  for (const source of sources) {
+    if (check.pattern.test(source.text) || (check.fallback && check.fallback.test(source.text))) {
+      findings.push({ ...check, path: source.path });
+    }
   }
 }
 for (const item of findings) {

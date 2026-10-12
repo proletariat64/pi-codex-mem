@@ -63,6 +63,50 @@ function fakePort(replies: MemoryResponse[]) {
 const response = (text: string): MemoryResponse => ({ stopReason: "stop", text,
   usage: { input: 100, output: 20 } });
 
+for (const version of ["v1", "v2"] as const) {
+  test(`${version} rejects output headroom below the native empty response before spending budget`, async (t) => {
+    const run = version === "v1" ? runV1Extraction : runV2Extraction;
+    const emptyOutput = JSON.stringify(version === "v1"
+      ? { raw_memory: "", rollout_summary: "", rollout_slug: "" }
+      : { rollout_summary: "", rollout_slug: "" });
+    const minimumTokens = Math.ceil(Buffer.byteLength(emptyOutput, "utf8") / 4);
+    const probe = setup(t, undefined, version);
+    const captured = fakePort([response(emptyOutput)]);
+    assert.equal((await run({ ...probe, modelRef, port: captured.port, now: NOW + 1,
+      timezone: "UTC", limits: { ...limits, v2RolloutSummaryBytes: 9_000 },
+      signal: new AbortController().signal })).status, "no_output");
+    const context = JSON.parse(captured.calls[0]!.text) as Context;
+    const user = context.messages[0]!;
+    assert.ok(user.role === "user" && typeof user.content === "string");
+    const inputTokens = Math.ceil(Buffer.byteLength(context.systemPrompt! + user.content, "utf8") / 4);
+
+    for (const headroom of [1, minimumTokens - 1, minimumTokens]) {
+      const fixture = setup(t, undefined, version);
+      const { port, calls } = fakePort([response(emptyOutput)]);
+      port.resolve = () => ({ ...modelRef, contextWindow: inputTokens + headroom, maxTokens: 8_000 });
+      const result = await run({ ...fixture, modelRef, port, now: NOW + 1,
+        timezone: "UTC", limits: { ...limits, v2RolloutSummaryBytes: 9_000 },
+        signal: new AbortController().signal });
+      const accepted = headroom === minimumTokens;
+      assert.equal(result.status, accepted ? "no_output" : "blocked", `headroom=${headroom}`);
+      assert.equal(calls.length, accepted ? 1 : 0);
+      assert.equal(fixture.db.prepare("SELECT COUNT(*) AS n FROM budget_reservations").get()!.n, accepted ? 1 : 0);
+      if (!accepted) {
+        assert.equal(fixture.db.prepare("SELECT error_code FROM jobs").get()!.error_code, "context_too_small");
+        assert.equal(fixture.db.prepare("SELECT COUNT(*) AS n FROM extractions").get()!.n, 0);
+      }
+    }
+    const fixture = setup(t, undefined, version);
+    const { port, calls } = fakePort([]);
+    port.resolve = () => ({ ...modelRef, contextWindow: 200_000, maxTokens: minimumTokens - 1 });
+    assert.equal((await run({ ...fixture, modelRef, port, now: NOW + 1,
+      timezone: "UTC", limits: { ...limits, v2RolloutSummaryBytes: 9_000 },
+      signal: new AbortController().signal })).status, "blocked");
+    assert.equal(calls.length, 0);
+    assert.equal(fixture.db.prepare("SELECT COUNT(*) AS n FROM budget_reservations").get()!.n, 0);
+  });
+}
+
 test("v2 runner uses the pinned prompt, stores NULL raw learning and bounded summary metadata", async (t) => {
   const { db, job, root } = setup(t, undefined, "v2");
   db.prepare("UPDATE workspaces SET git_branch = 'later-branch'").run();

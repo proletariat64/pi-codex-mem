@@ -11,7 +11,7 @@ import {
   type LeasedJob,
 } from "../store/jobs.ts";
 import { parseV1Output, renderV1Request, v1EvidenceLine, truncateCodexMiddle } from "./v1.ts";
-import type { ExtractionVersion } from "./format.ts";
+import { codexExtractionFormat, type ExtractionVersion } from "./format.ts";
 import { parseV2Output, renderV2Request, type V2RequestInput } from "./v2.ts";
 
 export interface ResolvedMemoryModel {
@@ -229,7 +229,12 @@ async function runExtraction(input: V1RunInput, version: "v1" | "v2"): Promise<V
   // The native rollout allowance is independent of output. At the Pi transport
   // boundary, clamp the requested output to the remaining resolved context.
   const outputTokens = Math.floor(Math.min(model.maxTokens, model.contextWindow - inputTokens));
-  if (!Number.isFinite(outputTokens) || outputTokens < 1) {
+  // Admission must at least fit the native no-output JSON under the same UTF-8/4
+  // estimate. This is a schema-derived floor, not another memory-size policy;
+  // it does not guarantee tokenizer accuracy or a complete nonempty response.
+  const emptyOutput = Object.fromEntries(codexExtractionFormat(version).schema.required.map(field => [field, ""]));
+  const minimumOutputTokens = Math.ceil(Buffer.byteLength(JSON.stringify(emptyOutput), "utf8") / 4);
+  if (!Number.isFinite(outputTokens) || outputTokens < minimumOutputTokens) {
     failExtraction(input.db, input.job, "blocked", "context_too_small", clock());
     return { status: "blocked" };
   }

@@ -1,7 +1,7 @@
 # Pi Memory — Native Consolidation Session
 
 **Version:** 0.2.0, revised 2026-10-12
-**Status:** Current implementation contract; final integrated verification is reported separately. No production/TUI UAT or release approval is implied.
+**Status:** Current implementation contract; integrated checks and passed isolated Pi CLI/TUI + real-model reruns are recorded in the [UAT report](../operations/strict-port-uat.md). Production-store acceptance and release approval remain separate.
 **Scope:** Background consolidation v1/v2 and its host context/accounting boundary.
 
 ## 1. Authority and corrected design
@@ -78,7 +78,7 @@ Focused SDK/synthetic tests cover:
 7. Required v1/v2 artifacts and no custom repair turn or project/date gate.
 8. Schema 14 preservation for native v2 truncation metadata, including marker growth beyond original input length, with rollback on failed migration.
 
-Final acceptance requires integrated typecheck, repository tests, behavioral matrix, upstream-manifest verification and parity audit. Report actual results rather than assuming focused passes establish every gate. Actual Pi TUI/noninteractive/provider UAT remains separate and unrun at this checkpoint. Synthetic selected-source counts do not prove semantic coverage, real-provider language quality or exact token accuracy.
+Final acceptance requires integrated typecheck, repository tests, behavioral matrix, upstream-manifest verification and parity audit. Report actual results rather than assuming focused passes establish every gate. The [UAT report](../operations/strict-port-uat.md) records 6/6 isolated actual Pi CLI/TUI cases with a deterministic provider and passed v1/v2 real `openai-codex/gpt-6-luna` reruns through publication, READABLE and detail retrieval, with captured prompt checks. These runs used temporary stores; real-provider overflow recovery and production-store acceptance are not established by them. Synthetic selected-source counts do not prove semantic coverage, real-provider language quality or exact token accuracy.
 
 ## 7. Compatibility
 

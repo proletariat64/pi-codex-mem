@@ -1,7 +1,9 @@
 # Strict-port UAT — 2026-10-12
 
-This acceptance applies to the local working-tree implementation based on
-`26a3dee624eb88ad03e97dbbfdb446d1fcaf564f`. Product changes are uncommitted.
+This acceptance covers the implementation committed as
+`27cb0f05d82532d5ef6e8e742c29c4f5c09c53a8` in PR #59, developed from Pi worktree
+base `26a3dee624eb88ad03e97dbbfdb446d1fcaf564f`. The separate upstream memory-policy
+baseline is `openai/codex@1cc7e2361237ce7244430ee1d581c77f95c57ac8`.
 Automated tests from the implementation ledger are separate from this UAT.
 
 ## Current result — 2026-10-13
@@ -31,8 +33,9 @@ host boundaries.
 
 The earlier six CLI cases used a deterministic provider. The four real-model
 pilot answers used SDK AgentSession, not the CLI/TUI. These are separate evidence
-sets. Two actual CLI/TUI + real-model cases (v1/v2, one each) have now run.
-Both reached READABLE but failed at the foreground read-tool path contract. The v2 invented UUID remains a secondary quality
+sets. The initial two actual CLI/TUI + real-model cases (v1/v2, one each)
+reached READABLE but failed at the foreground read-tool path contract. The
+post-fix v1/v2 reruns passed that contract, as recorded below. The v2 invented UUID remains a secondary quality
 observation; it does not independently prove a workflow or prompt difference.
 
 ## Arranged scope

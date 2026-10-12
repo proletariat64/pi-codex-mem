@@ -138,7 +138,9 @@ for (const version of ['v1', 'v2']) for (const order of ['memory-first', 'overri
     assert.deepEqual(folded[0].toolsAdded, delta.toolsAdded); fold = false;
     const nonCarrierReserve = model.contextWindow - model.maxTokens - requestCapacity(canonical, model.contextWindow, model.maxTokens);
     // Pure carrier rendering receives a formatting DTO, not a live pin.
-    const minimum = renderMemoryCarrier({ ...firstFormatting, summary: 'v1\n' + 'x'.repeat(10_000) }, cwd, { capacity: 100_000 });
+    const baseline = renderMemoryCarrier({ ...firstFormatting, summary: 'a' }, cwd, { capacity: 100_000 });
+    const minimum = renderMemoryCarrier({ ...firstFormatting, summary: 'x'.repeat(12_000) }, cwd, { capacity: baseline.units - 1 });
+    assert.equal(minimum.representation, 'minimal');
     model.contextWindow = model.maxTokens + nonCarrierReserve + minimum.units + 200;
     await project(canonical, 'first');
     await diagnostic(/clipped carrier projected/);

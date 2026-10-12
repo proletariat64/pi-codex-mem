@@ -221,7 +221,7 @@ test("active foreground and another process's session heartbeat defer new reques
   assert.equal(fx.calls.length, 0);
 });
 
-test("foreground work beginning mid-request pauses the repair until settlement", async (t) => {
+test("foreground work beginning mid-request cannot replay malformed extraction output", async (t) => {
   const fx = setup(t);
   fx.config.schedule.minIdleMinutes = 0;
   let finish: ((reply: { stopReason: "stop"; text: string }) => void) | undefined;
@@ -239,19 +239,16 @@ test("foreground work beginning mid-request pauses the repair until settlement",
   fx.scheduler.foregroundStarted();
   assert.ok(finish);
   finish({ stopReason: "stop", text: "not JSON" });
-  assert.deepEqual(await running, [{ status: "retry_wait" }]);
+  assert.deepEqual(await running, [{ status: "blocked" }]);
   assert.equal(requests, 1);
   fx.setIdle(true);
   fx.scheduler.foregroundSettled();
-  const wakeup = fx.scheduled.at(-1);
-  assert.ok(wakeup);
-  fx.setNow(NOW + 1);
-  await wakeup.run();
-  assert.equal(requests, 2);
-  assert.equal((fx.db.prepare("SELECT outcome FROM extractions").get() as { outcome: string }).outcome, "succeeded");
+  await fx.scheduler.runPass();
+  assert.equal(requests, 1);
+  assert.equal((fx.db.prepare("SELECT COUNT(*) AS n FROM extractions").get() as { n: number }).n, 0);
 });
 
-test("configuration changes during a model call prevent a paid repair request", async (t) => {
+test("configuration changes during a model call do not trigger a schema repair request", async (t) => {
   const fx = setup(t);
   fx.config.schedule.minIdleMinutes = 0;
   let finish: ((reply: { stopReason: "stop"; text: string }) => void) | undefined;
@@ -263,10 +260,10 @@ test("configuration changes during a model call prevent a paid repair request", 
   fx.config.generate = false;
   assert.ok(finish);
   finish({ stopReason: "stop", text: "invalid JSON" });
-  assert.deepEqual(await running, [{ status: "retry_wait" }]);
+  assert.deepEqual(await running, [{ status: "blocked" }]);
   assert.equal(requests, 1);
   assert.equal((fx.db.prepare("SELECT error_code FROM jobs").get() as { error_code: string }).error_code,
-    "configuration_changed");
+    "invalid_schema");
 });
 
 test("shutdown aborts the owned model request before the store is closed", async (t) => {

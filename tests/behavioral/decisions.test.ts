@@ -96,7 +96,7 @@ const scenarios: Scenario[] = [
     messages: [
       { role: "user", text: "Use TypeScript for the parser. It lets parser and editor share validation types." },
       ...Array.from({ length: 40 }, (_, index) => ({ role: "tool" as const,
-        text: `Routine tool call ${index + 1}: listed generated files and checked unchanged formatting output. ${"x".repeat(12_000)}` })),
+        text: `Routine tool call ${index + 1}: listed generated files and checked unchanged formatting output. ${"x".repeat(20_000)}` })),
       { role: "assistant", text: "The chosen parser language remains TypeScript." },
     ],
     summary: "Important decision: use TypeScript for the parser so parser and editor share validation types. Routine tool activity is not memory guidance.",
@@ -164,7 +164,8 @@ async function runScenario(t: test.TestContext, memoryVersion: "v1" | "v2", scen
     else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
   });
 
-  const now = Date.UTC(2026, 8, 29);
+  // Live lifecycle uses Date.now(); sources must stay inside the 10-day extraction age window.
+  const now = Date.now();
   const header = { type: "session", version: 3, id: `${scenario.id.toLowerCase()}-session`, cwd, timestamp: new Date(now).toISOString() };
   const branch = scenario.messages.map((message, index) => ({
     type: message.role === "memory" ? "custom_message" : "message",

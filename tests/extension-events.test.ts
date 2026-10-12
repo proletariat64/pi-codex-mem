@@ -82,7 +82,7 @@ test("doctor and status preserve the projected clipped representation", async (t
     assert.ok(lease);
     const directory = join(root, "versions", "v1", "generations", "clipped");
     mkdirSync(directory, { recursive: true });
-    const summary = `v1\n## User Profile\n${["A", "B", "C", "D"].map(letter => `${letter} `.repeat(400)).join("\n\n")}\n## User preferences\n## General Tips\n## What's in Memory\n`;
+    const summary = `v1\n## User Profile\n${["A", "B", "C", "D"].map(letter => `${letter} `.repeat(1500)).join("\n\n")}\n## User preferences\n## General Tips\n## What's in Memory\n`;
     writeFileSync(join(directory, "memory_summary.md"), summary);
     writeFileSync(join(directory, "MEMORY.md"), "Scoped handbook");
     const manifest = JSON.stringify({ memoryVersion: "v1", controlEpoch: snapshot.controlEpoch, sources: [],

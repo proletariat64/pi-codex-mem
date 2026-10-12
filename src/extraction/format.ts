@@ -11,7 +11,9 @@ export function codexExtractionFormat(version: ExtractionVersion) {
     strict: true,
     schema: {
       type: "object" as const,
-      properties: Object.fromEntries(fields.map(field => [field, { type: "string" }])),
+      properties: Object.fromEntries(fields.map(field => [field, {
+        type: version === "v1" && field === "rollout_slug" ? ["string", "null"] : "string",
+      }])),
       required: fields,
       additionalProperties: false,
     },

@@ -4,14 +4,14 @@ import type { DatabaseSync } from "node:sqlite";
 import { dirname, join, resolve, sep } from "node:path";
 import type { Context } from "@earendil-works/pi-ai";
 import type { ModelRef } from "../config.ts";
-import { selectEvidenceWithinBudget, truncateUtf8 } from "../snapshot.ts";
+import { selectEvidenceWithinBudget } from "../snapshot.ts";
 import {
   commitExtraction, deferExtractionForBudget, failExtraction, nextLocalDayTime,
-  pauseExtraction, reconcileModelCall, renewExtractionLease, reserveModelCall, reserveRepairAttempt,
+  reconcileModelCall, renewExtractionLease, reserveModelCall,
   type LeasedJob,
 } from "../store/jobs.ts";
-import { parseV1Output, renderV1Request, v1EvidenceLine } from "./v1.ts";
-import type { ExtractionVersion } from "./format.ts";
+import { parseV1Output, renderV1Request, v1EvidenceLine, truncateCodexMiddle } from "./v1.ts";
+import { codexExtractionFormat, type ExtractionVersion } from "./format.ts";
 import { parseV2Output, renderV2Request, type V2RequestInput } from "./v2.ts";
 
 export interface ResolvedMemoryModel {
@@ -122,21 +122,29 @@ function readSource(input: V1RunInput): V2RequestInput {
       omissionReasons: omissions?.reasons as string[] | undefined } };
 }
 
-/** Select by the shared user → assistant → tool tier, newest within a tier. */
+/** Pi supplies a resolved window; Codex's effective-window percentage has no Pi metadata field. */
 function fitContext(source: V2RequestInput, model: ResolvedMemoryModel,
-  outputTokens: number, version: "v1" | "v2"): ReturnType<typeof renderV1Request> | null {
-  const render = version === "v1" ? renderV1Request : renderV2Request;
-  const maxBytes = Math.floor((model.contextWindow - outputTokens - 1_024) * 0.7);
-  const base = render({ ...source, items: [] });
-  const baseBytes = Buffer.byteLength(base.systemPrompt + base.userPrompt, "utf8");
-  if (baseBytes + 80 > maxBytes) return null;
-  const remaining = maxBytes - baseBytes - 80; // reserve for the explicit omissions marker
-  const selected = selectEvidenceWithinBudget(source.items, remaining,
-    item => Buffer.byteLength(v1EvidenceLine(item), "utf8") + 1);
-  const request = render({ ...source,
-    items: source.items.filter(item => selected.has(item)),
-    omittedForContext: source.items.length - selected.size });
-  return Buffer.byteLength(request.systemPrompt + request.userPrompt, "utf8") <= maxBytes ? request : null;
+  version: "v1" | "v2"): ReturnType<typeof renderV1Request> | null {
+  if (!Number.isFinite(model.contextWindow) || model.contextWindow <= 0) return null;
+  const rolloutTokens = Math.max(1, Math.floor(model.contextWindow * 0.7));
+  let request: ReturnType<typeof renderV1Request>;
+  if (version === "v1") {
+    // Preserve the normalized Pi snapshot representation, but use native head/tail
+    // truncation rather than introducing a second role-priority selection policy.
+    const contents = [
+      source.manifest ? `[source manifest ${JSON.stringify(source.manifest)}]` : "",
+      source.manifest?.omittedSourceItems ? `[${source.manifest.omittedSourceItems} source items omitted during normalization]` : "",
+      ...source.items.map(v1EvidenceLine),
+    ].filter(Boolean).join("\n");
+    request = renderV1Request({ ...source, rolloutContents: truncateCodexMiddle(contents, rolloutTokens * 4, true) });
+  } else {
+    // v2 retains Pi snapshot role/dependency tiers at the host representation boundary.
+    const selected = selectEvidenceWithinBudget(source.items, rolloutTokens * 4 - 80,
+      item => Buffer.byteLength(v1EvidenceLine(item), "utf8") + 1);
+    request = renderV2Request({ ...source, items: source.items.filter(item => selected.has(item)),
+      omittedForContext: source.items.length - selected.size });
+  }
+  return Math.ceil(Buffer.byteLength(request.systemPrompt + request.userPrompt, "utf8") / 4) <= model.contextWindow ? request : null;
 }
 
 function usableUsage(usage: MemoryResponse["usage"]): { input: number; output: number } | undefined {
@@ -212,9 +220,21 @@ async function runExtraction(input: V1RunInput, version: "v1" | "v2"): Promise<V
     failExtraction(input.db, input.job, "blocked", "source_unavailable_for_version", clock());
     return { status: "blocked" };
   }
-  const outputTokens = Math.min(6_000, model.maxTokens);
-  const request = fitContext(source, model, outputTokens, version);
+  const request = fitContext(source, model, version);
   if (!request) {
+    failExtraction(input.db, input.job, "blocked", "context_too_small", clock());
+    return { status: "blocked" };
+  }
+  const inputTokens = Math.ceil(Buffer.byteLength(request.systemPrompt + request.userPrompt, "utf8") / 4);
+  // The native rollout allowance is independent of output. At the Pi transport
+  // boundary, clamp the requested output to the remaining resolved context.
+  const outputTokens = Math.floor(Math.min(model.maxTokens, model.contextWindow - inputTokens));
+  // Admission must at least fit the native no-output JSON under the same UTF-8/4
+  // estimate. This is a schema-derived floor, not another memory-size policy;
+  // it does not guarantee tokenizer accuracy or a complete nonempty response.
+  const emptyOutput = Object.fromEntries(codexExtractionFormat(version).schema.required.map(field => [field, ""]));
+  const minimumOutputTokens = Math.ceil(Buffer.byteLength(JSON.stringify(emptyOutput), "utf8") / 4);
+  if (!Number.isFinite(outputTokens) || outputTokens < minimumOutputTokens) {
     failExtraction(input.db, input.job, "blocked", "context_too_small", clock());
     return { status: "blocked" };
   }
@@ -222,98 +242,77 @@ async function runExtraction(input: V1RunInput, version: "v1" | "v2"): Promise<V
     failExtraction(input.db, input.job, "blocked", "prompt_changed", clock());
     return { status: "blocked" };
   }
-  let repair = "";
-  for (let attempt = 0; attempt < 2; attempt++) {
-    if (input.signal.aborted) {
-      failExtraction(input.db, input.job, "cancelled", "aborted", clock());
-      return { status: "cancelled" };
-    }
-    const eligibility = input.canStartRequest?.() ?? "ready";
-    if (eligibility !== "ready") {
-      const changed = attempt === 0
-        ? deferExtractionForBudget(input.db, input.job, eligibility, clock(), clock())
-        : pauseExtraction(input.db, input.job, clock(), eligibility);
-      return { status: changed ? "retry_wait" : "superseded" };
-    }
-    const userText = request.userPrompt + repair;
-    const context: Context = { systemPrompt: request.systemPrompt, tools: [], messages: [
-      { role: "user", content: userText, timestamp: clock() },
-    ] };
-    const estimate = { input: Buffer.byteLength(request.systemPrompt + userText, "utf8"),
-      output: outputTokens };
-    const inputLimit = Math.floor((model.contextWindow - outputTokens - 1_024) * 0.7);
-    if (estimate.input > inputLimit) {
-      const changed = failExtraction(input.db, input.job, "blocked", "repair_context_too_small", clock());
-      return { status: changed ? "blocked" : "superseded" };
-    }
-    // A repair is a distinct network attempt. Claim it before reserving the
-    // shared budget; if the budget denies the call, deferral refunds this
-    // unspent attempt rather than the previous, already-spent request.
-    if (attempt > 0 && !reserveRepairAttempt(input.db, input.job, clock())) {
-      const changed = failExtraction(input.db, input.job, "blocked", "repair_unavailable", clock());
-      return { status: changed ? "blocked" : "superseded" };
-    }
-    const reservationId = randomUUID();
-    const budget = reserveModelCall(input.db, {
-      id: reservationId, now: clock(), timezone: input.timezone,
-      provider: model.provider, model: model.modelId, estimate,
-      limits: { input: input.limits.dailyInputTokens, output: input.limits.dailyOutputTokens,
-        requests: input.limits.dailyRequests },
-    });
-    if (!budget.ok) {
-      const deferred = deferExtractionForBudget(input.db, input.job, budget.reason, clock(),
-        nextLocalDayTime(clock(), input.timezone));
-      return deferred ? { status: "budget_deferred", reason: budget.reason } : { status: "superseded" };
-    }
-    let response: MemoryResponse;
-    try {
-      response = await requestWithLease(input, model, context, estimate.output, version);
-    } catch (err) {
-      reconcileModelCall(input.db, reservationId, undefined);
-      const cancelled = input.signal.aborted;
-      const kind = cancelled ? "cancelled" : errorKind((err as Error).message);
-      const changed = failExtraction(input.db, input.job, kind, kind === "cancelled" ? "aborted" : "provider_error",
-        clock(), { retryAfterMs: retryAfterMs((err as Error).message) });
-      return changed ? { status: kind === "transient" ? "retry_wait" : kind } : { status: "superseded" };
-    }
-    const usage = usableUsage(response.usage);
-    reconcileModelCall(input.db, reservationId, usage);
-    if (response.stopReason === "aborted" || input.signal.aborted) {
-      const changed = failExtraction(input.db, input.job, "cancelled", "aborted", clock());
-      return { status: changed ? "cancelled" : "superseded" };
-    }
-    if (response.stopReason === "error" || response.stopReason === "deferred") {
-      const kind = errorKind(response.errorMessage);
-      const changed = failExtraction(input.db, input.job, kind, kind === "blocked" ? "auth_or_model" : "provider_error",
-        clock(), { retryAfterMs: retryAfterMs(response.errorMessage) });
-      return { status: changed ? kind === "transient" ? "retry_wait" : "blocked" : "superseded" };
-    }
-    let parsed: ReturnType<typeof parseV1Output> | ReturnType<typeof parseV2Output>;
-    if (response.stopReason !== "stop") {
-      parsed = { ok: false, reason: `unexpected stop reason ${response.stopReason}` };
-    } else if (version === "v1") {
-      parsed = parseV1Output(response.text, input.limits.outputBytes);
-    } else {
-      parsed = parseV2Output(response.text, input.limits.outputBytes, input.limits.v2RolloutSummaryBytes ?? 9_000);
-    }
-    if (parsed.ok) {
-      const accepted = commitExtraction(input.db, input.job, {
-        memoryVersion: version, promptHash: request.promptHash, model: input.modelRef,
-        rawMemory: "raw_memory" in parsed.output ? parsed.output.raw_memory : null,
-        rolloutSummary: parsed.output.rollout_summary, rolloutSlug: parsed.output.rollout_slug,
-        outputHash: parsed.outputHash, usage: usage ?? estimate, outcome: parsed.outcome,
-        truncation: "truncation" in parsed ? parsed.truncation : undefined,
-      }, clock());
-      return { status: accepted ? parsed.outcome : "superseded" };
-    }
-    if (attempt === 1 || input.job.attemptCount >= 3) {
-      const changed = failExtraction(input.db, input.job, "blocked", "invalid_schema", clock());
-      return { status: changed ? "blocked" : "superseded" };
-    }
-    repair = `\n\nRepair the prior JSON response. Return ONLY the ${version === "v1" ? "three required v1" : "two required v2"} string fields. Error: ${parsed.reason}. ` +
-      `Prior response: ${truncateUtf8(response.text, 4096).text}`;
+  if (input.signal.aborted) {
+    failExtraction(input.db, input.job, "cancelled", "aborted", clock());
+    return { status: "cancelled" };
   }
-  throw new Error("unreachable extraction repair limit");
+  const eligibility = input.canStartRequest?.() ?? "ready";
+  if (eligibility !== "ready") {
+    const changed = deferExtractionForBudget(input.db, input.job, eligibility, clock(), clock());
+    return { status: changed ? "retry_wait" : "superseded" };
+  }
+  const userText = request.userPrompt;
+  const context: Context = { systemPrompt: request.systemPrompt, tools: [], messages: [
+    { role: "user", content: userText, timestamp: clock() },
+  ] };
+  const estimate = { input: inputTokens,
+    output: outputTokens };
+  const reservationId = randomUUID();
+  const budget = reserveModelCall(input.db, {
+    id: reservationId, now: clock(), timezone: input.timezone,
+    provider: model.provider, model: model.modelId, estimate,
+    limits: { input: input.limits.dailyInputTokens, output: input.limits.dailyOutputTokens,
+      requests: input.limits.dailyRequests },
+  });
+  if (!budget.ok) {
+    const deferred = deferExtractionForBudget(input.db, input.job, budget.reason, clock(),
+      nextLocalDayTime(clock(), input.timezone));
+    return deferred ? { status: "budget_deferred", reason: budget.reason } : { status: "superseded" };
+  }
+  let response: MemoryResponse;
+  try {
+    response = await requestWithLease(input, model, context, estimate.output, version);
+  } catch (err) {
+    reconcileModelCall(input.db, reservationId, undefined);
+    const cancelled = input.signal.aborted;
+    const kind = cancelled ? "cancelled" : errorKind((err as Error).message);
+    const changed = failExtraction(input.db, input.job, kind, kind === "cancelled" ? "aborted" : "provider_error",
+      clock(), { retryAfterMs: retryAfterMs((err as Error).message) });
+    return changed ? { status: kind === "transient" ? "retry_wait" : kind } : { status: "superseded" };
+  }
+  const usage = usableUsage(response.usage);
+  reconcileModelCall(input.db, reservationId, usage);
+  if (response.stopReason === "aborted" || input.signal.aborted) {
+    const changed = failExtraction(input.db, input.job, "cancelled", "aborted", clock());
+    return { status: changed ? "cancelled" : "superseded" };
+  }
+  if (response.stopReason === "error" || response.stopReason === "deferred") {
+    const kind = errorKind(response.errorMessage);
+    const changed = failExtraction(input.db, input.job, kind, kind === "blocked" ? "auth_or_model" : "provider_error",
+      clock(), { retryAfterMs: retryAfterMs(response.errorMessage) });
+    return { status: changed ? kind === "transient" ? "retry_wait" : "blocked" : "superseded" };
+  }
+  let parsed: ReturnType<typeof parseV1Output> | ReturnType<typeof parseV2Output>;
+  if (response.stopReason !== "stop") {
+    parsed = { ok: false, reason: `unexpected stop reason ${response.stopReason}` };
+  } else if (version === "v1") {
+    parsed = parseV1Output(response.text, input.limits.outputBytes);
+  } else {
+    parsed = parseV2Output(response.text, input.limits.outputBytes, input.limits.v2RolloutSummaryBytes ?? 9_000);
+  }
+  if (parsed.ok) {
+    const accepted = commitExtraction(input.db, input.job, {
+      memoryVersion: version, promptHash: request.promptHash, model: input.modelRef,
+      rawMemory: "raw_memory" in parsed.output ? parsed.output.raw_memory : null,
+      rolloutSummary: parsed.output.rollout_summary, rolloutSlug: parsed.output.rollout_slug,
+      outputHash: parsed.outputHash, usage: usage ?? estimate, outcome: parsed.outcome,
+      truncation: "truncation" in parsed ? parsed.truncation : undefined,
+    }, clock());
+    return { status: accepted ? parsed.outcome : "superseded" };
+  }
+  // The pinned phase1 sampler parses once; malformed output fails this job.
+  const changed = failExtraction(input.db, input.job, "blocked", "invalid_schema", clock());
+  return { status: changed ? "blocked" : "superseded" };
 }
 
 export function runV1Extraction(input: V1RunInput): Promise<V1RunResult> {

@@ -37,7 +37,7 @@ export interface SnapshotRecord {
   evidenceRemoved?: boolean;
 }
 
-const SCHEMA_VERSION = 13;
+const SCHEMA_VERSION = 14;
 
 const MIGRATION_1 = `
 CREATE TABLE schema_migrations (
@@ -301,6 +301,25 @@ CREATE TABLE IF NOT EXISTS generation_pins (
 );
 `;
 
+/** Expand the metadata constraint without changing any existing extraction row.
+ * No table has an FK to extractions; the provenance trigger is restored inside
+ * the same transaction after the copy. Old runtimes reject the newer schema.
+ */
+function migrateNativeTruncation(db: DatabaseSync): void {
+  const schema = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'extractions'").get() as { sql: string };
+  const triggers = db.prepare("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND sql LIKE '%extractions%'").all() as { name: string; sql: string }[];
+  const expanded = schema.sql.replace(/CREATE TABLE\s+(?:"extractions"|extractions)(?=\s*\()/i, "CREATE TABLE extractions_native")
+    .replace("CHECK (accepted_bytes BETWEEN 0 AND 9000)", "CHECK (accepted_bytes >= 0)");
+  if (expanded === schema.sql || expanded.includes("BETWEEN 0 AND 9000")) throw new Error("unexpected extraction schema for native truncation migration");
+  for (const trigger of triggers) db.exec(`DROP TRIGGER "${trigger.name.replaceAll('"', '""')}"`);
+  db.exec(expanded);
+  db.exec("INSERT INTO extractions_native SELECT * FROM extractions");
+  db.exec("DROP TABLE extractions");
+  db.exec("ALTER TABLE extractions_native RENAME TO extractions");
+  for (const trigger of triggers) db.exec(trigger.sql);
+  if (db.prepare("PRAGMA foreign_key_check").all().length) throw new Error("foreign key violation after native truncation migration");
+}
+
 export function openStateDb(root: string, options?: { busyTimeoutMs?: number }): DatabaseSync {
   const busyTimeout = options?.busyTimeoutMs ?? 5_000;
   if (!Number.isSafeInteger(busyTimeout) || busyTimeout < 0 || busyTimeout > 5_000) {
@@ -405,6 +424,10 @@ export function openStateDb(root: string, options?: { busyTimeoutMs?: number }):
       if (current < 13) {
         db.exec(MIGRATION_13);
         db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(13, Date.now());
+      }
+      if (current < 14) {
+        migrateNativeTruncation(db);
+        db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(14, Date.now());
       }
       db.exec("COMMIT");
     } catch (err) {

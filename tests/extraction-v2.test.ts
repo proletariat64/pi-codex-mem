@@ -17,10 +17,10 @@ test("v2 uses its pinned prompt and accepts exactly summary plus slug", () => {
   assert.match(request.userPrompt, /选择 TypeScript/);
   assert.match(request.userPrompt, /feature\/v2/);
   assert.doesNotMatch(request.userPrompt, /\{\{\s*rollout_/);
-  const accepted = parseV2Output('```json\n{"rollout_summary":"用户选择 TypeScript","rollout_slug":"TS Choice"}\n```', 49_152, 9_000);
+  const accepted = parseV2Output('{"rollout_summary":"用户选择 TypeScript","rollout_slug":"TS Choice"}', 49_152, 9_000);
   assert.equal(accepted.ok, true);
   if (accepted.ok) {
-    assert.equal(accepted.output.rollout_slug, "ts-choice");
+    assert.equal(accepted.output.rollout_slug, "TS Choice");
     assert.equal(accepted.output.rollout_summary, "用户选择 TypeScript");
     assert.equal(accepted.outcome, "succeeded");
     assert.deepEqual(accepted.truncation, { truncated: false, originalBytes: 23, acceptedBytes: 23 });
@@ -30,50 +30,48 @@ test("v2 uses its pinned prompt and accepts exactly summary plus slug", () => {
     '{"rollout_summary":"test"}',
     '{"rollout_summary":"test","rollout_slug":null}',
     'before {"rollout_summary":"test","rollout_slug":"test"}',
-    '{"rollout_summary":"","rollout_slug":"slug-only"}',
-    '{"rollout_summary":"","rollout_slug":"!!!"}',
-    '{"rollout_summary":"","rollout_slug":"   "}',
-    '{"rollout_summary":"   ","rollout_slug":""}',
+    '```json\n{"rollout_summary":"test","rollout_slug":"test"}\n```',
   ]) assert.equal(parseV2Output(invalid, 49_152, 9_000).ok, false, invalid);
   const empty = parseV2Output('{"rollout_summary":"","rollout_slug":""}', 49_152, 9_000);
   assert.equal(empty.ok, true);
   if (empty.ok) assert.equal(empty.outcome, "no_output");
 });
 
-test("v2 truncates after redaction at a complete paragraph inside 9,000 UTF-8 bytes", () => {
-  const paragraph = "决策".repeat(500); // 3,000 bytes per paragraph
-  const summary = `${paragraph}\n\n${paragraph}\n\n${paragraph}\n\nfinal outcome is not visible`;
-  const result = parseV2Output(JSON.stringify({ rollout_summary: summary,
-    rollout_slug: "decision-summary" }), 49_152, 9_000);
+test("v2 matches native 9000-byte head/tail truncation and character marker", () => {
+  const summary = "A".repeat(4500) + "界🙂".repeat(100) + "Z".repeat(4500);
+  const result = parseV2Output(JSON.stringify({ rollout_summary: summary, rollout_slug: "Original Slug" }), 1, 1);
   assert.equal(result.ok, true);
   if (!result.ok) return;
-  assert.equal(result.outcome, "succeeded");
-  assert.equal(result.output.rollout_summary, `${paragraph}\n\n${paragraph}\n[... remainder omitted ...]`);
-  assert.deepEqual(result.truncation, { truncated: true, originalBytes: 9_034,
-    acceptedBytes: Buffer.byteLength(`${paragraph}\n\n${paragraph}\n[... remainder omitted ...]`, "utf8") });
-  assert.ok(Buffer.byteLength(result.output.rollout_summary, "utf8") <= 9_000);
+  assert.equal(result.output.rollout_summary, "A".repeat(4500) + "…200 chars truncated…" + "Z".repeat(4500));
+  assert.equal(result.output.rollout_slug, "Original Slug");
+  assert.deepEqual(result.truncation, { truncated: true, originalBytes: 9700, acceptedBytes: 9025 });
 });
 
-test("T24 v2: overlong Chinese summary retains complete pointers and UTF-8 inside the 9,000-byte cap", () => {
-  const line = "界".repeat(1_500); // 4,500 bytes
-  const summary = `${line}\n${line}\nhttps://example.com/important/identifier-not-partial`;
-  const result = parseV2Output(JSON.stringify({ rollout_summary: summary, rollout_slug: "history" }), 49_152, 9_000);
+test("T24 v2: middle truncation keeps UTF-8 boundaries and final evidence on unbroken lines", () => {
+  const result = parseV2Output(JSON.stringify({ rollout_summary: "界".repeat(3100), rollout_slug: "unicode" }), 49_152, 9000);
+  assert.equal(result.ok, true);
+  if (result.ok) assert.equal(result.output.rollout_summary, "界".repeat(1500) + "…100 chars truncated…" + "界".repeat(1500));
+  const tail = "https://example.com/final-evidence";
+  const unbroken = parseV2Output(JSON.stringify({ rollout_summary: "x".repeat(10000) + tail, rollout_slug: "url" }), 49_152, 9000);
+  assert.equal(unbroken.ok, true);
+  if (unbroken.ok) assert.ok(unbroken.output.rollout_summary.endsWith(tail));
+});
+
+test("native truncation marker may grow a summary just above the cutoff", () => {
+  const result = parseV2Output(JSON.stringify({ rollout_summary: "x".repeat(9001), rollout_slug: "near" }), 1, 1);
   assert.equal(result.ok, true);
   if (!result.ok) return;
-  assert.equal(result.output.rollout_summary, `${line}\n[... remainder omitted ...]`);
+  assert.equal(result.output.rollout_summary, "x".repeat(4500) + "…1 chars truncated…" + "x".repeat(4500));
+  assert.ok(result.truncation.acceptedBytes > result.truncation.originalBytes);
   assert.equal(result.truncation.truncated, true);
-  assert.doesNotMatch(result.output.rollout_summary, /https:\/\//);
-  assert.doesNotThrow(() => new TextDecoder("utf-8", { fatal: true }).decode(Buffer.from(result.output.rollout_summary)));
-  const pointer = "https://docs.example.com/decision/TS-42";
-  const retained = parseV2Output(JSON.stringify({
-    rollout_summary: `${pointer}\n${"界".repeat(3_100)}`, rollout_slug: "pointer",
-  }), 49_152, 9_000);
-  assert.equal(retained.ok, true);
-  if (retained.ok) assert.equal(retained.output.rollout_summary, `${pointer}\n[... remainder omitted ...]`);
-  const unbroken = parseV2Output(JSON.stringify({
-    rollout_summary: "https://example.com/" + "identifier".repeat(1_200), rollout_slug: "url",
-  }), 49_152, 9_000);
-  assert.equal(unbroken.ok, false, "a long unbroken URL has no complete line and must be repaired or rejected");
+});
+
+test("v2 no-output depends on literal empty summary only", () => {
+  for (const [summary, expected] of [["", "no_output"], ["   ", "succeeded"]]) {
+    const result = parseV2Output(JSON.stringify({ rollout_summary: summary, rollout_slug: "slug" }), 1, 1);
+    assert.equal(result.ok, true);
+    if (result.ok) assert.equal(result.outcome, expected);
+  }
 });
 
 test("v2 redacts generated secrets before counting summary bytes", () => {

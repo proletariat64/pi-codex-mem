@@ -12,15 +12,15 @@ for (const version of ["v1", "v2"] as const) test(`${version} template rendering
     items: [{ entryId: "u1", role: "user", origin: "unknown", text: opaque }] };
   const rendered = version === "v1" ? renderV1Request(input) : renderV2Request(input);
   assert.ok(rendered.userPrompt.includes(JSON.stringify(opaque)), "user evidence must remain byte-for-byte intact");
-  assert.ok(rendered.userPrompt.includes(JSON.stringify(path)));
-  assert.ok(rendered.userPrompt.includes(JSON.stringify(input.cwd)));
-  if (version === "v2") assert.ok(rendered.userPrompt.includes(JSON.stringify(input.gitBranch)));
+  assert.ok(rendered.userPrompt.includes(path));
+  assert.ok(rendered.userPrompt.includes(input.cwd));
+  if (version === "v2") assert.ok(rendered.userPrompt.includes(input.gitBranch));
   assert.equal(rendered.promptHash, version === "v1" ? v1PromptHash() : v2PromptHash());
   const view: MemoryCarrierView = { memoryVersion: version, generationId: "g-$&-{{ workspace }}",
     directory: "/tmp/$&-{{ memory_summary }}", controlEpoch: 0, manifestHash: "hash",
     summary: opaque, applicability: [] };
   const section = renderMemorySection(view, "/repo/$&-{{ memory_summary }}");
   assert.ok(section.includes(opaque), "injected summary must remain verbatim");
-  assert.ok(section.includes(JSON.stringify(view.generationId)));
-  assert.ok(section.includes(JSON.stringify(view.directory)));
+  assert.ok(!section.includes(view.generationId), "native read template has only base_path and memory_summary substitutions");
+  assert.ok(section.includes(view.directory));
 });

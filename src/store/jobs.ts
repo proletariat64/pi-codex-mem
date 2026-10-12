@@ -252,17 +252,19 @@ export function failExtraction(
 
 /** Accept a result only for the still-active revision and exact leased fence. */
 export function commitExtraction(db: DatabaseSync, job: LeasedJob, result: ExtractionResult, now: number): boolean {
-  const allEmpty = (result.rawMemory ?? "") === "" && result.rolloutSummary === "" && result.rolloutSlug === "";
+  const noOutput = result.rolloutSummary === "" || (job.memoryVersion === "v1" && result.rawMemory === "");
   const meta = result.truncation;
   if (result.memoryVersion !== job.memoryVersion || result.promptHash !== job.promptHash ||
       (job.memoryVersion === "v1" && (result.rawMemory === null || meta !== undefined)) ||
       (job.memoryVersion === "v2" && (result.rawMemory !== null || !meta ||
         !Number.isSafeInteger(meta.originalBytes) || !Number.isSafeInteger(meta.acceptedBytes) ||
-        meta.acceptedBytes < 0 || meta.originalBytes < meta.acceptedBytes ||
-        meta.acceptedBytes > 9_000 ||
+        meta.acceptedBytes < 0 || meta.originalBytes < 0 ||
+        // Native 9000-byte middle truncation adds its marker outside that budget.
+        meta.acceptedBytes > 9_000 + Buffer.byteLength(`…${meta.originalBytes} chars truncated…`, "utf8") ||
+        (!meta.truncated && meta.acceptedBytes !== meta.originalBytes) ||
         meta.acceptedBytes !== Buffer.byteLength(result.rolloutSummary, "utf8") ||
-        meta.truncated !== (meta.originalBytes > meta.acceptedBytes))) ||
-      (result.outcome === "no_output") !== allEmpty) return false;
+        meta.truncated !== (meta.originalBytes > 9_000))) ||
+      (result.outcome === "no_output") !== noOutput) return false;
   db.exec("BEGIN IMMEDIATE");
   try {
     const row = db.prepare(

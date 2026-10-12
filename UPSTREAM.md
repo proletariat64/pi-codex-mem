@@ -6,7 +6,7 @@ The fenced JSON block at the bottom is the machine-readable manifest verified by
 
 ## Vendored files
 
-All files below come from `openai/codex` at commit `1cc7e2361237ce7244430ee1d581c77f95c57ac8` and are stored **verbatim** (no edits). Adaptations never touch `prompts/upstream/`; adapted copies live under `prompts/pi/<version>/` with a reviewed change log entry here.
+All files below come from `openai/codex` at commit `1cc7e2361237ce7244430ee1d581c77f95c57ac8` and are stored **verbatim** (no edits). Runtime adapters never modify `prompts/upstream/`. The strict-port checkpoint uses these original templates; legacy `prompts/pi/` files are historical and are not the active prompt family.
 
 | Local destination | Upstream path | Purpose |
 |---|---|---|
@@ -22,18 +22,19 @@ All files below come from `openai/codex` at commit `1cc7e2361237ce7244430ee1d581
 
 ## Adaptation log
 
-All vendored files remain byte-identical to upstream (verify with the script).
+All vendored files remain byte-identical to upstream. The implementation baseline is the same pinned SHA as this manifest; see `docs/strict-codex-port.md` for the function map and unsupported equivalence.
 
-| Source | Adaptation | Changes |
+| Source | Active adaptation | Changes |
 |---|---|---|
-| `prompts/upstream/v1/consolidation.md` | Runtime renderer in `src/pipeline/consolidate.ts` plus `prompts/pi/v1/consolidation-boundaries.md` | Private workspace/diff placeholders; read-only shared notes; five custom workspace tools in place of shell/original-rollout access; Pi source/session identifiers; task applicability; literal summary marker; headings and length as guidance; minimal project/date grouping; ordinary citations; prose-only procedures; one bounded host-validation repair. |
-| `prompts/upstream/v1/read_path.md` | `prompts/pi/v1/read_path.md` | Concise Pi guidance with version/generation/workspace/applicability and bounded summary; historical evidence label; handbook-first progressive reading; no original JSONL browsing, proprietary citation wrapper, or automatic note writing. |
-| `prompts/upstream/v2/consolidation_v2.md` | Runtime renderer in `src/pipeline/consolidate.ts` plus `prompts/pi/v2/consolidation-boundaries.md` | Private workspace/diff placeholders; read-only selected evidence and scoped shared notes; four tools and summary-only writes; Pi session/source identifiers replace thread IDs; minimal project/date grouping (child topics inherit scope); exact source routes as guidance; no v1 raw memories, handbook or procedures; strict summary byte cap and one bounded validation repair. |
-| `prompts/upstream/v2/read_path_v2.md` | `prompts/pi/v2/read_path.md` | Version/generation/workspace applicability and bounded summary; historical-evidence labeling; direct rollout-summary routes; ordinary citations; no handbook lookup or original transcript browsing. |
+| v1/v2 extraction templates | `src/extraction/v1.ts`, `v2.ts`, `runner.ts` | Raw path/cwd/branch substitutions; normalized Pi snapshot payload. v1 native 70% head/tail truncation; v2 retains Pi role/dependency tiers. Original system templates and strict output schemas are used. |
+| v1/v2 consolidation templates | `src/pipeline/consolidate.ts` | Rendered original template is sent as the user prompt. Confined workspace/diff placeholders and read-only notes substitute for native memory-root/extension inputs. No identifier rewriting, appended policy, summary-length instruction or validation repair prompt. |
+| v1/v2 read templates | `src/read/inject.ts` | Original guidance and approximate 2500-token summary truncation. Active Pi carrier adds generation/pin identity and quoted historical evidence, with capacity clipping/omission; user-role delivery differs from native developer-policy contribution. |
+| Runtime orchestration | isolated Pi `AgentSession` and `src/pipeline/model-port.ts` | In-memory session, disabled resource discovery and minimum custom tools. Native Pi compaction/retry; fixed physical-model registry/auth facade. Virtual routing is explicitly unsupported. |
+| Workspace/storage | staging, publication and SQLite store | Immutable selections, bounded tool responses, notes, custom diff, revocation, generation/CAS, leases and shared daily budgets are host adapters; they do not establish native storage/scheduling equivalence. |
 
-Revision 3 removes prose-reference/ID/anchor, per-bullet citation, handbook-field and heading-order hard gates. The one repair is reserved for repairable format/grouping failures; host integrity remains fail-closed. Strict Codex JSON Schema is supplied via Pi for extraction without changing upstream templates.
+Strict-port checkpoint removes legacy writer call/tool/time/output caps, output-repair turns, project/date validation and adapted prompt instructions. Native required artifact/marker/v2-heading checks and data-integrity boundaries remain. Schema 14 retains the native truncation marker outside its 9000-byte retained-content budget.
 
-Detailed adaptation notes live in `prompts/pi/v1/CHANGELOG.md` and `prompts/pi/v2/CHANGELOG.md`. The shared renderer substitutes Pi session identifiers in both runtime templates; its revision participates in the content-based writer hash.
+Legacy `prompts/pi/` change logs describe historical behavior only. Their historical restrictions are superseded by the strict-port ledger and the current native-session specification.
 
 ## License
 

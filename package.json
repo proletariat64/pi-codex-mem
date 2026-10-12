@@ -20,7 +20,8 @@
     "test:behavioral": "node scripts/run-behavioral-matrix.mjs",
     "typecheck": "tsc --noEmit",
     "verify-upstream": "node scripts/verify-upstream.mjs",
-    "verify-foreground-host": "node scripts/verify-foreground-host.mjs"
+    "verify-foreground-host": "node scripts/verify-foreground-host.mjs",
+    "audit:codex-parity": "node scripts/audit-codex-parity.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-agent-core": "*",

@@ -136,7 +136,9 @@ function validateArtifactView(db: DatabaseSync, root: string, pin: ArtifactView,
   now = Date.now()): ReadValidation {
   try {
     const epoch = db.prepare("SELECT control_epoch FROM store_state WHERE singleton = 1").get()?.control_epoch;
-    if (epoch !== pin.controlEpoch) return { valid: false, reason: "control_epoch_changed" };
+    // A pin older than the current epoch is stale, not wrong: publish only ever
+    // moves forward, and hard revocation clears read_blocked below.
+    if (typeof epoch !== "number" || pin.controlEpoch > epoch) return { valid: false, reason: "control_epoch_changed" };
     const pipeline = db.prepare("SELECT read_blocked, block_reason FROM pipeline_state WHERE memory_version = ?").get(pin.memoryVersion);
     if (pipeline?.read_blocked) return { valid: false, reason: String(pipeline.block_reason ?? "read_invalidated") };
     const generation = getPublishedGeneration(db, pin.memoryVersion, now, { generationId: pin.generationId,
@@ -147,23 +149,29 @@ function validateArtifactView(db: DatabaseSync, root: string, pin: ArtifactView,
       if (identity?.status !== "published" || identity.manifest_hash !== pin.manifestHash || identity.directory !== pin.directory) {
         return { valid: false, reason: "generation_ineligible" };
       }
-      // Recovery is allowed only for proven expiry at the unchanged control epoch.
-      // Branch retirement, deletion, unknown invalidity and prompt changes are not expiry.
+      // Recovery is allowed only for proven expiry; retirement and prompt
+      // changes stay stale rather than authoritative.
+      // Recovery is proven only when every cited source is still current and
+      // merely out of retention. Any row that is revoked, retired, superseded,
+      // deleted or prompt-mismatched keeps this an ordinary ineligibility.
       const expired = db.prepare(`SELECT 1 FROM generation_sources gs
-        JOIN source_revisions r ON r.source_id = gs.source_id
-        JOIN branch_heads h ON h.session_key = r.session_key AND h.branch_id = r.branch_id
-        JOIN extractions e ON e.extraction_id = gs.extraction_id
+        LEFT JOIN source_revisions r ON r.source_id = gs.source_id
+        LEFT JOIN branch_heads h ON h.session_key = r.session_key AND h.branch_id = r.branch_id
+        LEFT JOIN extractions e ON e.extraction_id = gs.extraction_id
         LEFT JOIN source_stats st ON st.lineage_key = r.lineage_key AND st.memory_version = ?
         WHERE gs.generation_id = ? AND r.status = 'captured' AND h.state = 'active'
           AND h.latest_revision = r.source_id AND e.prompt_hash = ?
           AND COALESCE(st.last_used_at, r.source_time) < ? LIMIT 1`).get(pin.memoryVersion, pin.generationId,
         pin.extractionPromptHash ?? "", now - maxUnusedDays * 86_400_000);
       const unsafe = db.prepare(`SELECT 1 FROM generation_sources gs
-        JOIN source_revisions r ON r.source_id = gs.source_id
-        JOIN branch_heads h ON h.session_key = r.session_key AND h.branch_id = r.branch_id
-        JOIN extractions e ON e.extraction_id = gs.extraction_id
-        WHERE gs.generation_id = ? AND (r.status != 'captured' OR h.state != 'active'
-          OR h.latest_revision != r.source_id OR e.prompt_hash != ?) LIMIT 1`).get(pin.generationId, pin.extractionPromptHash ?? "");
+        LEFT JOIN source_revisions r ON r.source_id = gs.source_id
+        LEFT JOIN branch_heads h ON h.session_key = r.session_key AND h.branch_id = r.branch_id
+        LEFT JOIN extractions e ON e.extraction_id = gs.extraction_id
+        LEFT JOIN source_stats st ON st.lineage_key = r.lineage_key AND st.memory_version = ?
+        WHERE gs.generation_id = ? AND NOT (r.status = 'captured' AND h.state = 'active'
+          AND h.latest_revision = r.source_id AND e.prompt_hash = ?
+          AND COALESCE(st.last_used_at, r.source_time) < ?) LIMIT 1`)
+        .get(pin.memoryVersion, pin.generationId, pin.extractionPromptHash ?? "", now - maxUnusedDays * 86_400_000);
       return expired && !unsafe ? { valid: false, reason: "retention_expired", recoverable: true }
         : { valid: false, reason: "generation_ineligible" };
     }

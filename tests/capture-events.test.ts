@@ -108,7 +108,7 @@ test("compaction and shutdown checkpoint branch state without waiting for a mode
   assert.ok(files.some((f) => readSnapshotText(f).includes("last unscheduled decision")));
 });
 
-for (const version of ["v1", "v2"] as const) test(`T08 ${version}: session_tree retires abandoned head and revokes stale decisions`, async (t) => {
+for (const version of ["v1", "v2"] as const) test(`T08 ${version}: session_tree retires abandoned head and stays readable while stale`, async (t) => {
   const { cwd, memoryRoot } = makeSandbox(t, version);
   const mock = makeMockPi();
   memoryExtension(mock.pi);
@@ -128,11 +128,13 @@ for (const version of ["v1", "v2"] as const) test(`T08 ${version}: session_tree 
   const db = new DatabaseSync(join(memoryRoot, "state.sqlite"), { open: true });
   const heads = db.prepare("SELECT state FROM branch_heads").all() as { state: string }[];
   const epoch = db.prepare("SELECT control_epoch FROM store_state").get() as { control_epoch: number };
-  const blocked = db.prepare("SELECT read_blocked FROM pipeline_state").all() as { read_blocked: number }[];
+  const rows = db.prepare("SELECT read_blocked, stale_reason FROM pipeline_state").all() as
+    { read_blocked: number; stale_reason: string | null }[];
   db.close();
   assert.ok(heads.every((h) => h.state === "retired"), "old head retired after /tree switch");
-  assert.equal(epoch.control_epoch, 1);
-  assert.deepEqual(blocked.map((r) => r.read_blocked), [1, 1]);
+  assert.equal(epoch.control_epoch, 0, "retirement moves no epoch");
+  assert.deepEqual(rows.map((r) => r.read_blocked), [0, 0], "retirement alone never blocks reading");
+  assert.deepEqual(rows.map((r) => r.stale_reason), ["session_tree", "session_tree"]);
   const replacement = { ...ctx, sessionManager: fakeSessionManager(cwd, [userEntry("uX", "replacement decision: use Rust")]) };
   await mock.fire("agent_settled", { type: "agent_settled" }, replacement);
   const active = new DatabaseSync(join(memoryRoot, "state.sqlite"), { readOnly: true });
@@ -163,6 +165,35 @@ test("resume blocks old captured evidence when a new context edit is present bef
   db.close();
   await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
   assert.equal(snapshotFiles(memoryRoot).length, 1, "the old at-rest snapshot is removed on settlement");
+});
+
+test("resume does not fence a legacy revision for recovery-only omissions", async (t) => {
+  const { cwd, memoryRoot } = makeSandbox(t);
+  const mock = makeMockPi(); memoryExtension(mock.pi);
+  const entries: unknown[] = [userEntry("u1", "durable preference")];
+  const ctx = { cwd, hasUI: false, mode: "tui", sessionManager: fakeSessionManager(cwd, entries),
+    modelRegistry: { find: () => ({}), streamSimple: () => ({}) }, ui: { notify: () => {} } };
+  await mock.fire("session_start", { type: "session_start" }, ctx);
+  await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
+  const { DatabaseSync } = await import("node:sqlite");
+  const db = new DatabaseSync(join(memoryRoot, "state.sqlite"));
+  // Simulate a revision captured before schema 17 had a privacy subset.
+  db.exec("UPDATE source_revisions SET privacy_edit_hash = ''");
+  db.close();
+  // An abandoned attempt: empty assistant message plus its recovery omission.
+  entries.push({ type: "message", id: "a1", parentId: "u1", timestamp: new Date().toISOString(),
+    message: { role: "assistant", content: [], api: "openai-completions", provider: "fixture", model: "m",
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      stopReason: "aborted", timestamp: Date.now() } });
+  entries.push({ type: "context_edit", id: "e1", parentId: "a1", targetId: "a1", replacement: null,
+    timestamp: new Date().toISOString() });
+  await mock.fire("session_start", { type: "session_start" }, ctx);
+  const after = new DatabaseSync(join(memoryRoot, "state.sqlite"), { readOnly: true });
+  const row = after.prepare("SELECT read_blocked, stale_reason FROM pipeline_state WHERE memory_version = 'v1'")
+    .get() as { read_blocked: number; stale_reason: string | null };
+  after.close();
+  assert.equal(row.read_blocked, 0, "bookkeeping omission on an upgraded revision stays readable");
 });
 
 for (const version of ["v1", "v2"] as const) test(`T10 ${version}: context edit removes sensitive evidence and invalidates old views`, async (t) => {

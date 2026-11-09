@@ -165,6 +165,48 @@ test("re-recording the same revision is idempotent (§11.3)", (t) => {
   assert.equal(revs.n, 1);
 });
 
+test("retiring a head with an unapplied privacy edit fences instead of going stale", (t) => {
+  const root = makeRoot(t);
+  const db = openStateDb(root);
+  t.after(() => db.close());
+  recordSnapshot(db, rec());
+  // The captured revision has no stored subset, so a pending relevant edit is
+  // the only signal that pre-edit text may still be served.
+  retireOtherHeads(db, rec().session.sessionKey, "br-new", "hash-of-relevant-edits", true);
+  const blocked = db.prepare("SELECT read_blocked, block_reason, stale_reason FROM pipeline_state WHERE memory_version = 'v1'")
+    .get() as { read_blocked: number; block_reason: string | null; stale_reason: string | null };
+  assert.equal(blocked.read_blocked, 1, "removal still fences");
+  assert.equal(blocked.block_reason, "session_tree");
+  assert.equal(blocked.stale_reason, null);
+});
+
+test("rewinding to before a captured edit does not fence healthy memory", (t) => {
+  const root = makeRoot(t);
+  const db = openStateDb(root);
+  t.after(() => db.close());
+  recordSnapshot(db, rec());
+  // The retired head recorded a privacy edit, but the selected branch holds
+  // none, so nothing is pending for the switch.
+  db.exec("UPDATE source_revisions SET privacy_edit_hash = 'recorded-edit-hash'");
+  retireOtherHeads(db, rec().session.sessionKey, "br-new", "hash-of-no-edits", false);
+  const row = db.prepare("SELECT read_blocked, stale_reason FROM pipeline_state WHERE memory_version = 'v1'")
+    .get() as { read_blocked: number; stale_reason: string | null };
+  assert.equal(row.read_blocked, 0, "a differing stored hash alone is not a pending removal");
+  assert.equal(row.stale_reason, "session_tree");
+});
+
+test("retiring a head with no pending edit only marks staleness", (t) => {
+  const root = makeRoot(t);
+  const db = openStateDb(root);
+  t.after(() => db.close());
+  recordSnapshot(db, rec());
+  retireOtherHeads(db, rec().session.sessionKey, "br-new", "", false);
+  const row = db.prepare("SELECT read_blocked, stale_reason FROM pipeline_state WHERE memory_version = 'v1'")
+    .get() as { read_blocked: number; stale_reason: string | null };
+  assert.equal(row.read_blocked, 0, "branch bookkeeping never blocks reading");
+  assert.equal(row.stale_reason, "session_tree");
+});
+
 test("session_tree retires other heads for the session (§5.3, T08)", (t) => {
   const root = makeRoot(t);
   const db = openStateDb(root);

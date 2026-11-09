@@ -8,7 +8,10 @@ import { redactSensitive } from "./sensitive.ts";
  * §7.3 byte budgets with tiered selection and an omissions manifest.
  */
 
-export const NORMALIZATION_POLICY_VERSION = "norm-1";
+// norm-2: snapshot payloads no longer carry contextEditHash, so the revision
+// identity must move too; otherwise an identity from norm-1 could name two
+// different payloads and trip the immutable-snapshot check.
+export const NORMALIZATION_POLICY_VERSION = "norm-2";
 
 /** Custom message types that must never become evidence (T15 self-exclusion). */
 export const OWN_CUSTOM_TYPE = "pi_memory";

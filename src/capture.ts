@@ -38,6 +38,66 @@ export type CaptureResult =
 
 const hash = (value: string): string => createHash("sha256").update(value).digest("hex");
 
+/** Same identity capture uses, so resume can tell whether the branch moved on. */
+export function contextEditHashOf(entries: readonly SessionEntry[]): string {
+  return hash(JSON.stringify(entries.filter((entry) => entry.type === "context_edit")));
+}
+
+/**
+ * Does a replacement still export anything? Empty content is a removal, not a
+ * decision to keep; any block (text, media or tool call) counts as content so
+ * this matches the allowed-hash policy capture applies to the same edit.
+ */
+function replacementHasContent(replacement: unknown): boolean {
+  if (replacement === null || typeof replacement !== "object") return false;
+  const content = (replacement as { content?: unknown }).content;
+  if (typeof content === "string") return content.trim() !== "";
+  return Array.isArray(content) && content.length > 0;
+}
+
+/**
+ * Could this entry ever export text? Recovery omissions of empty/aborted
+ * attempts, metadata, own-memory traffic and foreign extension messages cannot,
+ * so an edit on them is bookkeeping, not a privacy decision.
+ */
+export function entryCarriesEvidence(entries: readonly SessionEntry[], entryId: string,
+  limits?: NormalizeLimits): boolean {
+  const entry = entries.find((candidate) => candidate.id === entryId);
+  if (!entry || entry.type === "context_edit") return false;
+  const single = normalizeEvidence([entry], { limits });
+  // A budget-excluded item still holds text: deleting it must revoke copies.
+  return single.items.length > 0 || single.omissions.some((omission) => omission.reason === "budget-exceeded");
+}
+
+/** Latest privacy-relevant edit per target; recovery bookkeeping is excluded. */
+function privacyRelevantEdits(entries: readonly SessionEntry[], limits?: NormalizeLimits): { targetId: string; replacement: unknown }[] {
+  const latest = new Map<string, unknown>();
+  for (const entry of entries) {
+    if (entry.type !== "context_edit") continue;
+    const edit = entry as { targetId: string; replacement: unknown };
+    latest.set(edit.targetId, edit.replacement);
+  }
+  const relevant: { targetId: string; replacement: unknown }[] = [];
+  for (const [targetId, replacement] of [...latest].sort(([left], [right]) => left.localeCompare(right))) {
+    if (replacementHasContent(replacement)) relevant.push({ targetId, replacement });
+    else if (entryCarriesEvidence(entries, targetId, limits)) relevant.push({ targetId, replacement });
+  }
+  return relevant;
+}
+
+/** Does the branch hold an edit that could revoke previously captured text? */
+export function hasPrivacyRelevantEdits(entries: readonly SessionEntry[], limits?: NormalizeLimits): boolean {
+  return privacyRelevantEdits(entries, limits).length > 0;
+}
+
+/**
+ * Identity of only the privacy-relevant edits, i.e. the ones resume must fence
+ * on. Recovery bookkeeping moves the branch to stale instead (§7.1, §10).
+ */
+export function privacyEditHashOf(entries: readonly SessionEntry[], limits?: NormalizeLimits): string {
+  return hash(JSON.stringify(privacyRelevantEdits(entries, limits)));
+}
+
 /**
  * On final settlement, snapshot the authoritative branch, apply privacy
  * edits, normalize under shared byte budgets, and record a new immutable
@@ -132,9 +192,7 @@ function captureBranch(
   const carriesEvidence = (entryId: string): boolean => {
     const cached = evidenceById.get(entryId);
     if (cached !== undefined) return cached;
-    const entry = branch.find((candidate) => candidate.id === entryId);
-    const decided = entry !== undefined && entry.type !== "context_edit" &&
-      normalizeEvidence([entry], { limits: input.limits }).items.length > 0;
+    const decided = entryCarriesEvidence(branch, entryId, input.limits);
     evidenceById.set(entryId, decided);
     return decided;
   };
@@ -202,7 +260,10 @@ function captureBranch(
   }
   const evidenceHash = hash(JSON.stringify(normalized));
   const scopeHash = hash(JSON.stringify(workspace));
-  const contextEditHash = hash(JSON.stringify(edits));
+  const contextEditHash = contextEditHashOf(branch);
+  // Resume fences on the privacy-relevant subset only: recovery bookkeeping
+  // must not make an at-rest revision unreadable.
+  const privacyEditHash = privacyEditHashOf(branch, input.limits);
   const revisionHash = computeRevisionHash({
     evidenceHash,
     leafId: leaf,
@@ -230,12 +291,12 @@ function captureBranch(
   }
   const revokedSourceIds: string[] = [];
   let evidenceRemoved = false;
-  // A whole-branch revision is trimmed by the input budget as the session grows,
-  // so older items legitimately leave the projection. Only a disappearance the
-  // budget does not explain is removed evidence (§7.3, §10).
-  const budgetTrimmed = new Set(normalized.omissions
-    .filter((omission) => omission.reason === "budget-exceeded")
-    .map((omission) => omission.entryId));
+  // A whole-branch revision legitimately drops items the current projection no
+  // longer exports: the input budget trims the oldest, and normalization
+  // excludes own-memory traffic, foreign extensions and metadata. Any entry the
+  // new snapshot accounts for in its omissions is explained; only an
+  // unexplained disappearance is removed evidence (§7.3, §10).
+  const explainedOmissions = new Set(normalized.omissions.map((omission) => omission.entryId));
   for (const row of priorRows) {
     let previous: { items: typeof normalized.items };
     try {
@@ -250,7 +311,7 @@ function captureBranch(
     const now = (prior: typeof normalized.items[number]) => normalized.items.find((item) =>
       item.entryId === prior.entryId && item.role === prior.role && item.toolCallId === prior.toolCallId);
     if (row.source_id === current?.source_id && previous.items.some((item) =>
-      !budgetTrimmed.has(item.entryId) && now(item)?.text !== item.text)) {
+      !explainedOmissions.has(item.entryId) && now(item)?.text !== item.text)) {
       evidenceRemoved = true;
     }
     // Context edits are branch-local for projection, but revocation of
@@ -279,7 +340,6 @@ function captureBranch(
     sessionHeader: header,
     sessionPath: file,
     parentSession: header.parentSession ?? null,
-    contextEditHash,
     capturedAt: sourceTime,
     sourceUpdatedAt: sourceTime,
     ...normalized,
@@ -325,6 +385,9 @@ function captureBranch(
         snapshotPath: saved.path,
         snapshotHash: saved.hash,
         sourceTime,
+        policyVersion: NORMALIZATION_POLICY_VERSION,
+        contextEditHash,
+        privacyEditHash,
       },
       capturedAt: Date.now(),
       revokedSourceIds,

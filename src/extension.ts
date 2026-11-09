@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { join, resolve } from "node:path";
 import { getAgentDir, VERSION as PI_VERSION, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type SessionHeader } from "@earendil-works/pi-coding-agent";
-import { captureSettledSession, type CaptureResult } from "./capture.ts";
+import { captureSettledSession, contextEditHashOf, type CaptureResult } from "./capture.ts";
 import { blockUncapturedLeaf, clearGenerationPins, openStateDb, prunePrivacyRevoked, registerGenerationPin, retireOtherHeads, sweepUnindexedNotes } from "./store/db.ts";
 import { storeSizeBytes } from "./store/size.ts";
 import { computeSessionKey } from "./identity.ts";
@@ -593,9 +593,11 @@ export default function (pi: ExtensionAPI) {
             if (heads.some((head) => !ancestry.has(head.selected_leaf))) {
               retireOtherHeads(state.db, key, "");
             } else if (heads.some((head) => head.selected_leaf !== ctx.sessionManager.getLeafId())) {
-              // The old leaf is still an ancestor, but appended edits or
-              // decisions are not yet reflected in its captured projection.
-              blockUncapturedLeaf(state.db, key, ctx.sessionManager.getLeafId());
+              // The old leaf is still an ancestor, but appended turns or edits
+              // are not yet reflected in its captured projection. Only an
+              // uncaptured edit can still be revoking text.
+              blockUncapturedLeaf(state.db, key, ctx.sessionManager.getLeafId(),
+                contextEditHashOf(ctx.sessionManager.getBranch()));
             }
           }
         } catch (err) {
@@ -956,7 +958,8 @@ export default function (pi: ExtensionAPI) {
     const readiness = (["v1", "v2"] as const).map(version =>
       `${version} readiness: ${absent ? "warming_up (store not initialized)" : "store unavailable"}`);
     return {
-      selectedReadable: false, selectedInvalidated: false, readiness,
+      selectedReadable: false, selectedInvalidated: false, selectedStale: false,
+      staleReason: null, pendingSources: 0, readiness,
       lines: [
         `selected memory (${config.version}): UNAVAILABLE (${absent ? "initialization pending" : "persistent diagnostics unavailable"})`,
         ...(["v1", "v2"] as const).flatMap(version => [

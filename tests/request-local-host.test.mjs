@@ -159,7 +159,7 @@ for (const version of ['v1', 'v2']) for (const order of ['memory-first', 'overri
     await runner.emit({ type: 'agent_settled' }); await begin('second user'); await project(canonical, 'second');
     db.exec("UPDATE store_state SET control_epoch = control_epoch + 1; UPDATE pipeline_state SET read_blocked = 1, block_reason = 'user_correction'");
     await project(canonical, 'second', false);
-    await diagnostic(/disabled: control_epoch_changed; no active carrier; retrieval pin unavailable/);
+    await diagnostic(/disabled: user_correction; no active carrier; retrieval pin unavailable/);
     const denied = await list.execute('list', {}, undefined, undefined, runner.createContext());
     assert.equal(denied.details.error, 'memory_unavailable');
     publish('clean'); await project(canonical, 'clean', false); // no user/privacy mid-run recovery
@@ -172,7 +172,7 @@ for (const version of ['v1', 'v2']) for (const order of ['memory-first', 'overri
     const payload = { messages: [{ role: 'system', content: 'EXACT_OTHER_POLICY' },
       { role: 'user', content: [{ type: 'text', text: carrierText }] }, user('REAL_HUMAN')], tools: head.toolsAdded, max_tokens: 1000 };
     const payloadSnapshot = structuredClone(payload);
-    db.exec('UPDATE store_state SET control_epoch = control_epoch + 1');
+    db.exec("UPDATE pipeline_state SET read_blocked = 1, block_reason = 'source_forgotten'");
     const replacement = await runner.emitBeforeProviderRequest(payload);
     assert.deepEqual(payload, payloadSnapshot);
     assert.equal(JSON.stringify(replacement).includes('Host-provided read guidance'), false);
@@ -183,7 +183,7 @@ for (const version of ['v1', 'v2']) for (const order of ['memory-first', 'overri
     publish('after-race'); await begin('opaque dispatch');
     const unsafe = await project(canonical, 'after-race');
     const unsafeText = unsafe.find(message => message.customType === 'pi_memory').content;
-    db.exec('UPDATE store_state SET control_epoch = control_epoch + 1');
+    db.exec("UPDATE pipeline_state SET read_blocked = 1, block_reason = 'source_forgotten'");
     await runner.emitBeforeProviderRequest({ opaque: unsafeText });
     assert.equal(aborted, true); // native binding exercised; transport enforcement is tested separately
     await diagnostic(/error: unsafe_provider_residue/);
@@ -192,7 +192,7 @@ for (const version of ['v1', 'v2']) for (const order of ['memory-first', 'overri
     const codexProjection = await project(canonical, 'codex');
     assert.equal((await list.execute('list', {}, undefined, undefined, runner.createContext())).details.error, undefined);
     const codexPayload = { input: [{ role: 'user', content: codexProjection.find(message => message.customType === 'pi_memory').content }, user('REAL_HUMAN')], tools: head.toolsAdded };
-    db.exec('UPDATE store_state SET control_epoch = control_epoch + 1');
+    db.exec("UPDATE pipeline_state SET read_blocked = 1, block_reason = 'source_forgotten'");
     assert.deepEqual(await runner.emitBeforeProviderRequest(codexPayload), { ...codexPayload, input: [user('REAL_HUMAN')] });
     assert.equal((await list.execute('list', {}, undefined, undefined, runner.createContext())).details.error, 'memory_unavailable');
     assert.equal(aborted, false); assert.deepEqual(errors, []);

@@ -29,6 +29,7 @@ export interface SnapshotRecord {
     snapshotPath: string;
     snapshotHash: string;
     sourceTime: number;
+    contextEditHash?: string;
   };
   capturedAt: number;
   revokedSourceIds?: string[];
@@ -37,7 +38,7 @@ export interface SnapshotRecord {
   evidenceRemoved?: boolean;
 }
 
-const SCHEMA_VERSION = 14;
+const SCHEMA_VERSION = 16;
 
 const MIGRATION_1 = `
 CREATE TABLE schema_migrations (
@@ -429,6 +430,21 @@ export function openStateDb(root: string, options?: { busyTimeoutMs?: number }):
         migrateNativeTruncation(db);
         db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(14, Date.now());
       }
+      if (current < 15) {
+        const columns = new Set((db.prepare("PRAGMA table_info(pipeline_state)").all() as { name: string }[]).map(column => column.name));
+        const additions: [string, string][] = [["stale_reason", "TEXT"], ["stale_since", "INTEGER NOT NULL DEFAULT 0"]];
+        for (const [name, definition] of additions) {
+          if (!columns.has(name)) db.exec(`ALTER TABLE pipeline_state ADD COLUMN ${name} ${definition}`);
+        }
+        db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(15, Date.now());
+      }
+      if (current < 16) {
+        const columns = new Set((db.prepare("PRAGMA table_info(source_revisions)").all() as { name: string }[]).map(column => column.name));
+        if (!columns.has("context_edit_hash")) {
+          db.exec("ALTER TABLE source_revisions ADD COLUMN context_edit_hash TEXT NOT NULL DEFAULT ''");
+        }
+        db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(16, Date.now());
+      }
       db.exec("COMMIT");
     } catch (err) {
       db.exec("ROLLBACK");
@@ -575,6 +591,16 @@ function blockBothViews(db: DatabaseSync, reason: string): void {
     .run(reason);
 }
 
+/**
+ * Branch bookkeeping (a retired head, a switched leaf, a session tree) moves the
+ * projection but deletes no evidence. Treat it as staleness so the published
+ * generation stays readable until the background pass refreshes it; only an
+ * explicit removal keeps the hard fence.
+ */
+function markStale(db: DatabaseSync, reason: string, now = Date.now()): void {
+  db.prepare("UPDATE pipeline_state SET stale_reason = ?, stale_since = ?").run(reason, now);
+}
+
 export const GENERATION_PIN_TTL_MS = 900_000;
 
 /**
@@ -601,20 +627,33 @@ export function clearGenerationPins(db: DatabaseSync, ownerId: string): void {
   db.prepare("DELETE FROM generation_pins WHERE owner_id = ?").run(ownerId);
 }
 
-/** On resume, an active branch whose leaf advanced has not been recaptured. */
-export function blockUncapturedLeaf(db: DatabaseSync, sessionKey: string, leafId: string | null): void {
+/**
+ * On resume, an active branch whose leaf advanced has not been recaptured.
+ * Appended turns only move the projection, so they stay stale; an edit that
+ * the captured revision does not know about may still be revoking text, so it
+ * keeps the hard fence until capture applies it.
+ */
+export function blockUncapturedLeaf(db: DatabaseSync, sessionKey: string, leafId: string | null,
+  pendingContextEditHash = ""): void {
   db.exec("BEGIN IMMEDIATE");
   try {
     const heads = db.prepare(
-      "SELECT latest_revision FROM branch_heads WHERE session_key = ? AND state = 'active' AND selected_leaf != ?",
-    ).all(sessionKey, leafId ?? "") as { latest_revision: string | null }[];
+      `SELECT h.latest_revision, r.context_edit_hash FROM branch_heads h
+       LEFT JOIN source_revisions r ON r.source_id = h.latest_revision
+       WHERE h.session_key = ? AND h.state = 'active' AND h.selected_leaf != ?`,
+    ).all(sessionKey, leafId ?? "") as { latest_revision: string | null; context_edit_hash: string | null }[];
     let changed = 0;
     for (const head of heads) {
       if (!head.latest_revision) continue;
       changed += Number(db.prepare("UPDATE source_revisions SET status = 'superseded' WHERE source_id = ? AND status = 'captured'")
         .run(head.latest_revision).changes);
     }
-    if (changed > 0) blockBothViews(db, "uncaptured_branch_leaf");
+    if (changed > 0) {
+      const pendingEdits = heads.some((head) => head.latest_revision &&
+        (head.context_edit_hash ?? "") !== pendingContextEditHash);
+      if (pendingEdits) blockBothViews(db, "uncaptured_branch_leaf");
+      else markStale(db, "uncaptured_branch_leaf");
+    }
     db.exec("COMMIT");
   } catch (err) {
     db.exec("ROLLBACK");
@@ -699,8 +738,8 @@ export function recordSnapshot(db: DatabaseSync, rec: SnapshotRecord, root?: str
     db.prepare(
       `INSERT OR IGNORE INTO source_revisions
          (source_id, lineage_key, session_key, branch_id, revision_hash, snapshot_path,
-          snapshot_hash, leaf_id, source_time, status, policy_version, captured_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'captured', ?, ?)`,
+          snapshot_hash, leaf_id, source_time, status, policy_version, captured_at, context_edit_hash)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'captured', ?, ?, ?)`,
     ).run(
       rec.revision.sourceId,
       rec.revision.lineageKey,
@@ -713,13 +752,14 @@ export function recordSnapshot(db: DatabaseSync, rec: SnapshotRecord, root?: str
       rec.revision.sourceTime,
       "norm-1",
       rec.capturedAt,
+      rec.revision.contextEditHash ?? "",
     );
     // Only the selected branch and its latest projection remain eligible.
     // A branch switch without a session_tree event must also revoke reads.
     const retired = db.prepare(
       "UPDATE branch_heads SET state = 'retired' WHERE session_key = ? AND branch_id != ? AND state = 'active'",
     ).run(rec.session.sessionKey, rec.session.branchId);
-    if (retired.changes > 0) blockBothViews(db, "branch_switch");
+    if (retired.changes > 0) markStale(db, "branch_switch");
     db.prepare(
       "UPDATE source_revisions SET status = 'superseded' WHERE session_key = ? AND source_id != ? AND status = 'captured'",
     ).run(rec.session.sessionKey, rec.revision.sourceId);
@@ -757,7 +797,7 @@ export function retireOtherHeads(db: DatabaseSync, sessionKey: string, activeBra
       `UPDATE source_revisions SET status = 'superseded'
        WHERE session_key = ? AND branch_id != ? AND status = 'captured'`,
     ).run(sessionKey, activeBranchId);
-    if (db.prepare("SELECT changes() AS n").get()?.n) blockBothViews(db, "session_tree");
+    if (db.prepare("SELECT changes() AS n").get()?.n) markStale(db, "session_tree");
     db.exec("COMMIT");
   } catch (err) {
     db.exec("ROLLBACK");

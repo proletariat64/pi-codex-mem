@@ -38,6 +38,11 @@ export type CaptureResult =
 
 const hash = (value: string): string => createHash("sha256").update(value).digest("hex");
 
+/** Same identity capture uses, so resume can tell whether edits are pending. */
+export function contextEditHashOf(entries: readonly SessionEntry[]): string {
+  return hash(JSON.stringify(entries.filter((entry) => entry.type === "context_edit")));
+}
+
 /**
  * On final settlement, snapshot the authoritative branch, apply privacy
  * edits, normalize under shared byte budgets, and record a new immutable
@@ -202,7 +207,7 @@ function captureBranch(
   }
   const evidenceHash = hash(JSON.stringify(normalized));
   const scopeHash = hash(JSON.stringify(workspace));
-  const contextEditHash = hash(JSON.stringify(edits));
+  const contextEditHash = contextEditHashOf(branch);
   const revisionHash = computeRevisionHash({
     evidenceHash,
     leafId: leaf,
@@ -230,12 +235,12 @@ function captureBranch(
   }
   const revokedSourceIds: string[] = [];
   let evidenceRemoved = false;
-  // A whole-branch revision is trimmed by the input budget as the session grows,
-  // so older items legitimately leave the projection. Only a disappearance the
-  // budget does not explain is removed evidence (§7.3, §10).
-  const budgetTrimmed = new Set(normalized.omissions
-    .filter((omission) => omission.reason === "budget-exceeded")
-    .map((omission) => omission.entryId));
+  // A whole-branch revision legitimately drops items the current projection no
+  // longer exports: the input budget trims the oldest, and normalization
+  // excludes own-memory traffic, foreign extensions and metadata. Any entry the
+  // new snapshot accounts for in its omissions is explained; only an
+  // unexplained disappearance is removed evidence (§7.3, §10).
+  const explainedOmissions = new Set(normalized.omissions.map((omission) => omission.entryId));
   for (const row of priorRows) {
     let previous: { items: typeof normalized.items };
     try {
@@ -250,7 +255,7 @@ function captureBranch(
     const now = (prior: typeof normalized.items[number]) => normalized.items.find((item) =>
       item.entryId === prior.entryId && item.role === prior.role && item.toolCallId === prior.toolCallId);
     if (row.source_id === current?.source_id && previous.items.some((item) =>
-      !budgetTrimmed.has(item.entryId) && now(item)?.text !== item.text)) {
+      !explainedOmissions.has(item.entryId) && now(item)?.text !== item.text)) {
       evidenceRemoved = true;
     }
     // Context edits are branch-local for projection, but revocation of
@@ -325,6 +330,7 @@ function captureBranch(
         snapshotPath: saved.path,
         snapshotHash: saved.hash,
         sourceTime,
+        contextEditHash,
       },
       capturedAt: Date.now(),
       revokedSourceIds,

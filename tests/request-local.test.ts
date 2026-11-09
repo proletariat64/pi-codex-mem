@@ -89,21 +89,28 @@ for (const version of ["v1", "v2"] as const) {
     reader.invalidate("retention_expired", true);
     assert.equal(reader.recover(() => fresh), false); assert.equal(reader.pin, null);
   });
-  test(`${version}: cross-process unclassified epoch change never permits recovery or old tool output`, async t => {
+  test(`${version}: a stale epoch keeps serving while cross-process revocation still stops output`, async t => {
     const f = fixture(t); const pin = f.publish(version, "old");
     const external = new DatabaseSync(join(f.root, "state.sqlite"));
     try { external.exec("UPDATE store_state SET control_epoch = control_epoch + 1 WHERE singleton = 1"); } finally { external.close(); }
-    assert.equal(pin.validate({ db: f.db, root: f.root, maxUnusedDays: 30, now: NOW + 5 }).reason, "control_epoch_changed");
+    assert.equal(pin.validate({ db: f.db, root: f.root, maxUnusedDays: 30, now: NOW + 5 }).valid, true,
+      "a newer epoch alone is staleness, not invalidation");
     const tools = createMemoryTools({ root: f.root, db: () => f.db, pin: () => pin, consumer: () => null, now: () => NOW + 5 });
+    assert.deepEqual((await tools[0]!.execute("tool", { queries: ["中文"], match: "any" }, undefined)).details.error, undefined,
+      "stale evidence stays retrievable");
+    // Authoritative revocation from another process still suppresses output.
+    const revoking = new DatabaseSync(join(f.root, "state.sqlite"));
+    try { revoking.exec("UPDATE pipeline_state SET read_blocked = 1, block_reason = 'source_forgotten'"); } finally { revoking.close(); }
+    assert.equal(pin.validate({ db: f.db, root: f.root, maxUnusedDays: 30, now: NOW + 5 }).reason, "source_forgotten");
     assert.equal((await tools[0]!.execute("tool", { queries: ["中文"], match: "any" }, undefined)).details.error, "memory_unavailable");
     const reader = new MemoryRunReader(); reader.begin(version, f.root); reader.pin = pin;
-    reader.invalidate("control_epoch_changed"); assert.equal(reader.recover(() => pin), false);
+    reader.invalidate("source_forgotten"); assert.equal(reader.recover(() => pin), false);
   });
-  test(`${version}: revocation after reading but before tool return suppresses all output`, async t => {
+  test(`${version}: authoritative revocation after reading but before tool return suppresses all output`, async t => {
     const f = fixture(t); const pin = f.publish(version, "old"); let checks = 0;
     const tools = createMemoryTools({ root: f.root, db: () => f.db, pin: () => pin, consumer: () => null,
       now: () => {
-        if (++checks === 3) f.db.exec("UPDATE store_state SET control_epoch = control_epoch + 1");
+        if (++checks === 3) f.db.exec("UPDATE pipeline_state SET read_blocked = 1, block_reason = 'source_forgotten'");
         return NOW + 4;
       } });
     const output = await tools[0]!.execute("search", { queries: ["中文"], match: "any" }, undefined);

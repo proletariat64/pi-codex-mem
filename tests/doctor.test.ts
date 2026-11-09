@@ -121,11 +121,12 @@ test("unconfigured models are a warning (defaults resolve on first use)", () => 
   assert.equal(report.probes.find((p) => p.id === "model:extract")?.status, "warn");
 });
 
-test("a formatted report renders one line per probe", () => {
+test("a formatted report renders one line per probe plus a next action", () => {
   const report = runDoctor(goodInput());
   const lines = report.format();
-  assert.equal(lines.length, report.probes.length + 1); // header + probes
+  assert.equal(lines.length, report.probes.length + 2); // header + probes + next
   assert.match(lines[0]!, /pi-memory doctor/);
+  assert.match(lines.at(-1)!, /^next: /);
 });
 
 test("a configured model that does not resolve in the registry fails", () => {

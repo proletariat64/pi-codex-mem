@@ -108,7 +108,7 @@ test("compaction and shutdown checkpoint branch state without waiting for a mode
   assert.ok(files.some((f) => readSnapshotText(f).includes("last unscheduled decision")));
 });
 
-for (const version of ["v1", "v2"] as const) test(`T08 ${version}: session_tree retires abandoned head and revokes stale decisions`, async (t) => {
+for (const version of ["v1", "v2"] as const) test(`T08 ${version}: session_tree retires abandoned head and stays readable while stale`, async (t) => {
   const { cwd, memoryRoot } = makeSandbox(t, version);
   const mock = makeMockPi();
   memoryExtension(mock.pi);
@@ -128,11 +128,13 @@ for (const version of ["v1", "v2"] as const) test(`T08 ${version}: session_tree 
   const db = new DatabaseSync(join(memoryRoot, "state.sqlite"), { open: true });
   const heads = db.prepare("SELECT state FROM branch_heads").all() as { state: string }[];
   const epoch = db.prepare("SELECT control_epoch FROM store_state").get() as { control_epoch: number };
-  const blocked = db.prepare("SELECT read_blocked FROM pipeline_state").all() as { read_blocked: number }[];
+  const rows = db.prepare("SELECT read_blocked, stale_reason FROM pipeline_state").all() as
+    { read_blocked: number; stale_reason: string | null }[];
   db.close();
   assert.ok(heads.every((h) => h.state === "retired"), "old head retired after /tree switch");
-  assert.equal(epoch.control_epoch, 1);
-  assert.deepEqual(blocked.map((r) => r.read_blocked), [1, 1]);
+  assert.equal(epoch.control_epoch, 0, "retirement moves no epoch");
+  assert.deepEqual(rows.map((r) => r.read_blocked), [0, 0], "retirement alone never blocks reading");
+  assert.deepEqual(rows.map((r) => r.stale_reason), ["session_tree", "session_tree"]);
   const replacement = { ...ctx, sessionManager: fakeSessionManager(cwd, [userEntry("uX", "replacement decision: use Rust")]) };
   await mock.fire("agent_settled", { type: "agent_settled" }, replacement);
   const active = new DatabaseSync(join(memoryRoot, "state.sqlite"), { readOnly: true });

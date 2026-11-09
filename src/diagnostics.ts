@@ -9,6 +9,11 @@ import { v2PromptHash } from "./extraction/v2.ts";
 export interface MemoryDiagnostics {
   selectedReadable: boolean;
   selectedInvalidated: boolean;
+  /** Branch bookkeeping moved on without deleting evidence: readable but older. */
+  selectedStale: boolean;
+  staleReason: string | null;
+  /** Captured branch heads newer than the readable generation. */
+  pendingSources: number;
   lines: string[];
   readiness: string[];
 }
@@ -19,6 +24,9 @@ export function persistentDiagnostics(db: DatabaseSync, config: MemoryConfig, no
   const readiness: string[] = [];
   let selectedReadable = false;
   let selectedInvalidated = false;
+  let selectedStale = false;
+  let staleReason: string | null = null;
+  let pendingSources = 0;
   const day = localDay(now, config.timezone);
   const usage = db.prepare(`SELECT COALESCE(SUM(actual_input), 0) AS input,
     COALESCE(SUM(reserved_input), 0) AS reservedInput,
@@ -29,15 +37,23 @@ export function persistentDiagnostics(db: DatabaseSync, config: MemoryConfig, no
     };
   let budgetWait = false;
   for (const version of ["v1", "v2"] as const) {
-    const pipeline = db.prepare("SELECT read_blocked, block_reason FROM pipeline_state WHERE memory_version = ?").get(version);
+    const pipeline = db.prepare("SELECT read_blocked, block_reason, stale_reason FROM pipeline_state WHERE memory_version = ?")
+      .get(version) as { read_blocked: number; block_reason: string | null; stale_reason: string | null } | undefined;
     const generation = getPublishedGeneration(db, version, now, {
       maxUnusedDays: config.schedule.maxUnusedDays,
       extractionPromptHash: version === "v1" ? v1PromptHash() : v2PromptHash(),
     });
     const readable = Boolean(generation);
+    const newer = db.prepare(`SELECT COUNT(*) AS n FROM source_revisions r
+      JOIN branch_heads h ON h.session_key = r.session_key AND h.branch_id = r.branch_id
+      WHERE r.status = 'captured' AND h.state = 'active' AND h.latest_revision = r.source_id
+        AND r.captured_at > ?`).get(generation?.createdAt ?? 0) as { n: number };
     if (version === config.version) {
       selectedReadable = readable;
       selectedInvalidated = Boolean(pipeline?.read_blocked);
+      selectedStale = Boolean(pipeline?.stale_reason);
+      staleReason = pipeline?.stale_reason ?? null;
+      pendingSources = readable ? Number(newer.n) : 0;
     }
     let readinessState = readable ? "published" : "warming_up";
     if (pipeline?.read_blocked) readinessState = `read invalidated (${pipeline.block_reason})`;
@@ -83,6 +99,9 @@ export function persistentDiagnostics(db: DatabaseSync, config: MemoryConfig, no
     lines.push(consolidation,
       `${version} readable generation: ${generation?.generationId ?? "none"}${!readable && !pipeline?.read_blocked ? " (initialization/publication pending; no eligible generation)" : ""}`);
     if (pipeline?.read_blocked) lines.push(`${version} invalidation reason: ${pipeline.block_reason ?? "unknown"}`);
+    if (pipeline?.stale_reason) {
+      lines.push(`${version} staleness: ${pipeline.stale_reason}; ${Number(newer.n)} newer captures await consolidation; reading continues`);
+    }
     const notes = db.prepare(`SELECT COUNT(*) AS saved, COALESCE(SUM(CASE WHEN EXISTS (
       SELECT 1 FROM note_applications a WHERE a.note_id = n.note_id AND a.note_hash = n.text_hash
         AND a.memory_version = ? AND a.generation_id = ?) THEN 1 ELSE 0 END), 0) AS published
@@ -101,7 +120,7 @@ export function persistentDiagnostics(db: DatabaseSync, config: MemoryConfig, no
     "retry due does not mean published; saved notes become searchable only after publication",
   );
   lines.push(...readiness);
-  return { selectedReadable, selectedInvalidated, lines, readiness };
+  return { selectedReadable, selectedInvalidated, selectedStale, staleReason, pendingSources, lines, readiness };
 }
 
 /** Describe the latest active source's extraction, including idle/busy-adjusted due time and prior denial. */

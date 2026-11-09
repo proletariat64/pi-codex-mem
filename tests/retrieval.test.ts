@@ -90,9 +90,13 @@ for (const version of ["v1", "v2"] as const) test(`${version} reader accepts gui
     assert.equal((await call("read", { path: rejected })).details.error, "path_not_available_for_version", rejected);
   }
   assert.equal((await call("list", { path: root })).details.error, "path_not_available_for_version");
+  // A stale epoch alone must not revoke a pin: only an authoritative removal does.
   db.exec("UPDATE store_state SET control_epoch = control_epoch + 1 WHERE singleton = 1");
+  assert.equal((await call("read", { path: absolute })).details.items[0]!.path, path,
+    "a newer epoch keeps the pinned generation readable");
+  db.exec("UPDATE pipeline_state SET read_blocked = 1, block_reason = 'source_forgotten'");
   assert.equal((await call("read", { path: absolute })).details.error, "memory_unavailable",
-    "absolute paths cannot bypass pin revocation");
+    "absolute paths cannot bypass an authoritative revocation");
 });
 
 test("reader accepts revision 3 format independently of lower writer targets", (t) => {
@@ -136,11 +140,12 @@ test("opaque read pins expose only lifecycle identity and scoped evidence access
   assert.throws(() => borrowed!.read(path), /memory_unavailable/);
 });
 
-test("withEvidence suppresses completion and usage when the pin changes after evidence reads", (t) => {
+test("withEvidence suppresses completion and usage when the pin is revoked after evidence reads", (t) => {
   const { root, db, publish } = fixture(t); const { pin, path } = publish("v1"); let completed = false;
   assert.throws(() => pin.withEvidence({ root, db: () => db, now: () => NOW + 5, maxUnusedDays: () => 30 }, access => {
     access.read(path);
-    db.exec("UPDATE store_state SET control_epoch = control_epoch + 1 WHERE singleton = 1");
+    // Only an authoritative removal revokes mid-run; a moved epoch stays stale.
+    db.exec("UPDATE pipeline_state SET read_blocked = 1, block_reason = 'source_forgotten'");
     return { detailUse: { path, startLine: 1, endLine: 1 }, complete: () => { completed = true; return "stale"; } };
   }, () => ({ consumerSession: "reader", runId: "invalidated" })), /memory_unavailable/);
   assert.equal(completed, false, "complete runs only after post-read validation");

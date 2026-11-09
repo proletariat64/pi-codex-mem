@@ -206,7 +206,7 @@ export function commitGeneration(db: DatabaseSync, opts: {
         .run(note.noteId, generation.memoryVersion, note.textHash, generation.generationId, snapshot.controlEpoch);
     }
     db.prepare(`UPDATE pipeline_state SET active_generation_id = ?, reconciled_epoch = ?,
-      read_blocked = 0, block_reason = NULL WHERE memory_version = ?`)
+      read_blocked = 0, block_reason = NULL, stale_reason = NULL, stale_since = 0 WHERE memory_version = ?`)
       .run(generation.generationId, snapshot.controlEpoch, generation.memoryVersion);
     finishConsolidation(db, lease, "succeeded", null, now);
     db.exec("COMMIT"); return true;
@@ -231,21 +231,23 @@ export function getPublishedGeneration(db: DatabaseSync, memoryVersion: MemoryVe
     FROM pipeline_state p JOIN generations g ON g.generation_id = COALESCE(?, p.active_generation_id)
       AND g.memory_version = p.memory_version CROSS JOIN store_state s
     WHERE p.memory_version = ? AND p.read_blocked = 0 AND g.status = 'published'
-      AND g.control_epoch = s.control_epoch AND p.reconciled_epoch = s.control_epoch AND s.singleton = 1`)
+      AND g.control_epoch <= s.control_epoch AND p.reconciled_epoch <= s.control_epoch AND s.singleton = 1`)
     .get(options?.generationId ?? null, memoryVersion) as unknown as (PublishedGeneration & { maxUnusedDays: number }) | undefined;
   if (!generation) return null;
   const retentionDays = options?.maxUnusedDays ?? generation.maxUnusedDays;
   if (!Number.isSafeInteger(retentionDays) || retentionDays < 1 || retentionDays > 3650) return null;
   const unavailable = db.prepare(`SELECT 1 FROM generation_sources gs
     JOIN source_revisions r ON r.source_id = gs.source_id
-    JOIN branch_heads h ON h.session_key = r.session_key AND h.branch_id = r.branch_id
     LEFT JOIN extractions e ON e.extraction_id = gs.extraction_id
     LEFT JOIN source_stats st ON st.lineage_key = r.lineage_key AND st.memory_version = ?
-    WHERE gs.generation_id = ? AND (r.status != 'captured' OR h.state != 'active'
-      OR h.latest_revision != r.source_id OR COALESCE(st.last_used_at, r.source_time) < ?
-      OR (? IS NOT NULL AND (e.extraction_id IS NULL OR e.prompt_hash != ?)))
-    LIMIT 1`).get(memoryVersion, generation.generationId, now - retentionDays * DAY_MS,
-      options?.extractionPromptHash ?? null, options?.extractionPromptHash ?? null);
+    WHERE gs.generation_id = ?
+      AND (r.status = 'privacy_revoked'
+        OR e.extraction_id IS NULL
+        OR (? IS NOT NULL AND e.prompt_hash != ?)
+        OR COALESCE(st.last_used_at, r.source_time) < ?)
+    LIMIT 1`).get(memoryVersion, generation.generationId,
+      options?.extractionPromptHash ?? null, options?.extractionPromptHash ?? null,
+      now - retentionDays * DAY_MS);
   if (unavailable) return null;
   const deadline = db.prepare(`SELECT MIN(COALESCE(st.last_used_at, r.source_time) + ?) AS deadline
     FROM generation_sources gs JOIN source_revisions r ON r.source_id = gs.source_id

@@ -33,7 +33,7 @@ function legacyStore(t: test.TestContext) {
     .replace("CHECK (accepted_bytes >= 0)", "CHECK (accepted_bytes BETWEEN 0 AND 9000)"));
   db.exec("INSERT INTO legacy_extractions SELECT * FROM extractions; DROP TABLE extractions; ALTER TABLE legacy_extractions RENAME TO extractions");
   for (const trigger of triggers) db.exec(trigger.sql as string);
-  db.exec("DELETE FROM schema_migrations WHERE version = 14; COMMIT");
+  db.exec("DELETE FROM schema_migrations WHERE version >= 14; COMMIT");
   const before = db.prepare("SELECT * FROM extractions").all();
   return { root, db, before };
 }
@@ -44,7 +44,7 @@ test("v13 expansion preserves extraction rows, constraints and provenance trigge
   db.close();
   const upgraded = openStateDb(root);
   assert.deepEqual(upgraded.prepare("SELECT * FROM extractions").all(), before);
-  assert.equal(upgraded.prepare("SELECT MAX(version) AS v FROM schema_migrations").get()!.v, 14);
+  assert.equal(upgraded.prepare("SELECT MAX(version) AS v FROM schema_migrations").get()!.v, 16);
   assert.equal(upgraded.prepare("PRAGMA foreign_key_check").all().length, 0);
   assert.throws(() => upgraded.exec("UPDATE extractions SET accepted_bytes = -1"), /CHECK constraint/);
   upgraded.exec("UPDATE extractions SET accepted_bytes = 9025");

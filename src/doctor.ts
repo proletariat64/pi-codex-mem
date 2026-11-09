@@ -232,13 +232,32 @@ export function runDoctor(input: DoctorInput): DoctorReport {
   return {
     ok,
     probes,
-    /** Render the health summary and probes as UI lines without changing their diagnostic state. */
+    /** Render the health summary, probes and the single next action in UI lines. */
     format(): string[] {
       const icon = { ok: "✓", warn: "!", fail: "✗" } as const;
       return [
         `pi-memory doctor — environment ${environmentOk ? "OK" : "BLOCKED (see failures)"}; selected memory ${memoryState}`,
         ...probes.map((probe) => `${icon[probe.status]} ${probe.id}: ${probe.detail}`),
+        `next: ${nextAction(probes, input.memory, memoryState)}`,
       ];
     },
   };
+}
+
+/** One actionable sentence: what the user can do now, not which internal state is set. */
+function nextAction(probes: DoctorProbe[], memory: MemoryDiagnostics | undefined, memoryState: string): string {
+  const failing = probes.filter((probe) => probe.status === "fail");
+  const environmentFailure = failing.find((probe) => probe.id !== "memory" && probe.id !== "host-events");
+  if (environmentFailure) return `fix the ${environmentFailure.id} failure above; memory stays off until it is healthy`;
+  if (failing.some((probe) => probe.id === "host-events")) return "send one prompt and let it finish, then run /memory doctor again";
+  if (!memory) return "nothing to judge yet; finish one session so capture and publication can report";
+  if (!memory.selectedReadable) {
+    return memory.selectedInvalidated
+      ? "memory is fenced by an explicit removal; run /memory run --version v1 --now to rebuild it"
+      : "no published memory yet; leave a session idle or run /memory run --version v1 --now";
+  }
+  if (memory.pendingSources > 0 || memory.selectedStale) {
+    return `usable now; ${memory.pendingSources} newer capture${memory.pendingSources === 1 ? "" : "s"} pending, memory refreshes automatically -- run /memory run --version v1 --now to refresh sooner`;
+  }
+  return `nothing to do; ${memoryState} affects the next eligible run`;
 }

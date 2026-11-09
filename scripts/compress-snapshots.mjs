@@ -93,8 +93,6 @@ try {
         try { fsyncSync(dir); } finally { closeSync(dir); }
       } catch (error) {
         damaged += 1;
-        bytesBefore -= before.length;
-        converted -= 1;
         console.error(`rewrite failed, left untouched: ${path}: ${error.message}`);
         continue;
       }

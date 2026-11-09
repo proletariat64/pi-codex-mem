@@ -812,10 +812,20 @@ export function sourceSuppressed(db: DatabaseSync, sessionKey: string, lineageKe
     WHERE (kind = 'session' AND identity = ?) OR (kind = 'lineage' AND identity = ?) LIMIT 1`).get(sessionKey, lineageKey);
 }
 
-/** §5.3: on session_tree, retire every head except the active one. */
-export function retireOtherHeads(db: DatabaseSync, sessionKey: string, activeBranchId: string): void {
+/**
+ * §5.3: on session_tree, retire every head except the active one. The move is
+ * staleness unless the branch also holds an edit the retired revisions never
+ * applied, in which case pre-edit text could still be served and reads fence.
+ */
+export function retireOtherHeads(db: DatabaseSync, sessionKey: string, activeBranchId: string,
+  pendingPrivacyEditHash = "", pendingHasPrivacyEdits = false): void {
   db.exec("BEGIN");
   try {
+    const retired = db.prepare(
+      `SELECT h.latest_revision, r.privacy_edit_hash FROM branch_heads h
+       LEFT JOIN source_revisions r ON r.source_id = h.latest_revision
+       WHERE h.session_key = ? AND h.branch_id != ? AND h.state = 'active'`,
+    ).all(sessionKey, activeBranchId) as { latest_revision: string | null; privacy_edit_hash: string | null }[];
     db.prepare(
       "UPDATE branch_heads SET state = 'retired' WHERE session_key = ? AND branch_id != ? AND state = 'active'",
     ).run(sessionKey, activeBranchId);
@@ -827,7 +837,14 @@ export function retireOtherHeads(db: DatabaseSync, sessionKey: string, activeBra
       `UPDATE source_revisions SET status = 'superseded'
        WHERE session_key = ? AND branch_id != ? AND status = 'captured'`,
     ).run(sessionKey, activeBranchId);
-    if (db.prepare("SELECT changes() AS n").get()?.n) markStale(db, "session_tree");
+    if (db.prepare("SELECT changes() AS n").get()?.n) {
+      // A revision captured before schema 17 has no stored subset, so fall back
+      // to "any relevant edit is pending".
+      const pending = retired.some((head) => head.latest_revision &&
+        (!head.privacy_edit_hash ? pendingHasPrivacyEdits : head.privacy_edit_hash !== pendingPrivacyEditHash));
+      if (pending) blockBothViews(db, "session_tree");
+      else markStale(db, "session_tree");
+    }
     db.exec("COMMIT");
   } catch (err) {
     db.exec("ROLLBACK");

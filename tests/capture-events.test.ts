@@ -167,6 +167,35 @@ test("resume blocks old captured evidence when a new context edit is present bef
   assert.equal(snapshotFiles(memoryRoot).length, 1, "the old at-rest snapshot is removed on settlement");
 });
 
+test("resume does not fence a legacy revision for recovery-only omissions", async (t) => {
+  const { cwd, memoryRoot } = makeSandbox(t);
+  const mock = makeMockPi(); memoryExtension(mock.pi);
+  const entries: unknown[] = [userEntry("u1", "durable preference")];
+  const ctx = { cwd, hasUI: false, mode: "tui", sessionManager: fakeSessionManager(cwd, entries),
+    modelRegistry: { find: () => ({}), streamSimple: () => ({}) }, ui: { notify: () => {} } };
+  await mock.fire("session_start", { type: "session_start" }, ctx);
+  await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
+  const { DatabaseSync } = await import("node:sqlite");
+  const db = new DatabaseSync(join(memoryRoot, "state.sqlite"));
+  // Simulate a revision captured before schema 17 had a privacy subset.
+  db.exec("UPDATE source_revisions SET privacy_edit_hash = ''");
+  db.close();
+  // An abandoned attempt: empty assistant message plus its recovery omission.
+  entries.push({ type: "message", id: "a1", parentId: "u1", timestamp: new Date().toISOString(),
+    message: { role: "assistant", content: [], api: "openai-completions", provider: "fixture", model: "m",
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      stopReason: "aborted", timestamp: Date.now() } });
+  entries.push({ type: "context_edit", id: "e1", parentId: "a1", targetId: "a1", replacement: null,
+    timestamp: new Date().toISOString() });
+  await mock.fire("session_start", { type: "session_start" }, ctx);
+  const after = new DatabaseSync(join(memoryRoot, "state.sqlite"), { readOnly: true });
+  const row = after.prepare("SELECT read_blocked, stale_reason FROM pipeline_state WHERE memory_version = 'v1'")
+    .get() as { read_blocked: number; stale_reason: string | null };
+  after.close();
+  assert.equal(row.read_blocked, 0, "bookkeeping omission on an upgraded revision stays readable");
+});
+
 for (const version of ["v1", "v2"] as const) test(`T10 ${version}: context edit removes sensitive evidence and invalidates old views`, async (t) => {
   const { cwd, memoryRoot } = makeSandbox(t, version);
   const sourceFile = join(cwd, "session.jsonl");

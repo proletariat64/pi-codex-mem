@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { join, resolve } from "node:path";
 import { getAgentDir, VERSION as PI_VERSION, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type SessionHeader } from "@earendil-works/pi-coding-agent";
-import { captureSettledSession, privacyEditHashOf, type CaptureResult } from "./capture.ts";
+import { captureSettledSession, hasPrivacyRelevantEdits, privacyEditHashOf, type CaptureResult } from "./capture.ts";
 import { blockUncapturedLeaf, clearGenerationPins, openStateDb, prunePrivacyRevoked, registerGenerationPin, retireOtherHeads, sweepUnindexedNotes } from "./store/db.ts";
 import { storeSizeBytes } from "./store/size.ts";
 import { computeSessionKey } from "./identity.ts";
@@ -593,13 +593,13 @@ export default function (pi: ExtensionAPI) {
             const branch = ctx.sessionManager.getBranch();
             const ancestry = new Set(branch.map((entry) => entry.id));
             if (heads.some((head) => !ancestry.has(head.selected_leaf))) {
-              retireOtherHeads(state.db, key, "");
+              retireOtherHeads(state.db, key, "", privacyEditHashOf(branch), hasPrivacyRelevantEdits(branch));
             } else if (heads.some((head) => head.selected_leaf !== ctx.sessionManager.getLeafId())) {
               // The old leaf is still an ancestor, but appended turns or edits
               // are not yet reflected in its captured projection. Only an
               // uncaptured edit can still be revoking text.
               blockUncapturedLeaf(state.db, key, ctx.sessionManager.getLeafId(),
-                privacyEditHashOf(branch), branch.some((entry) => entry.type === "context_edit"));
+                privacyEditHashOf(branch), hasPrivacyRelevantEdits(branch));
             }
           }
         } catch (err) {
@@ -712,8 +712,11 @@ export default function (pi: ExtensionAPI) {
       if (!header || !file) return;
       const key = computeSessionKey(getAgentDir(), file, header.id);
       // All previous selected heads are conservatively retired until the
-      // new branch is captured and validated (§5.3, T08).
-      retireOtherHeads(state.db, key, "");
+      // new branch is captured and validated (§5.3, T08). An edit the retired
+      // revisions never applied still fences, because pre-edit text may be
+      // what the new branch is removing.
+      const branch = ctx.sessionManager.getBranch();
+      retireOtherHeads(state.db, key, "", privacyEditHashOf(branch), hasPrivacyRelevantEdits(branch));
       foreground.sessionReplaced();
       state.capture = null;
       triggerScheduler();

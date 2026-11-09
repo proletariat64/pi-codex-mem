@@ -69,11 +69,8 @@ export function entryCarriesEvidence(entries: readonly SessionEntry[], entryId: 
   return single.items.length > 0 || single.omissions.some((omission) => omission.reason === "budget-exceeded");
 }
 
-/**
- * Identity of only the privacy-relevant edits, i.e. the ones resume must fence
- * on. Recovery bookkeeping moves the branch to stale instead (§7.1, §10).
- */
-export function privacyEditHashOf(entries: readonly SessionEntry[], limits?: NormalizeLimits): string {
+/** Latest privacy-relevant edit per target; recovery bookkeeping is excluded. */
+function privacyRelevantEdits(entries: readonly SessionEntry[], limits?: NormalizeLimits): { targetId: string; replacement: unknown }[] {
   const latest = new Map<string, unknown>();
   for (const entry of entries) {
     if (entry.type !== "context_edit") continue;
@@ -85,7 +82,20 @@ export function privacyEditHashOf(entries: readonly SessionEntry[], limits?: Nor
     if (replacementHasContent(replacement)) relevant.push({ targetId, replacement });
     else if (entryCarriesEvidence(entries, targetId, limits)) relevant.push({ targetId, replacement });
   }
-  return hash(JSON.stringify(relevant));
+  return relevant;
+}
+
+/** Does the branch hold an edit that could revoke previously captured text? */
+export function hasPrivacyRelevantEdits(entries: readonly SessionEntry[], limits?: NormalizeLimits): boolean {
+  return privacyRelevantEdits(entries, limits).length > 0;
+}
+
+/**
+ * Identity of only the privacy-relevant edits, i.e. the ones resume must fence
+ * on. Recovery bookkeeping moves the branch to stale instead (§7.1, §10).
+ */
+export function privacyEditHashOf(entries: readonly SessionEntry[], limits?: NormalizeLimits): string {
+  return hash(JSON.stringify(privacyRelevantEdits(entries, limits)));
 }
 
 /**

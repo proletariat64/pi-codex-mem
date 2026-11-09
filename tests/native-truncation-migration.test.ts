@@ -28,7 +28,8 @@ function legacyStore(t: test.TestContext) {
   const schema = db.prepare("SELECT sql FROM sqlite_master WHERE name = 'extractions'").get()!.sql as string;
   const triggers = db.prepare("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND sql LIKE '%extractions%'").all();
   db.exec("BEGIN");
-  for (const trigger of triggers) db.exec(`DROP TRIGGER ${trigger.name}`);
+  // Quote the identifier so a fixture name can never alter the statement.
+  for (const trigger of triggers) db.exec(`DROP TRIGGER "${String(trigger.name).replaceAll('"', '""')}"`);
   db.exec(schema.replace(/CREATE TABLE\s+(?:"extractions"|extractions)/i, "CREATE TABLE legacy_extractions")
     .replace("CHECK (accepted_bytes >= 0)", "CHECK (accepted_bytes BETWEEN 0 AND 9000)"));
   db.exec("INSERT INTO legacy_extractions SELECT * FROM extractions; DROP TABLE extractions; ALTER TABLE legacy_extractions RENAME TO extractions");
@@ -44,7 +45,7 @@ test("v13 expansion preserves extraction rows, constraints and provenance trigge
   db.close();
   const upgraded = openStateDb(root);
   assert.deepEqual(upgraded.prepare("SELECT * FROM extractions").all(), before);
-  assert.equal(upgraded.prepare("SELECT MAX(version) AS v FROM schema_migrations").get()!.v, 16);
+  assert.equal(upgraded.prepare("SELECT MAX(version) AS v FROM schema_migrations").get()!.v, 17);
   assert.equal(upgraded.prepare("PRAGMA foreign_key_check").all().length, 0);
   assert.throws(() => upgraded.exec("UPDATE extractions SET accepted_bytes = -1"), /CHECK constraint/);
   upgraded.exec("UPDATE extractions SET accepted_bytes = 9025");

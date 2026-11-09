@@ -30,6 +30,7 @@ export interface SnapshotRecord {
     snapshotHash: string;
     sourceTime: number;
     contextEditHash?: string;
+    privacyEditHash?: string;
   };
   capturedAt: number;
   revokedSourceIds?: string[];
@@ -38,7 +39,7 @@ export interface SnapshotRecord {
   evidenceRemoved?: boolean;
 }
 
-const SCHEMA_VERSION = 16;
+const SCHEMA_VERSION = 17;
 
 const MIGRATION_1 = `
 CREATE TABLE schema_migrations (
@@ -445,6 +446,13 @@ export function openStateDb(root: string, options?: { busyTimeoutMs?: number }):
         }
         db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(16, Date.now());
       }
+      if (current < 17) {
+        const columns = new Set((db.prepare("PRAGMA table_info(source_revisions)").all() as { name: string }[]).map(column => column.name));
+        if (!columns.has("privacy_edit_hash")) {
+          db.exec("ALTER TABLE source_revisions ADD COLUMN privacy_edit_hash TEXT NOT NULL DEFAULT ''");
+        }
+        db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(17, Date.now());
+      }
       db.exec("COMMIT");
     } catch (err) {
       db.exec("ROLLBACK");
@@ -634,26 +642,34 @@ export function clearGenerationPins(db: DatabaseSync, ownerId: string): void {
  * keeps the hard fence until capture applies it.
  */
 export function blockUncapturedLeaf(db: DatabaseSync, sessionKey: string, leafId: string | null,
-  pendingContextEditHash = ""): void {
+  pendingPrivacyEditHash = "", pendingHasPrivacyEdits = false): void {
   db.exec("BEGIN IMMEDIATE");
   try {
     const heads = db.prepare(
-      `SELECT h.latest_revision, r.context_edit_hash FROM branch_heads h
+      `SELECT h.latest_revision, r.status, r.privacy_edit_hash FROM branch_heads h
        LEFT JOIN source_revisions r ON r.source_id = h.latest_revision
        WHERE h.session_key = ? AND h.state = 'active' AND h.selected_leaf != ?`,
-    ).all(sessionKey, leafId ?? "") as { latest_revision: string | null; context_edit_hash: string | null }[];
+    ).all(sessionKey, leafId ?? "") as {
+      latest_revision: string | null; status: string | null; privacy_edit_hash: string | null;
+    }[];
     let changed = 0;
     for (const head of heads) {
       if (!head.latest_revision) continue;
       changed += Number(db.prepare("UPDATE source_revisions SET status = 'superseded' WHERE source_id = ? AND status = 'captured'")
         .run(head.latest_revision).changes);
     }
-    if (changed > 0) {
-      const pendingEdits = heads.some((head) => head.latest_revision &&
-        (head.context_edit_hash ?? "") !== pendingContextEditHash);
-      if (pendingEdits) blockBothViews(db, "uncaptured_branch_leaf");
-      else markStale(db, "uncaptured_branch_leaf");
-    }
+    // An edit the captured revision has not applied may still be revoking text.
+    // This must not depend on the revision having just been superseded: an
+    // earlier resume may already have retired it.
+    const pendingEdits = heads.some((head) => {
+      if (!head.latest_revision) return false;
+      // A revision captured before schema 17 has no stored subset; fall back to
+      // "any relevant edit is pending" so a real deletion still fences once.
+      if (!head.privacy_edit_hash) return pendingHasPrivacyEdits;
+      return head.privacy_edit_hash !== pendingPrivacyEditHash;
+    });
+    if (pendingEdits) blockBothViews(db, "uncaptured_branch_leaf");
+    else if (changed > 0) markStale(db, "uncaptured_branch_leaf");
     db.exec("COMMIT");
   } catch (err) {
     db.exec("ROLLBACK");
@@ -738,8 +754,9 @@ export function recordSnapshot(db: DatabaseSync, rec: SnapshotRecord, root?: str
     db.prepare(
       `INSERT OR IGNORE INTO source_revisions
          (source_id, lineage_key, session_key, branch_id, revision_hash, snapshot_path,
-          snapshot_hash, leaf_id, source_time, status, policy_version, captured_at, context_edit_hash)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'captured', ?, ?, ?)`,
+          snapshot_hash, leaf_id, source_time, status, policy_version, captured_at, context_edit_hash,
+          privacy_edit_hash)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'captured', ?, ?, ?, ?)`,
     ).run(
       rec.revision.sourceId,
       rec.revision.lineageKey,
@@ -753,6 +770,7 @@ export function recordSnapshot(db: DatabaseSync, rec: SnapshotRecord, root?: str
       "norm-1",
       rec.capturedAt,
       rec.revision.contextEditHash ?? "",
+      rec.revision.privacyEditHash ?? "",
     );
     // Only the selected branch and its latest projection remain eligible.
     // A branch switch without a session_tree event must also revoke reads.

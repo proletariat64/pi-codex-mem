@@ -230,6 +230,9 @@ export function getPublishedGeneration(db: DatabaseSync, memoryVersion: MemoryVe
     g.created_at AS createdAt, g.retention_deadline AS retentionDeadline, g.max_unused_days AS maxUnusedDays
     FROM pipeline_state p JOIN generations g ON g.generation_id = COALESCE(?, p.active_generation_id)
       AND g.memory_version = p.memory_version CROSS JOIN store_state s
+    -- Epoch lag is staleness, not invalidation: every hard fence also sets
+    -- read_blocked. These comparisons stay as a guard should a future writer
+    -- move the epoch for a reason that must not serve older output.
     WHERE p.memory_version = ? AND p.read_blocked = 0 AND g.status = 'published'
       AND g.control_epoch <= s.control_epoch AND p.reconciled_epoch <= s.control_epoch AND s.singleton = 1`)
     .get(options?.generationId ?? null, memoryVersion) as unknown as (PublishedGeneration & { maxUnusedDays: number }) | undefined;

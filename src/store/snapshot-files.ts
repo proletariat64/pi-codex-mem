@@ -46,7 +46,6 @@ export function writeSnapshotFile(
 ): { path: string; hash: string } {
   const content = JSON.stringify(snapshot, null, 2) + "\n";
   const hash = createHash("sha256").update(content, "utf8").digest("hex");
-  const payload = gzipSync(Buffer.from(content, "utf8"), { level: 9 });
   const sources = join(root, "sources");
   const dir = join(sources, lineageKey);
   const path = join(dir, `${revisionHash}.json`);
@@ -76,7 +75,8 @@ export function writeSnapshotFile(
   syncDirectory(sources);
   const temp = join(dir, `.snapshot-${randomBytes(12).toString("hex")}.tmp`);
   try {
-    writeFileSync(temp, payload, { mode: 0o600, flag: "wx" });
+    // Compress only on the writing path: an idempotent rewrite returns above.
+    writeFileSync(temp, gzipSync(Buffer.from(content, "utf8"), { level: 9 }), { mode: 0o600, flag: "wx" });
     const fd = openSync(temp, "r");
     try { fsyncSync(fd); } finally { closeSync(fd); }
     // A complete, durable temp file becomes visible atomically; link never replaces

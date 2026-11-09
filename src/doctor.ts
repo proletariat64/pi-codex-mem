@@ -229,6 +229,8 @@ export function runDoctor(input: DoctorInput): DoctorReport {
     });
   }
   const ok = probes.every((probe) => probe.status !== "fail");
+  const configuredVersion = input.config.status === "ok" || input.config.status === "created"
+    ? input.config.config.version : "v1";
   return {
     ok,
     probes,
@@ -238,14 +240,15 @@ export function runDoctor(input: DoctorInput): DoctorReport {
       return [
         `pi-memory doctor — environment ${environmentOk ? "OK" : "BLOCKED (see failures)"}; selected memory ${memoryState}`,
         ...probes.map((probe) => `${icon[probe.status]} ${probe.id}: ${probe.detail}`),
-        `next: ${nextAction(probes, input.memory, memoryState)}`,
+        `next: ${nextAction(probes, input.memory, memoryState, configuredVersion)}`,
       ];
     },
   };
 }
 
 /** One actionable sentence: what the user can do now, not which internal state is set. */
-function nextAction(probes: DoctorProbe[], memory: MemoryDiagnostics | undefined, memoryState: string): string {
+function nextAction(probes: DoctorProbe[], memory: MemoryDiagnostics | undefined, memoryState: string,
+  version: string): string {
   const failing = probes.filter((probe) => probe.status === "fail");
   const environmentFailure = failing.find((probe) => probe.id !== "memory" && probe.id !== "host-events");
   if (environmentFailure) return `fix the ${environmentFailure.id} failure above; memory stays off until it is healthy`;
@@ -253,11 +256,14 @@ function nextAction(probes: DoctorProbe[], memory: MemoryDiagnostics | undefined
   if (!memory) return "nothing to judge yet; finish one session so capture and publication can report";
   if (!memory.selectedReadable) {
     return memory.selectedInvalidated
-      ? "memory is fenced by an explicit removal; run /memory run --version v1 --now to rebuild it"
-      : "no published memory yet; leave a session idle or run /memory run --version v1 --now";
+      ? `memory is fenced until the next publication; run /memory run --version ${version} --now to rebuild it`
+      : `no published memory yet; leave a session idle or run /memory run --version ${version} --now`;
   }
-  if (memory.pendingSources > 0 || memory.selectedStale) {
-    return `usable now; ${memory.pendingSources} newer capture${memory.pendingSources === 1 ? "" : "s"} pending, memory refreshes automatically -- run /memory run --version v1 --now to refresh sooner`;
+  if (memory.pendingSources > 0) {
+    return `usable now; ${memory.pendingSources} newer capture${memory.pendingSources === 1 ? "" : "s"} pending, memory refreshes automatically -- run /memory run --version ${version} --now to refresh sooner`;
+  }
+  if (memory.selectedStale) {
+    return `usable now; the branch moved on (${memory.staleReason ?? "stale projection"}), memory refreshes automatically -- run /memory run --version ${version} --now to refresh sooner`;
   }
   return `nothing to do; ${memoryState} affects the next eligible run`;
 }

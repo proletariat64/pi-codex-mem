@@ -38,9 +38,52 @@ export type CaptureResult =
 
 const hash = (value: string): string => createHash("sha256").update(value).digest("hex");
 
-/** Same identity capture uses, so resume can tell whether edits are pending. */
+/** Same identity capture uses, so resume can tell whether the branch moved on. */
 export function contextEditHashOf(entries: readonly SessionEntry[]): string {
   return hash(JSON.stringify(entries.filter((entry) => entry.type === "context_edit")));
+}
+
+/** Text a replacement still exports; empty content is a removal, not a decision to keep. */
+function replacementText(replacement: unknown): string {
+  if (replacement === null || typeof replacement !== "object") return "";
+  const content = (replacement as { content?: unknown }).content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.map((block) => block && typeof block === "object" && typeof (block as { text?: unknown }).text === "string"
+    ? (block as { text: string }).text : "").join("");
+}
+
+/**
+ * Could this entry ever export text? Recovery omissions of empty/aborted
+ * attempts, metadata, own-memory traffic and foreign extension messages cannot,
+ * so an edit on them is bookkeeping, not a privacy decision.
+ */
+export function entryCarriesEvidence(entries: readonly SessionEntry[], entryId: string,
+  limits?: NormalizeLimits): boolean {
+  const entry = entries.find((candidate) => candidate.id === entryId);
+  if (!entry || entry.type === "context_edit") return false;
+  const single = normalizeEvidence([entry], { limits });
+  // A budget-excluded item still holds text: deleting it must revoke copies.
+  return single.items.length > 0 || single.omissions.some((omission) => omission.reason === "budget-exceeded");
+}
+
+/**
+ * Identity of only the privacy-relevant edits, i.e. the ones resume must fence
+ * on. Recovery bookkeeping moves the branch to stale instead (§7.1, §10).
+ */
+export function privacyEditHashOf(entries: readonly SessionEntry[], limits?: NormalizeLimits): string {
+  const latest = new Map<string, unknown>();
+  for (const entry of entries) {
+    if (entry.type !== "context_edit") continue;
+    const edit = entry as { targetId: string; replacement: unknown };
+    latest.set(edit.targetId, edit.replacement);
+  }
+  const relevant: { targetId: string; replacement: unknown }[] = [];
+  for (const [targetId, replacement] of [...latest].sort(([left], [right]) => left.localeCompare(right))) {
+    if (replacementText(replacement) !== "") relevant.push({ targetId, replacement });
+    else if (entryCarriesEvidence(entries, targetId, limits)) relevant.push({ targetId, replacement });
+  }
+  return hash(JSON.stringify(relevant));
 }
 
 /**
@@ -137,9 +180,7 @@ function captureBranch(
   const carriesEvidence = (entryId: string): boolean => {
     const cached = evidenceById.get(entryId);
     if (cached !== undefined) return cached;
-    const entry = branch.find((candidate) => candidate.id === entryId);
-    const decided = entry !== undefined && entry.type !== "context_edit" &&
-      normalizeEvidence([entry], { limits: input.limits }).items.length > 0;
+    const decided = entryCarriesEvidence(branch, entryId, input.limits);
     evidenceById.set(entryId, decided);
     return decided;
   };
@@ -208,6 +249,9 @@ function captureBranch(
   const evidenceHash = hash(JSON.stringify(normalized));
   const scopeHash = hash(JSON.stringify(workspace));
   const contextEditHash = contextEditHashOf(branch);
+  // Resume fences on the privacy-relevant subset only: recovery bookkeeping
+  // must not make an at-rest revision unreadable.
+  const privacyEditHash = privacyEditHashOf(branch, input.limits);
   const revisionHash = computeRevisionHash({
     evidenceHash,
     leafId: leaf,
@@ -284,7 +328,6 @@ function captureBranch(
     sessionHeader: header,
     sessionPath: file,
     parentSession: header.parentSession ?? null,
-    contextEditHash,
     capturedAt: sourceTime,
     sourceUpdatedAt: sourceTime,
     ...normalized,
@@ -331,6 +374,7 @@ function captureBranch(
         snapshotHash: saved.hash,
         sourceTime,
         contextEditHash,
+        privacyEditHash,
       },
       capturedAt: Date.now(),
       revokedSourceIds,

@@ -44,10 +44,11 @@ export function persistentDiagnostics(db: DatabaseSync, config: MemoryConfig, no
       extractionPromptHash: version === "v1" ? v1PromptHash() : v2PromptHash(),
     });
     const readable = Boolean(generation);
-    const newer = db.prepare(`SELECT COUNT(*) AS n FROM source_revisions r
+    // Only a readable generation has a baseline to count drift against.
+    const newer = generation ? db.prepare(`SELECT COUNT(*) AS n FROM source_revisions r
       JOIN branch_heads h ON h.session_key = r.session_key AND h.branch_id = r.branch_id
       WHERE r.status = 'captured' AND h.state = 'active' AND h.latest_revision = r.source_id
-        AND r.captured_at > ?`).get(generation?.createdAt ?? 0) as { n: number };
+        AND r.captured_at > ?`).get(generation.createdAt) as { n: number } : { n: 0 };
     if (version === config.version) {
       selectedReadable = readable;
       selectedInvalidated = Boolean(pipeline?.read_blocked);
@@ -100,7 +101,10 @@ export function persistentDiagnostics(db: DatabaseSync, config: MemoryConfig, no
       `${version} readable generation: ${generation?.generationId ?? "none"}${!readable && !pipeline?.read_blocked ? " (initialization/publication pending; no eligible generation)" : ""}`);
     if (pipeline?.read_blocked) lines.push(`${version} invalidation reason: ${pipeline.block_reason ?? "unknown"}`);
     if (pipeline?.stale_reason) {
-      lines.push(`${version} staleness: ${pipeline.stale_reason}; ${Number(newer.n)} newer captures await consolidation; reading continues`);
+      // A hard fence wins: never claim reads continue while read_blocked is set.
+      const pendingCount = Number(newer.n);
+      lines.push(`${version} staleness: ${pipeline.stale_reason}; ${pendingCount} newer capture${pendingCount === 1 ? "" : "s"} await consolidation`
+        + (pipeline.read_blocked ? "" : "; reading continues"));
     }
     const notes = db.prepare(`SELECT COUNT(*) AS saved, COALESCE(SUM(CASE WHEN EXISTS (
       SELECT 1 FROM note_applications a WHERE a.note_id = n.note_id AND a.note_hash = n.text_hash

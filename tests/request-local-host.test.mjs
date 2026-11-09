@@ -192,6 +192,11 @@ for (const version of ['v1', 'v2']) for (const order of ['memory-first', 'overri
     const codexProjection = await project(canonical, 'codex');
     assert.equal((await list.execute('list', {}, undefined, undefined, runner.createContext())).details.error, undefined);
     const codexPayload = { input: [{ role: 'user', content: codexProjection.find(message => message.customType === 'pi_memory').content }, user('REAL_HUMAN')], tools: head.toolsAdded };
+    // A stale epoch alone must keep the carrier: only an authoritative
+    // revocation may strip it at the dispatch boundary.
+    db.exec('UPDATE store_state SET control_epoch = control_epoch + 1');
+    assert.deepEqual(await runner.emitBeforeProviderRequest(codexPayload), codexPayload,
+      "an epoch advance keeps the projected carrier");
     db.exec("UPDATE pipeline_state SET read_blocked = 1, block_reason = 'source_forgotten'");
     assert.deepEqual(await runner.emitBeforeProviderRequest(codexPayload), { ...codexPayload, input: [user('REAL_HUMAN')] });
     assert.equal((await list.execute('list', {}, undefined, undefined, runner.createContext())).details.error, 'memory_unavailable');

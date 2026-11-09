@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { join, resolve } from "node:path";
 import { getAgentDir, VERSION as PI_VERSION, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type SessionHeader } from "@earendil-works/pi-coding-agent";
-import { captureSettledSession, contextEditHashOf, type CaptureResult } from "./capture.ts";
+import { captureSettledSession, privacyEditHashOf, type CaptureResult } from "./capture.ts";
 import { blockUncapturedLeaf, clearGenerationPins, openStateDb, prunePrivacyRevoked, registerGenerationPin, retireOtherHeads, sweepUnindexedNotes } from "./store/db.ts";
 import { storeSizeBytes } from "./store/size.ts";
 import { computeSessionKey } from "./identity.ts";
@@ -596,8 +596,9 @@ export default function (pi: ExtensionAPI) {
               // The old leaf is still an ancestor, but appended turns or edits
               // are not yet reflected in its captured projection. Only an
               // uncaptured edit can still be revoking text.
+              const branch = ctx.sessionManager.getBranch();
               blockUncapturedLeaf(state.db, key, ctx.sessionManager.getLeafId(),
-                contextEditHashOf(ctx.sessionManager.getBranch()));
+                privacyEditHashOf(branch), branch.some((entry) => entry.type === "context_edit"));
             }
           }
         } catch (err) {

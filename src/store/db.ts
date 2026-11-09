@@ -672,10 +672,11 @@ export function blockUncapturedLeaf(db: DatabaseSync, sessionKey: string, leafId
     // earlier resume may already have retired it.
     const pendingEdits = heads.some((head) => {
       if (!head.latest_revision) return false;
-      // A revision captured before schema 17 has no stored subset; fall back to
-      // "any relevant edit is pending" so a real deletion still fences once.
-      if (!head.privacy_edit_hash) return pendingHasPrivacyEdits;
-      return head.privacy_edit_hash !== pendingPrivacyEditHash;
+      // Only an edit the selected branch actually holds can be pending. A
+      // rewind to a point before a captured edit leaves the branch with none,
+      // and the differing stored hash alone must not fence healthy memory.
+      if (!pendingHasPrivacyEdits) return false;
+      return !head.privacy_edit_hash || head.privacy_edit_hash !== pendingPrivacyEditHash;
     });
     if (pendingEdits) blockBothViews(db, "uncaptured_branch_leaf");
     else if (changed > 0) markStale(db, "uncaptured_branch_leaf");
@@ -838,10 +839,10 @@ export function retireOtherHeads(db: DatabaseSync, sessionKey: string, activeBra
        WHERE session_key = ? AND branch_id != ? AND status = 'captured'`,
     ).run(sessionKey, activeBranchId);
     if (db.prepare("SELECT changes() AS n").get()?.n) {
-      // A revision captured before schema 17 has no stored subset, so fall back
-      // to "any relevant edit is pending".
-      const pending = retired.some((head) => head.latest_revision &&
-        (!head.privacy_edit_hash ? pendingHasPrivacyEdits : head.privacy_edit_hash !== pendingPrivacyEditHash));
+      // Same rule as the resume path: no relevant edit on the selected branch
+      // means nothing is pending, whatever the retired head recorded.
+      const pending = pendingHasPrivacyEdits && retired.some((head) => head.latest_revision &&
+        (!head.privacy_edit_hash || head.privacy_edit_hash !== pendingPrivacyEditHash));
       if (pending) blockBothViews(db, "session_tree");
       else markStale(db, "session_tree");
     }

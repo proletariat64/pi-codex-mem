@@ -180,6 +180,21 @@ test("retiring a head with an unapplied privacy edit fences instead of going sta
   assert.equal(blocked.stale_reason, null);
 });
 
+test("rewinding to before a captured edit does not fence healthy memory", (t) => {
+  const root = makeRoot(t);
+  const db = openStateDb(root);
+  t.after(() => db.close());
+  recordSnapshot(db, rec());
+  // The retired head recorded a privacy edit, but the selected branch holds
+  // none, so nothing is pending for the switch.
+  db.exec("UPDATE source_revisions SET privacy_edit_hash = 'recorded-edit-hash'");
+  retireOtherHeads(db, rec().session.sessionKey, "br-new", "hash-of-no-edits", false);
+  const row = db.prepare("SELECT read_blocked, stale_reason FROM pipeline_state WHERE memory_version = 'v1'")
+    .get() as { read_blocked: number; stale_reason: string | null };
+  assert.equal(row.read_blocked, 0, "a differing stored hash alone is not a pending removal");
+  assert.equal(row.stale_reason, "session_tree");
+});
+
 test("retiring a head with no pending edit only marks staleness", (t) => {
   const root = makeRoot(t);
   const db = openStateDb(root);

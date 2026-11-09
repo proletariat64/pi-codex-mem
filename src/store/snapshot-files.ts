@@ -1,10 +1,35 @@
 import { createHash, randomBytes } from "node:crypto";
 import { chmodSync, closeSync, existsSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { gunzipSync, gzipSync } from "node:zlib";
 import { join } from "node:path";
 
 function syncDirectory(path: string): void {
   const fd = openSync(path, "r");
   try { fsyncSync(fd); } finally { closeSync(fd); }
+}
+
+/** Snapshots are stored gzip-compressed: a revision carries the whole branch, so
+ * plaintext copies made every settle cost quadratic space. The identity hash
+ * always covers the decoded JSON text, keeping compression an encoding detail. */
+const GZIP_MAGIC = [0x1f, 0x8b] as const;
+
+export function isCompressedSnapshot(bytes: Buffer): boolean {
+  return bytes.length > 1 && bytes[0] === GZIP_MAGIC[0] && bytes[1] === GZIP_MAGIC[1];
+}
+
+/** Decode a snapshot payload, accepting both compressed and legacy plaintext files. */
+export function decodeSnapshot(bytes: Buffer): string {
+  return (isCompressedSnapshot(bytes) ? gunzipSync(bytes) : bytes).toString("utf8");
+}
+
+/** Content identity of a stored snapshot, independent of its on-disk encoding. */
+export function snapshotContentHash(bytes: Buffer): string {
+  return createHash("sha256").update(decodeSnapshot(bytes), "utf8").digest("hex");
+}
+
+/** Read a snapshot's decoded JSON text from the owned store. */
+export function readSnapshotText(path: string): string {
+  return decodeSnapshot(readFileSync(path));
 }
 
 /**
@@ -20,7 +45,8 @@ export function writeSnapshotFile(
   snapshot: unknown,
 ): { path: string; hash: string } {
   const content = JSON.stringify(snapshot, null, 2) + "\n";
-  const hash = createHash("sha256").update(content).digest("hex");
+  const hash = createHash("sha256").update(content, "utf8").digest("hex");
+  const payload = gzipSync(Buffer.from(content, "utf8"), { level: 9 });
   const sources = join(root, "sources");
   const dir = join(sources, lineageKey);
   const path = join(dir, `${revisionHash}.json`);
@@ -35,8 +61,7 @@ export function writeSnapshotFile(
 
   if (existsSync(path)) {
     if (lstatSync(path).isSymbolicLink()) throw new Error("snapshot symlink rejected");
-    const existing = createHash("sha256").update(readFileSync(path)).digest("hex");
-    if (existing !== hash) {
+    if (snapshotContentHash(readFileSync(path)) !== hash) {
       throw new Error(`snapshot ${path} is immutable: content differs for the same revision hash`);
     }
     syncDirectory(dir); // also makes a recovered pre-commit link durable
@@ -51,7 +76,7 @@ export function writeSnapshotFile(
   syncDirectory(sources);
   const temp = join(dir, `.snapshot-${randomBytes(12).toString("hex")}.tmp`);
   try {
-    writeFileSync(temp, content, { mode: 0o600, flag: "wx" });
+    writeFileSync(temp, payload, { mode: 0o600, flag: "wx" });
     const fd = openSync(temp, "r");
     try { fsyncSync(fd); } finally { closeSync(fd); }
     // A complete, durable temp file becomes visible atomically; link never replaces
@@ -61,8 +86,7 @@ export function writeSnapshotFile(
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
       if (lstatSync(path).isSymbolicLink()) throw new Error("snapshot symlink rejected");
-      const existing = createHash("sha256").update(readFileSync(path)).digest("hex");
-      if (existing !== hash) throw new Error(`snapshot ${path} is immutable: content differs for the same revision hash`);
+      if (snapshotContentHash(readFileSync(path)) !== hash) throw new Error(`snapshot ${path} is immutable: content differs for the same revision hash`);
     }
   } finally {
     if (existsSync(temp)) unlinkSync(temp);

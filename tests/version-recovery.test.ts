@@ -9,6 +9,7 @@ import { captureSettledSession } from "../src/capture.ts";
 import { defaultConfig } from "../src/config.ts";
 import { enqueueActiveExtractions } from "../src/extraction/scheduler.ts";
 import { recoverEnrolledSnapshots } from "../src/control/switch.ts";
+import { readSnapshotText } from "../src/store/snapshot-files.ts";
 
 function fixture(t: test.TestContext) {
   const base = mkdtempSync(join(tmpdir(), "pi-recover-version-")); const cwd = join(base, "repo"); mkdirSync(cwd);
@@ -30,7 +31,7 @@ test("T34 cross: newly enabled v2 reconstructs pruned enrolled snapshots from or
   const report = recoverEnrolledSnapshots({ root: f.root, db: f.db, config: f.config, now: Date.now() });
   assert.equal(report.recovered, 1); assert.deepEqual(report.unavailable, []);
   assert.equal(existsSync(f.captured.snapshotPath), true);
-  assert.match(readFileSync(f.captured.snapshotPath, "utf8"), /Original TypeScript decision/);
+  assert.match(readSnapshotText(f.captured.snapshotPath), /Original TypeScript decision/);
   assert.equal(readFileSync(f.file, "utf8"), f.original);
   enqueueActiveExtractions(f.db, Date.now(), f.config, f.root);
   assert.equal(f.db.prepare("SELECT memory_version FROM jobs WHERE kind = 'extract'").get()!.memory_version, "v2");
@@ -82,7 +83,7 @@ test("reconstruction captures changed enrolled evidence as a new revision withou
   assert.equal(typeof active.latest_revision, "string");
   assert.notEqual(active.latest_revision, f.captured.sourceId);
   const source = f.db.prepare("SELECT snapshot_path FROM source_revisions WHERE source_id = ?").get(String(active.latest_revision))!;
-  assert.match(readFileSync(String(source.snapshot_path), "utf8"), /Revised TypeScript decision/);
+  assert.match(readSnapshotText(String(source.snapshot_path)), /Revised TypeScript decision/);
   assert.equal(readFileSync(f.file, "utf8"), changed);
   assert.equal(f.db.prepare("SELECT source_id FROM jobs WHERE memory_version = 'v2'").get()!.source_id, active.latest_revision);
 });

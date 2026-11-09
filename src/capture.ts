@@ -1,5 +1,4 @@
 import { createHash, randomBytes } from "node:crypto";
-import { readFileSync } from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
 import type { SessionEntry, SessionHeader } from "@earendil-works/pi-coding-agent";
 import {
@@ -10,7 +9,7 @@ import {
 } from "./identity.ts";
 import { applyContextEdits, normalizeEvidence, NORMALIZATION_POLICY_VERSION, type NormalizeLimits } from "./snapshot.ts";
 import { prunePrivacyRevoked, recordCapturePrivacy, recordSnapshot, sourceSuppressed } from "./store/db.ts";
-import { writeSnapshotFile } from "./store/snapshot-files.ts";
+import { readSnapshotText, writeSnapshotFile } from "./store/snapshot-files.ts";
 import { storeSizeBytes } from "./store/size.ts";
 
 /** Capture plain branch values immediately; never retain a pi context for queued work (§6.1). */
@@ -182,7 +181,7 @@ function captureBranch(
   const ancestorKeys = new Map<string, string>();
   for (const revision of parentRevisions) {
     try {
-      const prior = JSON.parse(readFileSync(revision.snapshot_path, "utf8")) as {
+      const prior = JSON.parse(readSnapshotText(revision.snapshot_path)) as {
         sessionKey: string;
         items: { entryId: string; role: string; toolCallId?: string; evidenceKey?: string }[];
       };
@@ -234,7 +233,7 @@ function captureBranch(
   for (const row of priorRows) {
     let previous: { items: typeof normalized.items };
     try {
-      previous = JSON.parse(readFileSync(row.snapshot_path, "utf8")) as { items: typeof normalized.items };
+      previous = JSON.parse(readSnapshotText(row.snapshot_path)) as { items: typeof normalized.items };
     } catch {
       // If an earlier selected snapshot is unavailable, the read side must
       // not assume its generated conclusions remain valid.

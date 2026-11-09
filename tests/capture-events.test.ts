@@ -9,6 +9,7 @@ import { defaultConfig, type MemoryVersion } from "../src/config.ts";
 import { openStateDb } from "../src/store/db.ts";
 import { claimDueExtractions, commitExtraction, enqueueExtraction } from "../src/store/jobs.ts";
 import { makeMockPi } from "./mock-pi.ts";
+import { readSnapshotText } from "../src/store/snapshot-files.ts";
 
 const savedAgentDir = process.env.PI_CODING_AGENT_DIR;
 afterEach(() => {
@@ -76,7 +77,7 @@ test("agent_settled writes an immutable snapshot and DB rows (R01); status repor
 
   const files = snapshotFiles(memoryRoot);
   assert.equal(files.length, 1, "one snapshot file");
-  const snapshot = JSON.parse(readFileSync(files[0]!, "utf8"));
+  const snapshot = JSON.parse(readSnapshotText(files[0]!));
   assert.equal(snapshot.schemaVersion, 1);
   assert.ok(snapshot.lineageKey);
   assert.equal(snapshot.items[0].text, "decided: TypeScript over Rust");
@@ -104,7 +105,7 @@ test("compaction and shutdown checkpoint branch state without waiting for a mode
   await mock.fire("session_shutdown", { type: "session_shutdown", reason: "exit" }, ctx);
   const files = snapshotFiles(memoryRoot);
   assert.equal(files.length, 2);
-  assert.ok(files.some((f) => readFileSync(f, "utf8").includes("last unscheduled decision")));
+  assert.ok(files.some((f) => readSnapshotText(f).includes("last unscheduled decision")));
 });
 
 for (const version of ["v1", "v2"] as const) test(`T08 ${version}: session_tree retires abandoned head and revokes stale decisions`, async (t) => {
@@ -138,8 +139,8 @@ for (const version of ["v1", "v2"] as const) test(`T08 ${version}: session_tree 
   const row = active.prepare(`SELECT r.snapshot_path FROM source_revisions r
     JOIN branch_heads h ON h.session_key = r.session_key AND h.branch_id = r.branch_id
     WHERE h.state = 'active' AND r.status = 'captured'`).get() as { snapshot_path: string };
-  assert.match(readFileSync(row.snapshot_path, "utf8"), /replacement decision: use Rust/);
-  assert.doesNotMatch(readFileSync(row.snapshot_path, "utf8"), /original decision/);
+  assert.match(readSnapshotText(row.snapshot_path), /replacement decision: use Rust/);
+  assert.doesNotMatch(readSnapshotText(row.snapshot_path), /original decision/);
   active.close();
 });
 
@@ -181,7 +182,7 @@ for (const version of ["v1", "v2"] as const) test(`T10 ${version}: context edit 
   await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
   const files = snapshotFiles(memoryRoot);
   assert.equal(files.length, 1, "privacy edit deletes the prior at-rest snapshot");
-  const contents = files.map((f) => JSON.parse(readFileSync(f, "utf8")));
+  const contents = files.map((f) => JSON.parse(readSnapshotText(f)));
   assert.ok(contents.some((s) => s.items.length === 0));
   assert.equal(readFileSync(sourceFile, "utf8"), "authoritative session bytes\n");
   const { DatabaseSync } = await import("node:sqlite");
@@ -296,19 +297,19 @@ test("a fork cannot recapture an ancestor entry after a privacy removal", async 
   await mock.fire("session_start", { type: "session_start" }, { ...ctx, sessionManager: fork });
   await mock.fire("agent_settled", { type: "agent_settled" }, { ...ctx, sessionManager: fork });
   for (const file of snapshotFiles(memoryRoot)) {
-    assert.ok(!readFileSync(file, "utf8").includes("removed across copies"), "revoked ancestor cannot be recaptured");
+    assert.ok(!readSnapshotText(file).includes("removed across copies"), "revoked ancestor cannot be recaptured");
   }
   parentEntries.push({ type: "context_edit", id: "e2", parentId: "e1", targetId: "u1",
     replacement: { content: [{ type: "text", text: "user-approved replacement" }] }, timestamp: "2024-01-01T00:00:00.000Z" });
   await mock.fire("session_start", { type: "session_start" }, ctx);
   await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
-  assert.ok(snapshotFiles(memoryRoot).some((file) => readFileSync(file, "utf8").includes("user-approved replacement")),
+  assert.ok(snapshotFiles(memoryRoot).some((file) => readSnapshotText(file).includes("user-approved replacement")),
     "an explicit replacement can restore approved content without restoring old raw text");
   await mock.fire("session_start", { type: "session_start" }, { ...ctx, sessionManager: fork });
   await mock.fire("agent_settled", { type: "agent_settled" }, { ...ctx, sessionManager: fork });
-  assert.ok(snapshotFiles(memoryRoot).some((file) => readFileSync(file, "utf8").includes("user-approved replacement")),
+  assert.ok(snapshotFiles(memoryRoot).some((file) => readSnapshotText(file).includes("user-approved replacement")),
     "replaying an older sibling edit cannot revoke a newer approved replacement");
-  assert.ok(snapshotFiles(memoryRoot).every((file) => !readFileSync(file, "utf8").includes("removed across copies")));
+  assert.ok(snapshotFiles(memoryRoot).every((file) => !readSnapshotText(file).includes("removed across copies")));
 });
 
 test("later same-branch privacy removal wins even when its timestamp goes backward", async (t) => {
@@ -325,7 +326,7 @@ test("later same-branch privacy removal wins even when its timestamp goes backwa
   entries.push({ type: "context_edit", id: "e2", parentId: "e1", targetId: "u1", replacement: null,
     timestamp: "2024-01-01T00:00:00.000Z" });
   await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
-  assert.ok(snapshotFiles(memoryRoot).every((file) => !readFileSync(file, "utf8").includes("first approved text")));
+  assert.ok(snapshotFiles(memoryRoot).every((file) => !readSnapshotText(file).includes("first approved text")));
   const { DatabaseSync } = await import("node:sqlite");
   const db = new DatabaseSync(join(memoryRoot, "state.sqlite"));
   assert.equal((db.prepare("SELECT allowed_hashes FROM privacy_edit_targets WHERE entry_id = 'u1'").get() as { allowed_hashes: string }).allowed_hashes, "[]");
@@ -368,7 +369,7 @@ test("privacy edit revokes copied ancestor evidence on previously selected branc
   await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
   const files = snapshotFiles(memoryRoot);
   assert.equal(files.length, 1, "both prior branches are erased from the extension store");
-  assert.ok(!readFileSync(files[0]!, "utf8").includes("a private preference"));
+  assert.ok(!readSnapshotText(files[0]!).includes("a private preference"));
   const { DatabaseSync } = await import("node:sqlite");
   const db = new DatabaseSync(join(memoryRoot, "state.sqlite"));
   const statuses = db.prepare("SELECT status FROM source_revisions").all() as { status: string }[];
@@ -385,7 +386,7 @@ for (const version of ["v1", "v2"] as const) test(`T07 ${version}: pre-compactio
     modelRegistry: { find: () => ({}), streamSimple: () => ({}) }, ui: { notify: () => {} } };
   await mock.fire("session_start", { type: "session_start" }, ctx);
   await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
-  const snapshot = JSON.parse(readFileSync(snapshotFiles(memoryRoot)[0]!, "utf8"));
+  const snapshot = JSON.parse(readSnapshotText(snapshotFiles(memoryRoot)[0]!));
   assert.deepEqual(snapshot.items.map((item: { sourceId: string }) => item.sourceId), ["u1"]);
   assert.equal(snapshot.omissionsManifest.count, 1);
   assert.deepEqual(snapshot.omissionsManifest.entryIds, ["c1"]);
@@ -410,7 +411,7 @@ test("fork copies the ancestor evidence key from an older retained parent revisi
     getHeader: () => ({ type: "session", id: "fork", parentSession: parent.getSessionFile(), timestamp: new Date(0).toISOString(), cwd }) };
   await mock.fire("session_start", { type: "session_start" }, { ...ctx, sessionManager: fork });
   await mock.fire("agent_settled", { type: "agent_settled" }, { ...ctx, sessionManager: fork });
-  const snapshots = snapshotFiles(memoryRoot).map((file) => JSON.parse(readFileSync(file, "utf8")));
+  const snapshots = snapshotFiles(memoryRoot).map((file) => JSON.parse(readSnapshotText(file)));
   const first = snapshots.find((s) => s.sessionPath === parent.getSessionFile() && s.leafId === "u1");
   const copied = snapshots.find((s) => s.sessionPath === fork.getSessionFile());
   assert.ok(first && copied);
@@ -431,7 +432,7 @@ for (const version of ["v1", "v2"] as const) test(`T09 ${version}: fork retains 
   await mock.fire("session_start", { type: "session_start" }, { ...ctx, sessionManager: fork });
   await mock.fire("agent_settled", { type: "agent_settled" }, { ...ctx, sessionManager: fork });
   const files = snapshotFiles(memoryRoot);
-  const snapshots = files.map((f) => JSON.parse(readFileSync(f, "utf8")));
+  const snapshots = files.map((f) => JSON.parse(readSnapshotText(f)));
   assert.equal(new Set(snapshots.map((s) => s.sessionKey)).size, 2);
   assert.equal(new Set(snapshots.map((s) => s.sourceId)).size, 2);
   const source = snapshots.find((s) => !s.parentSession);
@@ -462,7 +463,7 @@ test("fork retains the evidence key of a copied ancestor from a retired parent b
     getHeader: () => ({ type: "session", id: "fork", parentSession: original.getSessionFile(), timestamp: new Date(0).toISOString(), cwd }) };
   await mock.fire("session_start", { type: "session_start" }, { ...ctx, sessionManager: fork });
   await mock.fire("agent_settled", { type: "agent_settled" }, { ...ctx, sessionManager: fork });
-  const snapshots = snapshotFiles(memoryRoot).map((file) => JSON.parse(readFileSync(file, "utf8")));
+  const snapshots = snapshotFiles(memoryRoot).map((file) => JSON.parse(readSnapshotText(file)));
   const source = snapshots.find((s) => s.sessionPath === original.getSessionFile() && s.leafId === "u1");
   const copied = snapshots.find((s) => s.sessionPath === fork.getSessionFile());
   assert.ok(source && copied);
@@ -628,6 +629,6 @@ for (const replacement of [null, "sanitized decision"] as const) test(`at-cap ca
     [original, { ...userEntry("sibling", "safe sibling evidence"), parentId: "u1" }]) };
   await mock.fire("agent_settled", { type: "agent_settled" }, siblingCtx);
   assert.equal(snapshotFiles(memoryRoot).length, 1);
-  assert.doesNotMatch(readFileSync(snapshotFiles(memoryRoot)[0]!, "utf8"), /private decision to remove/);
+  assert.doesNotMatch(readSnapshotText(snapshotFiles(memoryRoot)[0]!), /private decision to remove/);
   await mock.fire("session_shutdown", { type: "session_shutdown" }, siblingCtx);
 });

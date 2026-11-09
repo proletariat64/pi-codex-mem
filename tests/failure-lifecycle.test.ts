@@ -13,6 +13,7 @@ import { ConsolidationScheduler } from "../src/pipeline/scheduler.ts";
 import { addNote } from "../src/control/notes.ts";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { makeMockPi, projectRequest } from "./mock-pi.ts";
+import { readSnapshotText } from "../src/store/snapshot-files.ts";
 
 function fixture(t: test.TestContext, version: MemoryVersion, options: { ephemeral?: boolean; flag?: string; configured?: boolean } = {}) {
   const base = fs.mkdtempSync(join(tmpdir(), "pi-failure-lifecycle-")); const cwd = join(base, "repo"); fs.mkdirSync(cwd);
@@ -114,7 +115,7 @@ for (const version of ["v1", "v2"] as const) {
     await f.mock.fire("agent_settled", {}, f.ctx);
     const db = new DatabaseSync(join(f.root, "state.sqlite"), { readOnly: true });
     const rows = db.prepare("SELECT snapshot_path FROM source_revisions").all(); assert.equal(rows.length, 1);
-    const snapshot = JSON.parse(fs.readFileSync(String(rows[0]!.snapshot_path), "utf8")); db.close();
+    const snapshot = JSON.parse(readSnapshotText(String(rows[0]!.snapshot_path))); db.close();
     assert.deepEqual(snapshot.items.map((item: { entryId: string }) => item.entryId), ["u1", "u2"]);
   });
 

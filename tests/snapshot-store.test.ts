@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { openStateDb, recordSnapshot, retireOtherHeads, type SnapshotRecord } from "../src/store/db.ts";
 import { writeSnapshotFile } from "../src/store/snapshot-files.ts";
 import type { WorkspaceIdentity } from "../src/identity.ts";
+import { readSnapshotText } from "../src/store/snapshot-files.ts";
 
 function makeRoot(t: test.TestContext): string {
   const dir = mkdtempSync(join(tmpdir(), "pi-memory-store-"));
@@ -55,7 +56,7 @@ test("writeSnapshotFile writes sources/<lineage>/<revision>.json with mode 0600"
   const root = makeRoot(t);
   const { path, hash } = writeSnapshotFile(root, "l".repeat(64), "v".repeat(64), { hello: "world" });
   assert.equal(path, join(root, "sources", "l".repeat(64), "v".repeat(64) + ".json"));
-  assert.equal(JSON.parse(readFileSync(path, "utf8")).hello, "world");
+  assert.equal(JSON.parse(readSnapshotText(path)).hello, "world");
   assert.match(hash, /^[0-9a-f]{64}$/);
   assert.equal(statSync(path).mode & 0o777, 0o600);
   assert.equal(statSync(join(root, "sources", "l".repeat(64))).mode & 0o777, 0o700);

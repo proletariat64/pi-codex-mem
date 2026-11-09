@@ -1,10 +1,11 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
 import { dirname, join, resolve, sep } from "node:path";
 import type { Context } from "@earendil-works/pi-ai";
 import type { ModelRef } from "../config.ts";
 import { selectEvidenceWithinBudget } from "../snapshot.ts";
+import { decodeSnapshot, snapshotContentHash } from "../store/snapshot-files.ts";
 import {
   commitExtraction, deferExtractionForBudget, failExtraction, nextLocalDayTime,
   reconcileModelCall, renewExtractionLease, reserveModelCall,
@@ -60,8 +61,6 @@ export type V1RunResult =
   | { status: "succeeded" | "no_output" | "retry_wait" | "cancelled" | "blocked" | "superseded" }
   | { status: "budget_deferred"; reason: string };
 
-const digest = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
-
 /** Only read the immutable, hashed source snapshot inside the owned store. */
 function readSource(input: V1RunInput): V2RequestInput {
   const row = input.db.prepare(
@@ -80,10 +79,12 @@ function readSource(input: V1RunInput): V2RequestInput {
     throw new Error("source_unavailable_for_version");
   }
   const bytes = readFileSync(path);
-  if (digest(bytes) !== row.snapshot_hash) throw new Error("source_unavailable_for_version");
+  // Integrity covers the decoded revision text, so stored encoding (legacy
+  // plaintext or gzip) never changes the revision's identity.
+  if (snapshotContentHash(bytes) !== row.snapshot_hash) throw new Error("source_unavailable_for_version");
   let parsed: unknown;
   try {
-    parsed = JSON.parse(bytes.toString("utf8")) as unknown;
+    parsed = JSON.parse(decodeSnapshot(bytes)) as unknown;
   } catch {
     throw new Error("source_unavailable_for_version");
   }

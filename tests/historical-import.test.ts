@@ -9,6 +9,7 @@ import { enrollHistoricalImport, planHistoricalImport } from "../src/historical-
 import { openStateDb } from "../src/store/db.ts";
 import memoryExtension from "../src/extension.ts";
 import { makeMockPi } from "./mock-pi.ts";
+import { readSnapshotText } from "../src/store/snapshot-files.ts";
 
 function sandbox(t: test.TestContext) {
   const root = mkdtempSync(join(tmpdir(), "pi-memory-import-"));
@@ -160,7 +161,7 @@ test("/memory import --run enrolls sanitized evidence without modifying the sour
   const sourceDir = join(agentDir, "memory", "sources");
   const snapshots = readdirSync(sourceDir).flatMap((dir) => readdirSync(join(sourceDir, dir)).map((name) => join(sourceDir, dir, name)));
   assert.equal(snapshots.length, 1);
-  const saved = JSON.parse(readFileSync(snapshots[0]!, "utf8"));
+  const saved = JSON.parse(readSnapshotText(snapshots[0]!));
   assert.equal(saved.items[0].text, "historic decision [REDACTED]");
   assert.equal(saved.items[0].origin, "unknown");
   assert.equal(readFileSync(file, "utf8"), original);
@@ -199,7 +200,7 @@ test("historical import applies the live input budget and reports omitted entry 
   const sourceDir = join(agentDir, "memory", "sources");
   const [lineage] = readdirSync(sourceDir);
   const [name] = readdirSync(join(sourceDir, lineage!));
-  const snapshot = JSON.parse(readFileSync(join(sourceDir, lineage!, name!), "utf8"));
+  const snapshot = JSON.parse(readSnapshotText(join(sourceDir, lineage!, name!)));
   assert.deepEqual(snapshot.items.map((item: { entryId: string }) => item.entryId), ["u2"]);
   assert.deepEqual(snapshot.omissionsManifest.entryIds, ["u1"]);
   assert.match(notifications.at(-1) ?? "", /imported:\s*1/);
@@ -221,7 +222,7 @@ test("/memory import reuses a captured active leaf instead of guessing the last 
   await mock.commands.get("memory")!.handler(`import ${file} --run --leaf a1`, ctx);
   const sourceDir = join(agentDir, "memory", "sources");
   const snapshots = readdirSync(sourceDir).flatMap((dir) => readdirSync(join(sourceDir, dir))
-    .map((name) => JSON.parse(readFileSync(join(sourceDir, dir, name), "utf8"))));
+    .map((name) => JSON.parse(readSnapshotText(join(sourceDir, dir, name)))));
   assert.ok(snapshots.some((snapshot) => snapshot.leafId === "a1" &&
     snapshot.items.some((item: { text: string }) => item.text === "first")));
   assert.ok(snapshots.every((snapshot) => snapshot.items.every((item: { text: string }) => item.text !== "physical last")));

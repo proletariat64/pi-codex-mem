@@ -7,6 +7,7 @@ import { planHistoricalImport, enrollHistoricalImport } from "../src/historical-
 import { openStateDb } from "../src/store/db.ts";
 import { forgetEvidence } from "../src/control/forget.ts";
 import { buildSessionJsonl, selectedLeafId } from "../eval/session.mjs";
+import { readSnapshotText } from "../src/store/snapshot-files.ts";
 
 const NOW = Date.UTC(2026, 8, 29);
 test("evaluation source JSONL imports the selected branch without the abandoned alternative", (t) => {
@@ -32,7 +33,7 @@ test("evaluation source JSONL imports the selected branch without the abandoned 
       limits: { itemBytes: 65_536, toolResultBytes: 8_192, totalBytes: 262_144 } });
     assert.deepEqual(enrolled, { imported: 1, skipped: [] });
     const revision = db.prepare("SELECT snapshot_path FROM source_revisions").get();
-    const snapshot = readFileSync(revision.snapshot_path, "utf8");
+    const snapshot = readSnapshotText(revision.snapshot_path);
     assert.match(snapshot, /Choose B instead/);
     assert.doesNotMatch(snapshot, /Discarded proposal A/);
   } finally { db.close(); }
@@ -103,6 +104,6 @@ test("evaluation tool evidence keeps tool-result role for production normalizati
       limits: { itemBytes: 65_536, toolResultBytes: 8_192, totalBytes: 262_144 } });
     assert.equal(result.imported, 1);
     const revision = db.prepare("SELECT snapshot_path FROM source_revisions").get();
-    assert.match(readFileSync(revision.snapshot_path, "utf8"), /Build ran but approval not recorded/);
+    assert.match(readSnapshotText(revision.snapshot_path), /Build ran but approval not recorded/);
   } finally { db.close(); }
 });

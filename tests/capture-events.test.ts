@@ -333,7 +333,7 @@ test("later same-branch privacy removal wins even when its timestamp goes backwa
   db.close();
 });
 
-test("budget-driven removal of previously captured evidence blocks derived views", async (t) => {
+test("input-budget rotation of older evidence keeps derived views readable", async (t) => {
   const { cwd, memoryRoot } = makeSandbox(t);
   const mock = makeMockPi(); memoryExtension(mock.pi);
   const entries: unknown[] = [userEntry("u1", "a".repeat(700))];
@@ -348,9 +348,14 @@ test("budget-driven removal of previously captured evidence blocks derived views
   await mock.fire("agent_settled", { type: "agent_settled" }, ctx);
   const { DatabaseSync } = await import("node:sqlite");
   const db = new DatabaseSync(join(memoryRoot, "state.sqlite"));
-  assert.equal((db.prepare("SELECT control_epoch FROM store_state").get() as { control_epoch: number }).control_epoch, 1);
-  assert.deepEqual((db.prepare("SELECT read_blocked FROM pipeline_state").all() as { read_blocked: number }[]).map((r) => r.read_blocked), [1, 1]);
+  assert.deepEqual((db.prepare("SELECT read_blocked FROM pipeline_state").all() as { read_blocked: number }[]).map((r) => r.read_blocked), [0, 0],
+    "a whole-branch revision trimmed by its own input budget is not removed evidence");
+  assert.deepEqual((db.prepare("SELECT status FROM source_revisions ORDER BY captured_at").all() as { status: string }[]).map((r) => r.status),
+    ["superseded", "captured"], "rotation does not revoke either revision");
+  const newest = db.prepare("SELECT snapshot_path FROM source_revisions ORDER BY captured_at DESC LIMIT 1").get() as { snapshot_path: string };
   db.close();
+  assert.ok(JSON.parse(readSnapshotText(newest.snapshot_path)).omissions.some((omission: { reason: string }) =>
+    omission.reason === "budget-exceeded"), "the fixture really rotated an item out of the budget");
 });
 
 test("privacy edit revokes copied ancestor evidence on previously selected branches", async (t) => {

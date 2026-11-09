@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openStateDb } from "../src/store/db.ts";
 import { captureSettledSession } from "../src/capture.ts";
+import { readSnapshotText } from "../src/store/snapshot-files.ts";
 
 /**
  * Pi appends a null-replacement context_edit when it abandons an empty or
@@ -29,7 +30,7 @@ function fixture(t: test.TestContext) {
   const reader = { getBranch: () => entries as never, getHeader: () => header as never,
     getSessionFile: () => file, getLeafId: () => String(entries.at(-1)!.id) };
   const capture = () => captureSettledSession({ root, agentDir, cwd, db, mode: "tui", reader });
-  return { root, db, entries, save, capture };
+  return { root, db, entries, save, capture, cwd, agentDir, reader };
 }
 
 function emptyAssistant(id: string, parentId: string) {
@@ -96,4 +97,28 @@ test("replacement edit on a text entry is still recorded as privacy policy", (t)
     .get() as { allowed_hashes: string } | undefined;
   assert.ok(row, "replacement keeps its allowed-hash policy");
   assert.ok(row!.allowed_hashes.length > 2);
+});
+
+test("input-budget rotation of older items is not removed evidence", (t) => {
+  const f = fixture(t);
+  const limits = { itemBytes: 64 * 1024, toolResultBytes: 8 * 1024, totalBytes: 4096 };
+  const capture = () => captureSettledSession({ root: f.root, agentDir: f.agentDir, cwd: f.cwd, db: f.db,
+    mode: "tui", reader: f.reader, limits });
+  assert.equal(capture().status, "captured");
+  // Grow the branch past the total budget so the oldest items rotate out.
+  for (let index = 0; index < 12; index++) {
+    f.entries.push({ type: "message", id: `u${index + 2}`, parentId: `u${index + 1}`,
+      timestamp: new Date().toISOString(),
+      message: { role: "user", content: [{ type: "text", text: `budget filler ${index} `.repeat(30) }], timestamp: Date.now() } });
+  }
+  f.save();
+  assert.equal(capture().status, "captured");
+  const omissions = f.db.prepare("SELECT COUNT(*) AS n FROM source_revisions").get()!.n;
+  assert.ok(Number(omissions) >= 2);
+  assert.equal(readBlocked(f.db).read_blocked, 0, "budget rotation must not fence the read views");
+  const newest = f.db.prepare("SELECT snapshot_path FROM source_revisions ORDER BY captured_at DESC LIMIT 1")
+    .get() as { snapshot_path: string };
+  const decoded = JSON.parse(readSnapshotText(newest.snapshot_path)) as { omissions: { reason: string }[] };
+  assert.ok(decoded.omissions.some((omission) => omission.reason === "budget-exceeded"),
+    "the fixture really dropped items for budget reasons");
 });

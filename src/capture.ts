@@ -230,6 +230,12 @@ function captureBranch(
   }
   const revokedSourceIds: string[] = [];
   let evidenceRemoved = false;
+  // A whole-branch revision is trimmed by the input budget as the session grows,
+  // so older items legitimately leave the projection. Only a disappearance the
+  // budget does not explain is removed evidence (§7.3, §10).
+  const budgetTrimmed = new Set(normalized.omissions
+    .filter((omission) => omission.reason === "budget-exceeded")
+    .map((omission) => omission.entryId));
   for (const row of priorRows) {
     let previous: { items: typeof normalized.items };
     try {
@@ -243,7 +249,8 @@ function captureBranch(
     }
     const now = (prior: typeof normalized.items[number]) => normalized.items.find((item) =>
       item.entryId === prior.entryId && item.role === prior.role && item.toolCallId === prior.toolCallId);
-    if (row.source_id === current?.source_id && previous.items.some((item) => now(item)?.text !== item.text)) {
+    if (row.source_id === current?.source_id && previous.items.some((item) =>
+      !budgetTrimmed.has(item.entryId) && now(item)?.text !== item.text)) {
       evidenceRemoved = true;
     }
     // Context edits are branch-local for projection, but revocation of

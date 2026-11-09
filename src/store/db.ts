@@ -3,6 +3,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, realpathSync,
 import { dirname, join, resolve, sep } from "node:path";
 import type { WorkspaceIdentity } from "../identity.ts";
 import type { MemoryVersion } from "../config.ts";
+import { NORMALIZATION_POLICY_VERSION } from "../snapshot.ts";
 
 /**
  * State store (spec §12.2 — ticket #3 subset: schema_migrations, workspaces,
@@ -29,6 +30,7 @@ export interface SnapshotRecord {
     snapshotPath: string;
     snapshotHash: string;
     sourceTime: number;
+    policyVersion?: string;
     contextEditHash?: string;
     privacyEditHash?: string;
   };
@@ -440,6 +442,8 @@ export function openStateDb(root: string, options?: { busyTimeoutMs?: number }):
         db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(15, Date.now());
       }
       if (current < 16) {
+        // Revision identity of the captured projection; also proven provenance
+        // for a snapshot whose payload no longer repeats the hash.
         const columns = new Set((db.prepare("PRAGMA table_info(source_revisions)").all() as { name: string }[]).map(column => column.name));
         if (!columns.has("context_edit_hash")) {
           db.exec("ALTER TABLE source_revisions ADD COLUMN context_edit_hash TEXT NOT NULL DEFAULT ''");
@@ -447,6 +451,7 @@ export function openStateDb(root: string, options?: { busyTimeoutMs?: number }):
         db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(16, Date.now());
       }
       if (current < 17) {
+        // Privacy-relevant edit subset used by the resume fence.
         const columns = new Set((db.prepare("PRAGMA table_info(source_revisions)").all() as { name: string }[]).map(column => column.name));
         if (!columns.has("privacy_edit_hash")) {
           db.exec("ALTER TABLE source_revisions ADD COLUMN privacy_edit_hash TEXT NOT NULL DEFAULT ''");
@@ -595,8 +600,12 @@ export function prunePrivacyRevoked(db: DatabaseSync, root: string): void {
 
 function blockBothViews(db: DatabaseSync, reason: string): void {
   db.exec("UPDATE store_state SET control_epoch = control_epoch + 1 WHERE singleton = 1");
-  db.prepare("UPDATE pipeline_state SET read_blocked = 1, block_reason = ?")
+  db.prepare("UPDATE pipeline_state SET read_blocked = 1, block_reason = ?, active_generation_id = NULL")
     .run(reason);
+  // A hard fence means the published output may cite removed evidence, so it
+  // must not come back into service when a later publish clears read_blocked.
+  // Revoking it also invalidates pins taken before the removal.
+  db.exec("UPDATE generations SET status = 'revoked' WHERE status = 'published'");
 }
 
 /**
@@ -646,11 +655,11 @@ export function blockUncapturedLeaf(db: DatabaseSync, sessionKey: string, leafId
   db.exec("BEGIN IMMEDIATE");
   try {
     const heads = db.prepare(
-      `SELECT h.latest_revision, r.status, r.privacy_edit_hash FROM branch_heads h
+      `SELECT h.latest_revision, r.privacy_edit_hash FROM branch_heads h
        LEFT JOIN source_revisions r ON r.source_id = h.latest_revision
        WHERE h.session_key = ? AND h.state = 'active' AND h.selected_leaf != ?`,
     ).all(sessionKey, leafId ?? "") as {
-      latest_revision: string | null; status: string | null; privacy_edit_hash: string | null;
+      latest_revision: string | null; privacy_edit_hash: string | null;
     }[];
     let changed = 0;
     for (const head of heads) {
@@ -754,8 +763,8 @@ export function recordSnapshot(db: DatabaseSync, rec: SnapshotRecord, root?: str
     db.prepare(
       `INSERT OR IGNORE INTO source_revisions
          (source_id, lineage_key, session_key, branch_id, revision_hash, snapshot_path,
-          snapshot_hash, leaf_id, source_time, status, policy_version, captured_at, context_edit_hash,
-          privacy_edit_hash)
+          snapshot_hash, leaf_id, source_time, status, policy_version, captured_at,
+          context_edit_hash, privacy_edit_hash)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'captured', ?, ?, ?, ?)`,
     ).run(
       rec.revision.sourceId,
@@ -767,7 +776,7 @@ export function recordSnapshot(db: DatabaseSync, rec: SnapshotRecord, root?: str
       rec.revision.snapshotHash,
       rec.revision.leafId,
       rec.revision.sourceTime,
-      "norm-1",
+      rec.revision.policyVersion ?? NORMALIZATION_POLICY_VERSION,
       rec.capturedAt,
       rec.revision.contextEditHash ?? "",
       rec.revision.privacyEditHash ?? "",
@@ -810,7 +819,10 @@ export function retireOtherHeads(db: DatabaseSync, sessionKey: string, activeBra
     db.prepare(
       "UPDATE branch_heads SET state = 'retired' WHERE session_key = ? AND branch_id != ? AND state = 'active'",
     ).run(sessionKey, activeBranchId);
-    // Retired heads must not supply current decisions to either pipeline.
+    // Retired heads must not supply current decisions to either pipeline. The
+    // abandonment is staleness, not deletion: the turns still exist in the
+    // session, so the published generation stays readable until it refreshes
+    // against the new branch (§5.3 keeps retirement conservative for selection).
     db.prepare(
       `UPDATE source_revisions SET status = 'superseded'
        WHERE session_key = ? AND branch_id != ? AND status = 'captured'`,

@@ -1,11 +1,11 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
 import { dirname, join, resolve, sep } from "node:path";
 import type { Context } from "@earendil-works/pi-ai";
 import type { ModelRef } from "../config.ts";
 import { selectEvidenceWithinBudget } from "../snapshot.ts";
-import { decodeSnapshot, snapshotContentHash } from "../store/snapshot-files.ts";
+import { decodeSnapshot } from "../store/snapshot-files.ts";
 import {
   commitExtraction, deferExtractionForBudget, failExtraction, nextLocalDayTime,
   reconcileModelCall, renewExtractionLease, reserveModelCall,
@@ -79,12 +79,15 @@ function readSource(input: V1RunInput): V2RequestInput {
     throw new Error("source_unavailable_for_version");
   }
   const bytes = readFileSync(path);
-  // Integrity covers the decoded revision text, so stored encoding (legacy
-  // plaintext or gzip) never changes the revision's identity.
-  if (snapshotContentHash(bytes) !== row.snapshot_hash) throw new Error("source_unavailable_for_version");
+  // Decode once: integrity and parsing both need the revision text, and every
+  // extraction job would otherwise gunzip the whole branch twice.
+  const text = decodeSnapshot(bytes);
+  if (createHash("sha256").update(text, "utf8").digest("hex") !== row.snapshot_hash) {
+    throw new Error("source_unavailable_for_version");
+  }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(decodeSnapshot(bytes)) as unknown;
+    parsed = JSON.parse(text) as unknown;
   } catch {
     throw new Error("source_unavailable_for_version");
   }

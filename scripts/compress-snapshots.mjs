@@ -10,7 +10,8 @@
  *
  * Usage: node scripts/compress-snapshots.mjs [--memory-root DIR] [--dry-run]
  */
-import { existsSync, lstatSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { closeSync, existsSync, fsyncSync, lstatSync, openSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -38,7 +39,14 @@ if (!existsSync(dbPath)) {
 // SELECT-only: never checkpoint, journal or otherwise write during migration.
 const db = new DatabaseSync(dbPath, { readOnly: true });
 const sources = resolve(join(root, "sources"));
-const rows = db.prepare("SELECT snapshot_path, snapshot_hash FROM source_revisions").all();
+// Revoked rows may lose their file at any moment; never resurrect one.
+const rows = db.prepare("SELECT source_id, snapshot_path, snapshot_hash FROM source_revisions WHERE status != 'privacy_revoked'").all();
+const sourcesLink = lstatSync(sources, { throwIfNoEntry: false });
+if (sourcesLink?.isSymbolicLink()) {
+  console.error("sources/ is a symlink; refusing to rewrite outside the owned store");
+  process.exit(1);
+}
+const realSources = existsSync(sources) ? realpathSync(sources) : sources;
 let converted = 0, skipped = 0, bytesBefore = 0, bytesAfter = 0, damaged = 0;
 
 try {
@@ -51,6 +59,10 @@ try {
       console.error(`symlink rejected: ${path}`);
       continue;
     }
+    if (!realpathSync(dirname(path)).startsWith(realSources + sep)) { damaged++; console.error(`outside store: ${path}`); continue; }
+    // A capture may have revoked this revision since the scan.
+    const status = db.prepare("SELECT status FROM source_revisions WHERE source_id = ?").get(row.source_id);
+    if (status?.status === "privacy_revoked") { skipped++; continue; }
     const before = readFileSync(path);
     let text;
     try {
@@ -69,9 +81,23 @@ try {
     const after = gzipSync(Buffer.from(text, "utf8"), { level: 9 });
     if (after.length >= before.length) { skipped++; continue; }
     if (!dryRun) {
-      const temp = join(dirname(path), `.compress-${process.pid}-${Date.now()}.tmp`);
-      writeFileSync(temp, after, { mode: 0o600, flag: "wx" });
-      renameSync(temp, path);
+      // Same temp naming and durability as writeSnapshotFile so an interrupted
+      // run is swept later and a crash cannot expose a truncated snapshot.
+      const temp = join(dirname(path), `.snapshot-${randomBytes(12).toString("hex")}.tmp`);
+      try {
+        writeFileSync(temp, after, { mode: 0o600, flag: "wx" });
+        const fd = openSync(temp, "r");
+        try { fsyncSync(fd); } finally { closeSync(fd); }
+        renameSync(temp, path);
+        const dir = openSync(dirname(path), "r");
+        try { fsyncSync(dir); } finally { closeSync(dir); }
+      } catch (error) {
+        damaged += 1;
+        bytesBefore -= before.length;
+        converted -= 1;
+        console.error(`rewrite failed, left untouched: ${path}: ${error.message}`);
+        continue;
+      }
     }
     converted++;
     bytesBefore += before.length;

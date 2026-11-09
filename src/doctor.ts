@@ -229,8 +229,9 @@ export function runDoctor(input: DoctorInput): DoctorReport {
     });
   }
   const ok = probes.every((probe) => probe.status !== "fail");
-  const configuredVersion = input.config.status === "ok" || input.config.status === "created"
-    ? input.config.config.version : "v1";
+  const loaded = input.config.status === "ok" || input.config.status === "created" ? input.config.config : null;
+  const configuredVersion = loaded?.version ?? "v1";
+  const generationEnabled = !loaded || (loaded.generate && loaded.enabled);
   return {
     ok,
     probes,
@@ -240,7 +241,7 @@ export function runDoctor(input: DoctorInput): DoctorReport {
       return [
         `pi-memory doctor — environment ${environmentOk ? "OK" : "BLOCKED (see failures)"}; selected memory ${memoryState}`,
         ...probes.map((probe) => `${icon[probe.status]} ${probe.id}: ${probe.detail}`),
-        `next: ${nextAction(probes, input.memory, memoryState, configuredVersion)}`,
+        `next: ${nextAction(probes, input.memory, memoryState, configuredVersion, generationEnabled)}`,
       ];
     },
   };
@@ -248,22 +249,34 @@ export function runDoctor(input: DoctorInput): DoctorReport {
 
 /** One actionable sentence: what the user can do now, not which internal state is set. */
 function nextAction(probes: DoctorProbe[], memory: MemoryDiagnostics | undefined, memoryState: string,
-  version: string): string {
+  version: string, generationEnabled = true): string {
   const failing = probes.filter((probe) => probe.status === "fail");
   const environmentFailure = failing.find((probe) => probe.id !== "memory" && probe.id !== "host-events");
-  if (environmentFailure) return `fix the ${environmentFailure.id} failure above; memory stays off until it is healthy`;
-  if (failing.some((probe) => probe.id === "host-events")) return "send one prompt and let it finish, then run /memory doctor again";
+  if (environmentFailure) {
+    return environmentFailure.id.startsWith("model:")
+      ? `configure ${environmentFailure.id} above; capture and existing memory keep working, but nothing new is generated`
+      : `fix the ${environmentFailure.id} failure above; memory stays off until it is healthy`;
+  }
+  const hostEvents = failing.find((probe) => probe.id === "host-events");
+  if (hostEvents) {
+    return hostEvents.detail.includes("never dispatched")
+      ? "this host never dispatches the required events; memory cannot work here -- report the host-events failure"
+      : "send one prompt and let it finish, then run /memory doctor again";
+  }
   if (!memory) return "nothing to judge yet; finish one session so capture and publication can report";
   if (!memory.selectedReadable) {
     return memory.selectedInvalidated
       ? `memory is fenced until the next publication; run /memory run --version ${version} --now to rebuild it`
       : `no published memory yet; leave a session idle or run /memory run --version ${version} --now`;
   }
+  const refresh = generationEnabled
+    ? `memory refreshes automatically -- run /memory run --version ${version} --now to refresh sooner`
+    : `generation is disabled, so it will not refresh until you enable it and run /memory run --version ${version} --now`;
   if (memory.pendingSources > 0) {
-    return `usable now; ${memory.pendingSources} newer capture${memory.pendingSources === 1 ? "" : "s"} pending, memory refreshes automatically -- run /memory run --version ${version} --now to refresh sooner`;
+    return `usable now; ${memory.pendingSources} newer capture${memory.pendingSources === 1 ? "" : "s"} pending, ${refresh}`;
   }
   if (memory.selectedStale) {
-    return `usable now; the branch moved on (${memory.staleReason ?? "stale projection"}), memory refreshes automatically -- run /memory run --version ${version} --now to refresh sooner`;
+    return `usable now; the branch moved on (${memory.staleReason ?? "stale projection"}), ${refresh}`;
   }
-  return `nothing to do; ${memoryState} affects the next eligible run`;
+  return "nothing to do; memory is up to date and refreshes on the next eligible run";
 }

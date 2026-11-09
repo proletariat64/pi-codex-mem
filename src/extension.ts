@@ -589,14 +589,15 @@ export default function (pi: ExtensionAPI) {
             const key = computeSessionKey(getAgentDir(), file, header.id);
             const heads = state.db.prepare("SELECT selected_leaf FROM branch_heads WHERE session_key = ? AND state = 'active'")
               .all(key) as { selected_leaf: string }[];
-            const ancestry = new Set(ctx.sessionManager.getBranch().map((entry) => entry.id));
+            // One snapshot for both checks: they must agree about the branch.
+            const branch = ctx.sessionManager.getBranch();
+            const ancestry = new Set(branch.map((entry) => entry.id));
             if (heads.some((head) => !ancestry.has(head.selected_leaf))) {
               retireOtherHeads(state.db, key, "");
             } else if (heads.some((head) => head.selected_leaf !== ctx.sessionManager.getLeafId())) {
               // The old leaf is still an ancestor, but appended turns or edits
               // are not yet reflected in its captured projection. Only an
               // uncaptured edit can still be revoking text.
-              const branch = ctx.sessionManager.getBranch();
               blockUncapturedLeaf(state.db, key, ctx.sessionManager.getLeafId(),
                 privacyEditHashOf(branch), branch.some((entry) => entry.type === "context_edit"));
             }

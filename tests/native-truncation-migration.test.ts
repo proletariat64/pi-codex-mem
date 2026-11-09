@@ -28,8 +28,17 @@ function legacyStore(t: test.TestContext) {
   const schema = db.prepare("SELECT sql FROM sqlite_master WHERE name = 'extractions'").get()!.sql as string;
   const triggers = db.prepare("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND sql LIKE '%extractions%'").all();
   db.exec("BEGIN");
-  // Quote the identifier so a fixture name can never alter the statement.
-  for (const trigger of triggers) db.exec(`DROP TRIGGER "${String(trigger.name).replaceAll('"', '""')}"`);
+  // Static statements only: an unexpected trigger means the fixture drifted.
+  const dropTrigger: Readonly<Record<string, string>> = {
+    generation_source_version: 'DROP TRIGGER IF EXISTS "generation_source_version"',
+    generation_source_version_update: 'DROP TRIGGER IF EXISTS "generation_source_version_update"',
+    pipeline_generation_version: 'DROP TRIGGER IF EXISTS "pipeline_generation_version"',
+  };
+  for (const trigger of triggers) {
+    const statement = dropTrigger[String(trigger.name)];
+    if (!statement) throw new Error(`unexpected trigger in fixture: ${String(trigger.name)}`);
+    db.exec(statement);
+  }
   db.exec(schema.replace(/CREATE TABLE\s+(?:"extractions"|extractions)/i, "CREATE TABLE legacy_extractions")
     .replace("CHECK (accepted_bytes >= 0)", "CHECK (accepted_bytes BETWEEN 0 AND 9000)"));
   db.exec("INSERT INTO legacy_extractions SELECT * FROM extractions; DROP TABLE extractions; ALTER TABLE legacy_extractions RENAME TO extractions");

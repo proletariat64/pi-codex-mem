@@ -37,8 +37,9 @@ export function persistentDiagnostics(db: DatabaseSync, config: MemoryConfig, no
     };
   let budgetWait = false;
   for (const version of ["v1", "v2"] as const) {
-    const pipeline = db.prepare("SELECT read_blocked, block_reason, stale_reason FROM pipeline_state WHERE memory_version = ?")
-      .get(version) as { read_blocked: number; block_reason: string | null; stale_reason: string | null } | undefined;
+    const pipeline = db.prepare("SELECT read_blocked, block_reason, stale_reason, stale_since FROM pipeline_state WHERE memory_version = ?")
+      .get(version) as { read_blocked: number; block_reason: string | null; stale_reason: string | null;
+        stale_since: number | null } | undefined;
     const generation = getPublishedGeneration(db, version, now, {
       maxUnusedDays: config.schedule.maxUnusedDays,
       extractionPromptHash: version === "v1" ? v1PromptHash() : v2PromptHash(),
@@ -52,7 +53,7 @@ export function persistentDiagnostics(db: DatabaseSync, config: MemoryConfig, no
     if (version === config.version) {
       selectedReadable = readable;
       selectedInvalidated = Boolean(pipeline?.read_blocked);
-      selectedStale = Boolean(pipeline?.stale_reason);
+      selectedStale = readable && Boolean(pipeline?.stale_reason);
       staleReason = pipeline?.stale_reason ?? null;
       pendingSources = readable ? Number(newer.n) : 0;
     }
@@ -103,8 +104,11 @@ export function persistentDiagnostics(db: DatabaseSync, config: MemoryConfig, no
     if (pipeline?.stale_reason) {
       // A hard fence wins: never claim reads continue while read_blocked is set.
       const pendingCount = Number(newer.n);
-      lines.push(`${version} staleness: ${pipeline.stale_reason}; ${pendingCount} newer capture${pendingCount === 1 ? "" : "s"} await consolidation`
-        + (pipeline.read_blocked ? "" : "; reading continues"));
+      const since = Number(pipeline.stale_since ?? 0);
+      const age = since > 0 ? ` since ${new Date(since).toISOString()}` : "";
+      lines.push(`${version} staleness: ${pipeline.stale_reason}${age}`
+        + (readable ? `; ${pendingCount} newer capture${pendingCount === 1 ? "" : "s"} await consolidation` : "")
+        + (readable && !pipeline.read_blocked ? "; reading continues" : ""));
     }
     const notes = db.prepare(`SELECT COUNT(*) AS saved, COALESCE(SUM(CASE WHEN EXISTS (
       SELECT 1 FROM note_applications a WHERE a.note_id = n.note_id AND a.note_hash = n.text_hash

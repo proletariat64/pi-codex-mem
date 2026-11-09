@@ -43,14 +43,16 @@ export function contextEditHashOf(entries: readonly SessionEntry[]): string {
   return hash(JSON.stringify(entries.filter((entry) => entry.type === "context_edit")));
 }
 
-/** Text a replacement still exports; empty content is a removal, not a decision to keep. */
-function replacementText(replacement: unknown): string {
-  if (replacement === null || typeof replacement !== "object") return "";
+/**
+ * Does a replacement still export anything? Empty content is a removal, not a
+ * decision to keep; any block (text, media or tool call) counts as content so
+ * this matches the allowed-hash policy capture applies to the same edit.
+ */
+function replacementHasContent(replacement: unknown): boolean {
+  if (replacement === null || typeof replacement !== "object") return false;
   const content = (replacement as { content?: unknown }).content;
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  return content.map((block) => block && typeof block === "object" && typeof (block as { text?: unknown }).text === "string"
-    ? (block as { text: string }).text : "").join("");
+  if (typeof content === "string") return content.trim() !== "";
+  return Array.isArray(content) && content.length > 0;
 }
 
 /**
@@ -80,7 +82,7 @@ export function privacyEditHashOf(entries: readonly SessionEntry[], limits?: Nor
   }
   const relevant: { targetId: string; replacement: unknown }[] = [];
   for (const [targetId, replacement] of [...latest].sort(([left], [right]) => left.localeCompare(right))) {
-    if (replacementText(replacement) !== "") relevant.push({ targetId, replacement });
+    if (replacementHasContent(replacement)) relevant.push({ targetId, replacement });
     else if (entryCarriesEvidence(entries, targetId, limits)) relevant.push({ targetId, replacement });
   }
   return hash(JSON.stringify(relevant));
@@ -373,6 +375,7 @@ function captureBranch(
         snapshotPath: saved.path,
         snapshotHash: saved.hash,
         sourceTime,
+        policyVersion: NORMALIZATION_POLICY_VERSION,
         contextEditHash,
         privacyEditHash,
       },

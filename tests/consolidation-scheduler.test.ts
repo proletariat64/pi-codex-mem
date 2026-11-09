@@ -202,3 +202,13 @@ test("pruning recovery copies below the store cap continues pending consolidatio
   assert.equal(readFileSync(join(after.directory, "memory_summary.md"), "utf8"), MINIMAL_V1_SUMMARY);
   assert.equal(scheduled.filter(item => !item.cancelled).length, 0);
 });
+
+test("another process's active heartbeat must not stall publication (hotfix)", async (t) => {
+  const { root, db, scheduler } = fixture(t);
+  // A foreign pi session is mid-turn; its 180 s heartbeat lease is live.
+  db.prepare(`INSERT INTO process_activity (owner_id, session_key, activity_state, expires_at)
+    VALUES (?, ?, 'active', ?)`).run("foreign-process", "foreign-session", NOW + 180_000);
+  assert.deepEqual(await scheduler.runPass(), [{ status: "published" }],
+    "the consolidation lease, not a foreign heartbeat, decides contention");
+  assert.ok(getPublishedGeneration(db, "v1", NOW), "the generation is readable while the other session keeps working");
+});

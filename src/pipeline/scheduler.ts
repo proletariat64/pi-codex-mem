@@ -103,9 +103,6 @@ export class ConsolidationScheduler {
       const leased = this.options.db.prepare(
         "SELECT MIN(lease_expires_at) AS expiry FROM jobs WHERE kind = 'consolidate' AND status = 'leased'",
       ).get() as { expiry: number | null };
-      const busy = this.options.db.prepare(
-        "SELECT MAX(expires_at) AS expiry FROM process_activity WHERE activity_state = 'active' AND expires_at > ?",
-      ).get(now) as { expiry: number | null };
       let next: number | null = null;
       for (const version of targetVersions(config)) {
         const snapshot = this.snapshot(config, version);
@@ -120,7 +117,7 @@ export class ConsolidationScheduler {
           JSON.stringify(["consolidate", version, promptHash, this.inputRevision(config, version)])) as { due_at: number | null };
         let due: number | null = null;
         if (this.checkedKeys.get(version) !== key || row.due_at !== null) {
-          due = Math.max(now, row.due_at ?? now, leased.expiry ?? now, busy.expiry ?? now);
+          due = Math.max(now, row.due_at ?? now, leased.expiry ?? now);
         }
         if (snapshot.retentionDeadline !== null && snapshot.retentionDeadline > now) {
           due = due === null ? snapshot.retentionDeadline : Math.min(due, snapshot.retentionDeadline);
@@ -178,8 +175,11 @@ export class ConsolidationScheduler {
   private async run(config: MemoryConfig, version: MemoryVersion, retryBlocked: boolean): Promise<ConsolidationPassResult[]> {
     const clock = this.options.now;
     const db = this.options.db;
-    const busy = db.prepare("SELECT 1 FROM process_activity WHERE activity_state = 'active' AND expires_at > ? LIMIT 1").get(clock());
-    if (busy) return [];
+    // Cross-process safety is the consolidation lease plus the control-epoch
+    // fence rechecked before publish; a heartbeat from another pi process only
+    // says that process is mid-turn. Gating publication on it stalled memory
+    // indefinitely whenever any other session was active, so the claim below
+    // decides contention instead.
     // limits.maxStoreBytes pauses generation writes at the configured cap and
     // instead prunes old recovery copies; without a gate the store grows until
     // filesystem writes fail. Recheck capacity after pruning so a successful

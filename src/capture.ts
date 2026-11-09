@@ -125,13 +125,27 @@ function captureBranch(
     normalized.omissions.push({ entryId: item.entryId, reason: "privacy-edit-target-excluded" });
     return false;
   });
+  // Pi appends a null-replacement context_edit when it abandons a failed or
+  // overflowing attempt. That is recovery bookkeeping, not a user privacy
+  // decision, and it must not fence the read views (§7.1, §10). An edit only
+  // carries privacy weight when the projection could export text for it.
+  const evidenceById = new Map<string, boolean>();
+  const carriesEvidence = (entryId: string): boolean => {
+    const cached = evidenceById.get(entryId);
+    if (cached !== undefined) return cached;
+    const entry = branch.find((candidate) => candidate.id === entryId);
+    const decided = entry !== undefined && entry.type !== "context_edit" &&
+      normalizeEvidence([entry], { limits: input.limits }).items.length > 0;
+    evidenceById.set(entryId, decided);
+    return decided;
+  };
   const privacyTargets: { entryId: string; editId: string; editTime: number; allowedHashes: string }[] = [];
   for (const [entryId, edit] of latestEdits) {
     if (!mayApplyEdit(entryId)) continue;
-    privacyTargets.push({
-      entryId, editId: edit.id, editTime: edit.time,
-      allowedHashes: JSON.stringify(normalized.items.filter((item) => item.entryId === entryId).map(itemHash)),
-    });
+    const allowedHashes = JSON.stringify(normalized.items.filter((item) => item.entryId === entryId).map(itemHash));
+    // Nothing exported then, nothing exported now: no earlier text can reappear.
+    if (allowedHashes === "[]" && !carriesEvidence(entryId)) continue;
+    privacyTargets.push({ entryId, editId: edit.id, editTime: edit.time, allowedHashes });
   }
   const revocableTargetIds = new Set(privacyTargets.map((target) => target.entryId));
   const privacyPolicyChanged = privacyTargets.some((target) =>

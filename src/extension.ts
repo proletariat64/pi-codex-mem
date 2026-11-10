@@ -41,6 +41,7 @@ import { prepareEvidencePin, type MemoryReadPin } from "./read/evidence.ts";
 import { ForegroundMemory, type PinAcquisition } from "./read/foreground.ts";
 import { cleanupGenerations } from "./pipeline/publish.ts";
 import { createMemoryTools } from "./read/tools.ts";
+import { savedNotesReader } from "./read/notes.ts";
 import { persistentDiagnostics, type MemoryDiagnostics } from "./diagnostics.ts";
 import { Type } from "typebox";
 import { addNote, cleanupRevokedNotes, forgetNote, type NoteProvenance } from "./control/notes.ts";
@@ -83,7 +84,7 @@ function importWords(text: string): string[] | null {
 }
 
 /** The independent pi memory root (spec §5.1). Never Codex or Claude-mem data. */
-function resolveMemoryRoot(): string {
+function configuredMemoryRoot(): string {
   return join(getAgentDir(), "memory");
 }
 
@@ -146,6 +147,9 @@ interface ExplicitMemoryRun {
 }
 
 export default function (pi: ExtensionAPI) {
+  // Keep filesystem ownership aligned with cached database handles for this instance.
+  const memoryRoot = configuredMemoryRoot();
+  const resolveMemoryRoot = () => memoryRoot;
   const state: RuntimeState = {
     compat: null,
     config: null,
@@ -189,11 +193,40 @@ export default function (pi: ExtensionAPI) {
         preadmitted = canReadMemory(facts) && canAccessMemoryStore(root) &&
           recheckEligibilityWithWorkspace(config.config, ctx.cwd, facts, canReadMemory);
       }
+      const unavailable = (reason: string) => ({
+        content: [{ type: "text" as const, text: `Memory unavailable: ${reason}.` }],
+        details: { items: [], truncated: false, cursor: null, error: "memory_unavailable", reason },
+      });
+      const parameters = args && typeof args === "object" && !Array.isArray(args) ? args as Record<string, unknown> : {};
+      const path = typeof parameters.path === "string" ? parameters.path.replace(/^(?:\.\/)+/, "").replace(/\/+$/, "") : undefined;
+      const notesRequested = path === "notes" || path?.startsWith("notes/");
+      const defaultPath = path === undefined || path === "" || path === ".";
+      if (notesRequested || (!foreground.pin && defaultPath)) {
+        // Explicit saved evidence does not depend on carrier projection, an active run,
+        // or model-generated publication. Confirmed host incompatibility, read-disable,
+        // exclusions and clear still apply, even without a foreground run.
+        const allowed = state.compat?.supported !== false && config.status === "ok" &&
+          !rootPointsIntoForeignMemory(root) && !legacyLockPath(root) &&
+          !existsSync(join(root, "clear.pending")) && recheckEligibilityWithWorkspace(config.config, ctx.cwd,
+            { config: config.config, flag: flagMode(), workspaceExcluded: false }, canReadMemory);
+        if (!allowed || config.status !== "ok") return unavailable("read_disabled");
+        const version = config.config.version;
+        try {
+          return await withReaderDb<ReturnType<typeof tool.execute>>(db => {
+            if (!notesRequested && !db.prepare("SELECT 1 FROM notes WHERE status = 'active' LIMIT 1").get()) {
+              return Promise.resolve(unavailable(foreground.diagnostic.reason));
+            }
+            const reader = savedNotesReader({ root, db, memoryVersion: version });
+            const notesTool = createMemoryTools({ root, db: () => db, pin: () => reader, consumer: () => null })
+              .find(candidate => candidate.name === tool.name)!;
+            return notesTool.execute(id, { ...parameters, ...(defaultPath && tool.name === "pi_memory_list" ? { path: "notes" } : {}) }, signal);
+          }, Promise.resolve(unavailable("saved_notes_unavailable")));
+        } catch { return unavailable("saved_notes_unavailable"); }
+      }
       return foreground.admitToolCall({
         preadmitted, cwd: ctx.cwd,
         execute: () => tool.execute(id, args, signal),
-        unavailable: () => ({ content: [{ type: "text" as const, text: "Memory unavailable." }],
-          details: { items: [], truncated: false, cursor: null, error: "memory_unavailable" as const } }),
+        unavailable: () => unavailable(preadmitted ? foreground.diagnostic.reason : "read_disabled"),
         isIntegrityError: output => output.details?.error === "memory_unavailable",
       });
     } });

@@ -11,14 +11,19 @@ export interface MemoryItem {
   sourceUnavailable?: boolean;
   retainedRanges?: { startLine: number; endLine: number }[];
   entryType?: "file" | "directory"; matchLineNumber?: number; matchedQueries?: string[];
+  noteId?: string; scope?: string; action?: "remember" | "correct"; createdAt?: number;
 }
 export interface MemoryToolDetails {
   memoryVersion?: string; generationId?: string; items: MemoryItem[];
-  truncated: boolean; cursor: string | null; error?: string; nextStartLine?: number | null;
+  truncated: boolean; cursor: string | null; error?: string; reason?: string; nextStartLine?: number | null;
+  source?: "saved_notes";
 }
 export interface MemoryConsumer { consumerSession: string; runId: string }
+export type MemoryEvidenceReader = Pick<MemoryReadPin, "memoryVersion" | "generationId" | "withEvidence"> & {
+  source?: "saved_notes";
+};
 export interface MemoryToolsInput {
-  root: string; db: () => DatabaseSync | null; pin: () => MemoryReadPin | null;
+  root: string; db: () => DatabaseSync | null; pin: () => MemoryEvidenceReader | null;
   consumer: () => MemoryConsumer | null; now?: () => number; maxUnusedDays?: () => number;
 }
 // Pi response envelope ceiling: pagination and excerpts remain bounded even when
@@ -48,16 +53,15 @@ function result(details: MemoryToolDetails) {
 /** All data access stays within a host-selected immutable pin, revalidated at each boundary. */
 export function createMemoryTools(input: MemoryToolsInput): AgentTool<TSchema, MemoryToolDetails>[] {
   const tool = (name: string, description: string, parameters: TSchema,
-    operation: (args: Record<string, unknown>, pin: MemoryReadPin, access: EvidenceAccess) => MemoryToolDetails): AgentTool<TSchema, MemoryToolDetails> => ({
+    operation: (args: Record<string, unknown>, pin: MemoryEvidenceReader, access: EvidenceAccess) => MemoryToolDetails): AgentTool<TSchema, MemoryToolDetails> => ({
     name, label: name, description, parameters,
     async execute(_id, raw, signal) {
-      let pin: MemoryReadPin | null = null;
+      let pin: MemoryEvidenceReader | null = null;
       try {
         if (signal?.aborted) throw new Error("aborted");
         pin = input.pin();
         if (!pin) {
           input.db();
-          input.now?.() ?? Date.now();
           throw new Error("memory_unavailable");
         }
         return pin.withEvidence({ root: input.root, db: input.db, now: input.now, maxUnusedDays: input.maxUnusedDays },
@@ -65,6 +69,7 @@ export function createMemoryTools(input: MemoryToolsInput): AgentTool<TSchema, M
             if (!raw || typeof raw !== "object" || Array.isArray(raw) || "version" in raw || "memoryVersion" in raw || "generationId" in raw) throw new Error("invalid_arguments");
             const args = raw as Record<string, unknown>;
             const details = operation(args.path === undefined ? args : { ...args, path: access.normalizePath(args.path) }, pin!, access);
+            if (pin!.source) details.source = pin!.source;
             const first = details.items[0];
             const last = details.items[details.items.length - 1];
             const detailUse = name === "pi_memory_read" && first && last
@@ -81,14 +86,14 @@ export function createMemoryTools(input: MemoryToolsInput): AgentTool<TSchema, M
             };
           }, input.consumer);
       } catch (error) {
-        const known = ["memory_unavailable", "path_not_available_for_version", "invalid_arguments", "invalid_cursor", "response_too_large", "aborted", "line_offset_exceeds_file_length"];
+        const known = ["saved_notes_changed", "saved_note_integrity", "memory_unavailable", "path_not_available_for_version", "invalid_arguments", "invalid_cursor", "response_too_large", "aborted", "line_offset_exceeds_file_length"];
         const message = (error as Error).message;
         return result({ ...(pin ? { memoryVersion: pin.memoryVersion, generationId: pin.generationId } : {}),
           items: [], truncated: false, cursor: null, error: known.includes(message) ? message : "memory_unavailable" });
       }
     },
   });
-  const page = (args: Record<string, unknown>, pin: MemoryReadPin, fingerprint: string, items: MemoryItem[], limit: number): MemoryToolDetails => {
+  const page = (args: Record<string, unknown>, pin: MemoryEvidenceReader, fingerprint: string, items: MemoryItem[], limit: number): MemoryToolDetails => {
     const queryHash = hash(fingerprint);
     let offset = 0;
     if (args.cursor !== undefined) {
@@ -100,7 +105,8 @@ export function createMemoryTools(input: MemoryToolsInput): AgentTool<TSchema, M
         offset = cursor.offset;
       } catch { throw new Error("invalid_cursor"); }
     }
-    const output: MemoryToolDetails = { memoryVersion: pin.memoryVersion, generationId: pin.generationId, items: [], truncated: false, cursor: null };
+    const output: MemoryToolDetails = { memoryVersion: pin.memoryVersion, generationId: pin.generationId,
+      ...(pin.source ? { source: pin.source } : {}), items: [], truncated: false, cursor: null };
     const update = () => { output.truncated = offset < items.length || output.items.some(item => item.truncated || item.sourceIdsTruncated);
       output.cursor = offset < items.length ? Buffer.from(JSON.stringify({ memoryVersion: pin.memoryVersion, generationId: pin.generationId, queryHash, offset })).toString("base64url") : null; };
     update();
@@ -112,7 +118,7 @@ export function createMemoryTools(input: MemoryToolsInput): AgentTool<TSchema, M
     return output;
   };
   const pathArg = Type.Optional(Type.String({ maxLength: 512 }));
-  return [tool("pi_memory_search", "Search pinned evidence with literal or alphanumeric-normalized queries, same-line or minimal multi-line matches and context. Results are paginated under the host response byte ceiling.", Type.Object({
+  return [tool("pi_memory_search", "Search memory evidence; path 'notes' searches saved user notes without waiting for consolidation. Notes are user evidence; later corrections supersede earlier conflicting notes. Other paths search published evidence. Use literal or alphanumeric-normalized queries, same-line or minimal multi-line matches and context. Results are paginated under the host response byte ceiling.", Type.Object({
     queries: Type.Array(Type.String({ minLength: 1, maxLength: 1024 }), { minItems: 1, maxItems: 8 }), path: pathArg,
     match: Type.Union([Type.Literal("any"), Type.Literal("all"), Type.Literal("all_on_same_line"), Type.Literal("all_within_lines")]),
     lineCount: Type.Optional(Type.Integer({ minimum: 1 })), contextLines: Type.Optional(Type.Integer({ minimum: 0 })),
@@ -189,7 +195,7 @@ export function createMemoryTools(input: MemoryToolsInput): AgentTool<TSchema, M
     }
     return page(args, pin, JSON.stringify(["search", args.path ?? ".", rawQueries, args.match, args.caseSensitive ?? true, args.normalized ?? false, window, context]), items, Math.min(boundedInteger(args.maxResults, 200, Number.MAX_SAFE_INTEGER), 200));
   }),
-  tool("pi_memory_list", "List immediate reader-allowed child files and directories in the pinned generation. The host byte ceiling may paginate before the 2000-entry limit.", Type.Object({
+  tool("pi_memory_list", "List memory files and directories. Path 'notes' lists saved user notes independently of consolidation; missing publications default to saved notes. The host byte ceiling may paginate before the 2000-entry limit.", Type.Object({
     path: pathArg, limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 2000 })), cursor: Type.Optional(Type.String()),
   }, { additionalProperties: false }), (args, pin, access) => {
     const scope = args.path ?? ".";
@@ -209,7 +215,7 @@ export function createMemoryTools(input: MemoryToolsInput): AgentTool<TSchema, M
     const items = [...entries.values()].sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
     return page(args, pin, JSON.stringify(["list", scope]), items, Math.min(boundedInteger(args.limit, 2000, Number.MAX_SAFE_INTEGER), 2000));
   }),
-  tool("pi_memory_read", "Read allowed pinned evidence from a 1-based line offset, with optional line and token limits. startLine aliases lineOffset. The host byte ceiling can truncate before the token limit; nextStartLine continues remaining lines.", Type.Object({
+  tool("pi_memory_read", "Read memory evidence, including saved notes at notes/<note-id>.md without a publication, from a 1-based line offset, with optional line and token limits. startLine aliases lineOffset. The host byte ceiling can truncate before the token limit; nextStartLine continues remaining lines.", Type.Object({
     path: Type.String({ minLength: 1, maxLength: 512 }), startLine: Type.Optional(Type.Integer({ minimum: 1 })),
     lineOffset: Type.Optional(Type.Integer({ minimum: 1 })), maxLines: Type.Optional(Type.Integer({ minimum: 1 })),
     maxTokens: Type.Optional(Type.Integer({ minimum: 0 })),
@@ -223,7 +229,7 @@ export function createMemoryTools(input: MemoryToolsInput): AgentTool<TSchema, M
     if (start > lines.length) throw new Error("line_offset_exceeds_file_length");
     const tokens = args.maxTokens === 0 ? 20_000 : boundedInteger(args.maxTokens, 20_000, Number.MAX_SAFE_INTEGER);
     const details: MemoryToolDetails = { memoryVersion: pin.memoryVersion, generationId: pin.generationId,
-      items: [], truncated: false, cursor: null, nextStartLine: null };
+      ...(pin.source ? { source: pin.source } : {}), items: [], truncated: false, cursor: null, nextStartLine: null };
     // Apply the native token policy to the requested byte range before Pi's
     // independent response envelope ceiling. Keep original range identity for
     // attribution, including both ends of native middle-truncated content.

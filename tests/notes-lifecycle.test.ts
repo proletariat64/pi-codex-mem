@@ -18,8 +18,14 @@ async function fixture(t: test.TestContext, mode: "tui" | "rpc" = "tui") {
   execFileSync("git", ["init", "-q"], { cwd });
   const agentDir = join(root, "agent"); const memoryRoot = join(agentDir, "memory"); mkdirSync(memoryRoot, { recursive: true });
   const previous = process.env.PI_CODING_AGENT_DIR; process.env.PI_CODING_AGENT_DIR = agentDir;
-  t.after(() => { if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous;
-    rmSync(root, { recursive: true, force: true }); });
+  let shutdown: (() => Promise<unknown>) | undefined;
+  t.after(async () => {
+    try { await shutdown?.(); }
+    finally {
+      if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
   writeFileSync(join(memoryRoot, "config.json"), JSON.stringify(defaultConfig("UTC")));
   const header = { type: "session", version: 3, id: "notes-session", cwd, timestamp: new Date().toISOString() };
   const entry = { type: "message", id: "u1", parentId: null, timestamp: new Date().toISOString(),
@@ -34,7 +40,7 @@ async function fixture(t: test.TestContext, mode: "tui" | "rpc" = "tui") {
     modelRegistry: { find: () => undefined, streamSimple: () => { throw new Error("no model configured"); } },
     sessionManager: { getBranch: () => [entry], getHeader: () => header, getSessionFile: () => file, getLeafId: () => entry.id } };
   await mock.fire("session_start", {}, ctx);
-  t.after(async () => { await mock.fire("session_shutdown", {}, ctx); });
+  shutdown = () => mock.fire("session_shutdown", {}, ctx);
   const command = (text: string, hasUI = true) => mock.commands.get("memory")!.handler(text, { ...ctx, hasUI });
   const note = (args: Record<string, unknown>) => mock.tools.get("pi_memory_note")!.execute("note", args, undefined, undefined, ctx as never);
   return { root: memoryRoot, mock, ctx, command, note, notifications, setFlag: (value: string | undefined) => { modeFlag = value; } };

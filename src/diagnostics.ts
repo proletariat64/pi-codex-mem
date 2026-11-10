@@ -1,10 +1,12 @@
-// Persistent diagnostics: SELECT-only; never claims work, pins memory or calls a model.
+// Persistent diagnostics: SELECT-only; never claims work, registers pins or calls a model.
+import { dirname } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import type { MemoryConfig, MemoryVersion } from "./config.ts";
 import { getPublishedGeneration } from "./store/consolidation.ts";
 import { localDay } from "./store/jobs.ts";
 import { v1PromptHash } from "./extraction/v1.ts";
 import { v2PromptHash } from "./extraction/v2.ts";
+import { prepareEvidencePin } from "./read/evidence.ts";
 
 export interface MemoryDiagnostics {
   selectedReadable: boolean;
@@ -18,8 +20,15 @@ export interface MemoryDiagnostics {
   readiness: string[];
 }
 
-/** Collect SELECT-only pipeline and budget diagnostics without claiming jobs or pinning memory. */
-export function persistentDiagnostics(db: DatabaseSync, config: MemoryConfig, now = Date.now()): MemoryDiagnostics {
+function databaseMemoryRoot(db: DatabaseSync): string | null {
+  const rows = db.prepare("PRAGMA database_list").all() as { name: string; file: string }[];
+  const file = rows.find(row => row.name === "main")?.file;
+  return file ? dirname(file) : null;
+}
+
+/** Collect SELECT-only pipeline, artifact and budget diagnostics without claiming jobs or registering pins. */
+export function persistentDiagnostics(db: DatabaseSync, config: MemoryConfig, now = Date.now(), memoryRoot?: string): MemoryDiagnostics {
+  const root = memoryRoot ?? databaseMemoryRoot(db);
   const lines: string[] = [];
   const readiness: string[] = [];
   let selectedReadable = false;
@@ -40,11 +49,16 @@ export function persistentDiagnostics(db: DatabaseSync, config: MemoryConfig, no
     const pipeline = db.prepare("SELECT read_blocked, block_reason, stale_reason, stale_since FROM pipeline_state WHERE memory_version = ?")
       .get(version) as { read_blocked: number; block_reason: string | null; stale_reason: string | null;
         stale_since: number | null } | undefined;
+    const extractionPromptHash = version === "v1" ? v1PromptHash() : v2PromptHash();
     const generation = getPublishedGeneration(db, version, now, {
       maxUnusedDays: config.schedule.maxUnusedDays,
-      extractionPromptHash: version === "v1" ? v1PromptHash() : v2PromptHash(),
+      extractionPromptHash,
     });
-    const readable = Boolean(generation);
+    const preparation = generation && root ? prepareEvidencePin({ db, root, memoryVersion: version,
+      generationId: generation.generationId, maxUnusedDays: config.schedule.maxUnusedDays, now, extractionPromptHash }) : null;
+    const artifactFailure = generation && !preparation?.pin
+      ? preparation?.failure ?? { error: true, reason: "artifact_integrity" } : null;
+    const readable = Boolean(generation && preparation?.pin);
     // Only a readable generation has a baseline to count drift against.
     const newer = generation ? db.prepare(`SELECT COUNT(*) AS n FROM source_revisions r
       JOIN branch_heads h ON h.session_key = r.session_key AND h.branch_id = r.branch_id
@@ -52,12 +66,12 @@ export function persistentDiagnostics(db: DatabaseSync, config: MemoryConfig, no
         AND r.captured_at > ?`).get(generation.createdAt) as { n: number } : { n: 0 };
     if (version === config.version) {
       selectedReadable = readable;
-      selectedInvalidated = Boolean(pipeline?.read_blocked);
+      selectedInvalidated = Boolean(pipeline?.read_blocked || artifactFailure?.error);
       selectedStale = readable && Boolean(pipeline?.stale_reason);
       staleReason = pipeline?.stale_reason ?? null;
       pendingSources = readable ? Number(newer.n) : 0;
     }
-    let readinessState = readable ? "published" : "warming_up";
+    let readinessState = readable ? "published" : artifactFailure?.reason ?? "warming_up";
     if (pipeline?.read_blocked) readinessState = `read invalidated (${pipeline.block_reason})`;
     readiness.push(`${version} readiness: ${readinessState}`);
     const extraction = extractionLine(db, config, version, now);
@@ -99,7 +113,8 @@ export function persistentDiagnostics(db: DatabaseSync, config: MemoryConfig, no
       }
     }
     lines.push(consolidation,
-      `${version} readable generation: ${generation?.generationId ?? "none"}${!readable && !pipeline?.read_blocked ? " (initialization/publication pending; no eligible generation)" : ""}`);
+      `${version} readable generation: ${generation?.generationId ?? "none"}${!generation && !pipeline?.read_blocked ? " (initialization/publication pending; no eligible generation)" : ""}`);
+    if (artifactFailure) lines.push(`${version} artifact preparation: ${artifactFailure.reason}`);
     if (pipeline?.read_blocked) lines.push(`${version} invalidation reason: ${pipeline.block_reason ?? "unknown"}`);
     if (pipeline?.stale_reason) {
       // A hard fence wins: never claim reads continue while read_blocked is set.
@@ -113,8 +128,11 @@ export function persistentDiagnostics(db: DatabaseSync, config: MemoryConfig, no
     const notes = db.prepare(`SELECT COUNT(*) AS saved, COALESCE(SUM(CASE WHEN EXISTS (
       SELECT 1 FROM note_applications a WHERE a.note_id = n.note_id AND a.note_hash = n.text_hash
         AND a.memory_version = ? AND a.generation_id = ?) THEN 1 ELSE 0 END), 0) AS published
-      FROM notes n WHERE n.status = 'active'`).get(version, generation?.generationId ?? "") as { saved: number; published: number };
+      FROM notes n WHERE n.status = 'active'`).get(version, readable ? generation?.generationId ?? "" : "") as { saved: number; published: number };
     lines.push(`${version} notes: ${notes.saved} saved; ${notes.published} in readable publication; ${notes.saved - notes.published} pending publication`);
+    if (version === config.version && notes.saved > 0) {
+      lines.push("saved-note recall: use pi_memory_list/search with path 'notes'; publication is not required (read policy still applies)");
+    }
   }
   lines.unshift(`selected memory (${config.version}): ${selectedReadable ? "READABLE (available for next eligible run)" : "UNAVAILABLE"}`);
   if (budgetWait) lines.push(
@@ -125,7 +143,7 @@ export function persistentDiagnostics(db: DatabaseSync, config: MemoryConfig, no
     `requests used/limit: ${usage.requests} / ${config.limits.dailyRequests}`,
     "next request estimated input/output: unknown (denied request estimate not persisted); admission uses used + reserved + estimated tokens",
     `recovery: wait for the budget reset or adjust local limits; /memory run --version ${config.version} --now skips idle waiting, not budget admission`,
-    "retry due does not mean published; saved notes become searchable only after publication",
+    "retry due does not mean published; active saved notes can be recalled with path 'notes' before publication",
   );
   lines.push(...readiness);
   return { selectedReadable, selectedInvalidated, selectedStale, staleReason, pendingSources, lines, readiness };

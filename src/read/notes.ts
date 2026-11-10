@@ -33,6 +33,8 @@ export function savedNotesReader(input: {
   return {
     memoryVersion, generationId, source: "saved_notes",
     withEvidence<T>(_context: unknown, operation: (access: EvidenceAccess) => EvidenceOperation<T>): T {
+      // Fence the synchronous operation once at each boundary; each read below
+      // still checks its file's path, type, size and content hash.
       validate();
       const normalizePath = (value: unknown): string => {
         if (typeof value !== "string" || value.includes("\\") || value.includes("\0") ||
@@ -42,13 +44,13 @@ export function savedNotesReader(input: {
         return path;
       };
       const read = (path: string) => {
-        validate();
         const note = byPath.get(path);
         if (!note) throw new Error("path_not_available_for_version");
         if (resolve(note.text_path) !== resolve(root, path)) throw new Error("saved_note_integrity");
         const file = safeWorkspacePath(root, path);
         const stat = lstatSync(file);
-        if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 16_384 || realpathSync(root) !== resolve(root)) {
+        if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 16_384 ||
+            realpathSync(file) !== resolve(realpathSync(root), path)) {
           throw new Error("saved_note_integrity");
         }
         const text = readWorkspaceUtf8(root, path);

@@ -203,8 +203,10 @@ export default function (pi: ExtensionAPI) {
       const defaultPath = path === undefined || path === "" || path === ".";
       if (notesRequested || (!foreground.pin && defaultPath)) {
         // Explicit saved evidence does not depend on carrier projection, an active run,
-        // or model-generated publication. Read-disable, exclusions and clear still apply.
-        const allowed = config.status === "ok" && !rootPointsIntoForeignMemory(root) && !legacyLockPath(root) &&
+        // or model-generated publication. Confirmed host incompatibility, read-disable,
+        // exclusions and clear still apply, even without a foreground run.
+        const allowed = state.compat?.supported !== false && config.status === "ok" &&
+          !rootPointsIntoForeignMemory(root) && !legacyLockPath(root) &&
           !existsSync(join(root, "clear.pending")) && recheckEligibilityWithWorkspace(config.config, ctx.cwd,
             { config: config.config, flag: flagMode(), workspaceExcluded: false }, canReadMemory);
         if (!allowed || config.status !== "ok") return unavailable("read_disabled");

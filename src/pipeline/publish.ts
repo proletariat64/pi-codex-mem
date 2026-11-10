@@ -110,6 +110,11 @@ export function cleanupGenerations(opts: {
   const retainRecovery = opts.retainRecoveryCount ?? 2;
   if (!Number.isSafeInteger(retainRecovery) || retainRecovery < 0) throw new Error("invalid generation recovery retention");
   const root = realpathSync(opts.root);
+  const main = (db.prepare("PRAGMA database_list").all() as { name: string; file: string }[])
+    .find(row => row.name === "main");
+  if (!main?.file || realpathSync(main.file) !== realpathSync(join(root, "state.sqlite"))) {
+    throw new Error("generation cleanup store mismatch");
+  }
   db.exec("BEGIN IMMEDIATE");
   try {
     // Renamed candidates have no generation row until CAS. A live consolidator

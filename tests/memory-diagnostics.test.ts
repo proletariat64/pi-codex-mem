@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
@@ -14,6 +15,7 @@ import { openStateDb, recordSnapshot } from "../src/store/db.ts";
 import { claimDueExtractions, commitExtraction, enqueueExtraction, localDay } from "../src/store/jobs.ts";
 import { claimConsolidation, commitGeneration, finishConsolidation, getPublishedGeneration, selectConsolidation } from "../src/store/consolidation.ts";
 import { addNote } from "../src/control/notes.ts";
+import { MINIMAL_V1_SUMMARY } from "../src/pipeline/validate.ts";
 import { makeMockPi } from "./mock-pi.ts";
 
 const NOW = Date.UTC(2026, 8, 1, 12);
@@ -52,8 +54,15 @@ function fixture(t: test.TestContext) {
     assert.equal(snapshot.sources.length, 1);
     const lease = claimConsolidation(db, { memoryVersion: "v1", owner: "writer", promptHash: "writer", now: NOW - 1000 });
     assert.ok(lease);
+    const directory = join(root, "versions", "v1", "generations", "readable-v1");
+    mkdirSync(directory, { recursive: true });
+    const files = { "memory_summary.md": MINIMAL_V1_SUMMARY, "MEMORY.md": "# TypeScript decision\n" };
+    for (const [path, text] of Object.entries(files)) writeFileSync(join(directory, path), text);
+    const manifest = JSON.stringify({ memoryVersion: "v1", controlEpoch: snapshot.controlEpoch, sources: [],
+      fileHashes: Object.fromEntries(Object.entries(files).map(([path, text]) => [path, createHash("sha256").update(text).digest("hex")])) });
+    writeFileSync(join(directory, "manifest.json"), manifest);
     assert.equal(commitGeneration(db, { lease, snapshot, generation: { memoryVersion: "v1", generationId: "readable-v1",
-      directory: join(root, "published"), manifestHash: "manifest", inputHash: snapshot.selectionHash }, now: NOW - 1000 }), true);
+      directory, manifestHash: createHash("sha256").update(manifest).digest("hex"), inputHash: snapshot.selectionHash }, now: NOW - 1000 }), true);
     assert.equal(getPublishedGeneration(db, "v1", NOW, { maxUnusedDays: config.schedule.maxUnusedDays,
       extractionPromptHash: v1PromptHash() })?.generationId, "readable-v1");
   }
@@ -181,6 +190,31 @@ test("published selected memory stays readable during budget wait; another versi
   assert.equal(report.ok, true);
   assert.equal(report.probes.find(p => p.id === "memory")?.status, "ok");
   assert.match(report.format()[0]!, /environment OK; selected memory READABLE/);
+});
+
+test("missing published artifacts are UNAVAILABLE with artifact_integrity and no diagnostic writes", t => {
+  const f = fixture(t);
+  addNote({ root: f.root, db: f.db, action: "remember", text: "Keep artifact evidence", scope: "global",
+    provenance: { consumerSession: "reader", runId: "run", userMessageId: "u1", origin: "tool" }, now: NOW });
+  f.publish();
+  rmSync(join(f.root, "versions", "v1", "generations", "readable-v1"), { recursive: true, force: true });
+  const before = snapshot(f.db);
+  const changes = f.db.prepare("SELECT total_changes() AS n").get()?.n;
+  f.db.exec("PRAGMA query_only = ON");
+  const diagnostics = persistentDiagnostics(f.db, f.config, NOW);
+  const text = diagnostics.lines.join("\n");
+  assert.equal(diagnostics.selectedReadable, false);
+  assert.match(text, /selected memory \(v1\): UNAVAILABLE/);
+  assert.match(text, /v1 readiness: artifact_integrity/);
+  assert.match(text, /v1 readable generation: readable-v1/);
+  assert.match(text, /v1 artifact preparation: artifact_integrity/);
+  assert.match(text, /v1 notes: 1 saved; 0 in readable publication; 1 pending publication/);
+  const report = doctor(f);
+  assert.equal(report.ok, false);
+  assert.equal(report.probes.find(p => p.id === "memory")?.status, "fail");
+  assert.match(report.format().join("\n"), /selected memory UNAVAILABLE[\s\S]*artifact_integrity/);
+  assert.equal(snapshot(f.db), before);
+  assert.equal(f.db.prepare("SELECT total_changes() AS n").get()?.n, changes);
 });
 
 test("first use reports warming_up and publication pending, not a recovery integrity failure", t => {

@@ -74,6 +74,20 @@ test("cleanup retains another process's registered generation pin until its leas
   assert.equal(existsSync(join(root, "versions", "v1", "generations", "generation-0")), false);
 });
 
+test("cleanup rejects a database owned by another memory root before any deletion or mutation", (t) => {
+  const source = fixture(t);
+  const target = fixture(t);
+  for (let n = 0; n < 5; n++) assert.equal(publishGeneration(target.candidate(`generation-${n}`, NOW + n)).published, true);
+  const sourceStateBefore = source.db.prepare("SELECT * FROM pipeline_state ORDER BY memory_version").all();
+  const targetGenerationsBefore = target.db.prepare("SELECT * FROM generations ORDER BY generation_id").all();
+  assert.throws(() => cleanupGenerations({ db: source.db, root: target.root, now: NOW + 6 }), /cleanup store mismatch/);
+  assert.deepEqual(source.db.prepare("SELECT * FROM pipeline_state ORDER BY memory_version").all(), sourceStateBefore);
+  assert.deepEqual(target.db.prepare("SELECT * FROM generations ORDER BY generation_id").all(), targetGenerationsBefore);
+  for (let n = 0; n < 5; n++) {
+    assert.equal(existsSync(join(target.root, "versions", "v1", "generations", `generation-${n}`)), true);
+  }
+});
+
 test("v2 publication rejects forbidden files and directories even without caller validation", (t) => {
   const { root, db, candidate } = fixture(t);
   const old = publishGeneration(candidate("v2-old", NOW, "v2"));
